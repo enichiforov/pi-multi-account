@@ -1448,9 +1448,9 @@ interface ProjectConfig {
 	pools?: PoolConfig[];
 	/** Override chains for this project. If set, replaces global chains. */
 	chains?: ChainConfig[];
-	/** Restrict which subscriptions can be used. Provider names (e.g. "openai-codex-2").
-	 *  If set, only these subs (plus the originals) are available in this project.
-	 *  If not set, all global subs are available. */
+	/** Restrict which provider names can be used in this project (for example
+	 *  "openai-codex" or "openai-codex-2"). If set, only these exact providers
+	 *  are available in this project. If not set, all global providers are available. */
 	allowedSubs?: string[];
 }
 
@@ -1459,6 +1459,8 @@ interface EffectiveConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
 	chains: ChainConfig[];
+	/** Exact provider names allowed in this project, if restricted. */
+	allowedProviderNames?: string[];
 	/** Which project config was loaded from, if any */
 	projectConfigPath?: string;
 }
@@ -1514,33 +1516,71 @@ function loadProjectConfig(cwd: string): ProjectConfig | undefined {
 	}
 }
 
+function normalizeAllowedProviderNames(allowedSubs: string[] | undefined): string[] | undefined {
+	if (!allowedSubs || allowedSubs.length === 0) return undefined;
+	const normalized = [...new Set(allowedSubs.map((value) => value.trim()).filter(Boolean))];
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function filterPoolsByAllowedProviders(
+	pools: PoolConfig[],
+	allowedProviderNames: string[] | undefined,
+): PoolConfig[] {
+	if (!allowedProviderNames || allowedProviderNames.length === 0) {
+		return pools;
+	}
+	const allowed = new Set(allowedProviderNames);
+	return pools
+		.map((pool) => ({
+			...pool,
+			members: pool.members.filter((member) => allowed.has(member)),
+		}))
+		.filter((pool) => pool.members.length > 0);
+}
+
+function filterChainsByAvailablePools(chains: ChainConfig[], pools: PoolConfig[]): ChainConfig[] {
+	const poolNames = new Set(pools.map((pool) => pool.name));
+	return chains
+		.map((chain) => ({
+			...chain,
+			entries: chain.entries.filter((entry) => poolNames.has(entry.pool)),
+		}))
+		.filter((chain) => chain.entries.length > 0);
+}
+
 function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	const global = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const mergedSubscriptions = normalizeEntries(mergeConfigs(global, envEntries));
 	const project = loadProjectConfig(cwd);
 
 	if (!project) {
 		return {
-			subscriptions: global.subscriptions,
+			subscriptions: mergedSubscriptions,
 			pools: global.pools,
 			chains: global.chains,
 		};
 	}
 
-	// Subscriptions are always global, but filter if allowedSubs is set
-	let subs = global.subscriptions;
-	if (project.allowedSubs && project.allowedSubs.length > 0) {
-		const allowed = new Set(project.allowedSubs);
-		subs = global.subscriptions.filter((s) => allowed.has(subProviderName(s)));
+	const allowedProviderNames = normalizeAllowedProviderNames(project.allowedSubs);
+	let subs = mergedSubscriptions;
+	if (allowedProviderNames) {
+		const allowed = new Set(allowedProviderNames);
+		subs = mergedSubscriptions.filter((s) => allowed.has(subProviderName(s)));
 	}
 
-	// Pools/chains: project overrides global if defined
-	const pools = project.pools !== undefined ? project.pools : global.pools;
-	const chains = project.chains !== undefined ? project.chains : global.chains;
+	let pools = project.pools !== undefined ? project.pools : global.pools;
+	let chains = project.chains !== undefined ? project.chains : global.chains;
+	if (allowedProviderNames) {
+		pools = filterPoolsByAllowedProviders(pools, allowedProviderNames);
+		chains = filterChainsByAvailablePools(chains, pools);
+	}
 
 	return {
 		subscriptions: subs,
 		pools,
 		chains,
+		allowedProviderNames,
 		projectConfigPath: projectConfigPath(cwd),
 	};
 }
@@ -1557,6 +1597,82 @@ function saveProjectConfig(cwd: string, config: ProjectConfig): void {
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+}
+
+function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
+	const subEntry = subscriptions.find((entry) => subProviderName(entry) === providerName);
+	if (subEntry) {
+		return subDisplayName(subEntry);
+	}
+	return PROVIDER_TEMPLATES[providerName]?.displayName || providerName;
+}
+
+function getProjectScopedProviderNames(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	effective: EffectiveConfig,
+): string[] {
+	const seen = new Set<string>();
+	const providerNames: string[] = [];
+	const push = (providerName: string) => {
+		if (!providerName || seen.has(providerName)) return;
+		seen.add(providerName);
+		providerNames.push(providerName);
+	};
+
+	if (effective.allowedProviderNames && effective.allowedProviderNames.length > 0) {
+		for (const providerName of effective.allowedProviderNames) {
+			const isExtraSubscription = effective.subscriptions.some(
+				(entry) => subProviderName(entry) === providerName,
+			);
+			const isSupportedBaseProvider = SUPPORTED_PROVIDERS.includes(providerName);
+			if (!isExtraSubscription && !isSupportedBaseProvider) continue;
+			push(providerName);
+		}
+		return providerNames;
+	}
+
+	for (const providerName of SUPPORTED_PROVIDERS) {
+		if (ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+			push(providerName);
+		}
+	}
+	for (const entry of effective.subscriptions) {
+		push(subProviderName(entry));
+	}
+	return providerNames;
+}
+
+function findSelectableModelForProvider(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	providerName: string,
+	preferredModelId?: string,
+): Model<Api> | undefined {
+	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+		return undefined;
+	}
+	if (preferredModelId) {
+		const preferred = ctx.modelRegistry.find(providerName, preferredModelId);
+		if (preferred) {
+			return preferred as Model<Api>;
+		}
+	}
+	const baseProvider = getBaseProvider(providerName);
+	if (!baseProvider) {
+		return undefined;
+	}
+	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
+		if (candidate) {
+			return candidate as Model<Api>;
+		}
+	}
+	return undefined;
+}
+
+function formatAllowedProviderSummary(effective: EffectiveConfig): string | undefined {
+	return effective.allowedProviderNames && effective.allowedProviderNames.length > 0
+		? effective.allowedProviderNames.join(", ")
+		: undefined;
 }
 
 // ==========================================================================
@@ -4136,35 +4252,88 @@ export default function multiSub(pi: ExtensionAPI) {
 	const poolManager = new PoolManager(pi);
 	poolManager.loadPools(config.pools);
 
+	let projectRestrictionSwitchInFlight = false;
+	const enforceProjectRestriction = async (
+		ctx: ExtensionContext | ExtensionCommandContext,
+		reason: "session" | "model" | "input",
+	): Promise<boolean> => {
+		if (projectRestrictionSwitchInFlight) return true;
+		const effective = loadEffectiveConfig(ctx.cwd);
+		const allowedSummary = formatAllowedProviderSummary(effective);
+		if (!allowedSummary) {
+			return true;
+		}
+		if (ctx.model && effective.allowedProviderNames?.includes(ctx.model.provider)) {
+			return true;
+		}
+
+		for (const providerName of getProjectScopedProviderNames(ctx, effective)) {
+			const model = findSelectableModelForProvider(ctx, providerName, ctx.model?.id);
+			if (!model) continue;
+
+			projectRestrictionSwitchInFlight = true;
+			try {
+				const success = await pi.setModel(model);
+				if (!success) continue;
+				const displayName = getProviderDisplayName(providerName, effective.subscriptions);
+				ctx.ui.notify(
+					`multi-pass: project restricted to ${allowedSummary}; switched to ${displayName} (${model.id}).`,
+					"info",
+				);
+				return true;
+			} finally {
+				projectRestrictionSwitchInFlight = false;
+			}
+		}
+
+		const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "the current model";
+		ctx.ui.notify(
+			`multi-pass: project restricted to ${allowedSummary}, but no authenticated allowed provider can serve ${currentModel}.`,
+			"warning",
+		);
+		return false;
+	};
+
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
+		const statusParts: string[] = [];
 		const enabledChains = effective.chains.filter((chain) => chain.enabled);
 		const activeChain = enabledChains[0];
 		if (activeChain) {
 			const firstEnabledEntry = activeChain.entries.find((entry) => entry.enabled);
 			if (firstEnabledEntry) {
-				ctx.ui.setStatus(
-					"multi-pass",
-					`chain:${activeChain.name} | starts ${firstEnabledEntry.pool} -> ${firstEnabledEntry.model}`,
-				);
-				return;
+				statusParts.push(`chain:${activeChain.name} | starts ${firstEnabledEntry.pool} -> ${firstEnabledEntry.model}`);
 			}
+		}
+		const allowedSummary = formatAllowedProviderSummary(effective);
+		if (allowedSummary) {
+			statusParts.push(`allowed ${allowedSummary}`);
+		} else {
+			const poolCount = effective.pools.filter((p) => p.enabled).length;
+			if (poolCount > 0 && !activeChain) {
+				statusParts.push(`${poolCount} pool(s)`);
+			}
+		}
+		if (statusParts.length > 0) {
+			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
 
-		const projectConf = loadProjectConfig(ctx.cwd);
-		if (projectConf) {
-			const poolCount = effective.pools.filter((p) => p.enabled).length;
-			const restricted = projectConf.allowedSubs && projectConf.allowedSubs.length > 0;
-			const parts: string[] = [];
-			if (poolCount > 0) parts.push(`${poolCount} pool(s)`);
-			if (restricted) parts.push(`restricted to ${projectConf.allowedSubs!.length} sub(s)`);
-			if (parts.length > 0) {
-				ctx.ui.setStatus("multi-pass", `project: ${parts.join(", ")}`);
-			}
+		await enforceProjectRestriction(ctx, "session");
+	});
+
+	pi.on("model_select", async (_event, ctx) => {
+		await enforceProjectRestriction(ctx, "model");
+	});
+
+	pi.on("input", async (event, ctx) => {
+		if (event.text.trimStart().startsWith("/")) {
+			return { action: "continue" as const };
 		}
+		const ok = await enforceProjectRestriction(ctx, "input");
+		return ok ? { action: "continue" as const } : { action: "handled" as const };
 	});
 
 	// Track last user prompt for retry on rotation
