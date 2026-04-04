@@ -1192,13 +1192,23 @@ async function checkGoogleQuotaAccount(
 	}
 }
 
+function normalizeQuotaAllowedProviderNames(cwd: string): string[] | undefined {
+	const project = loadProjectConfig(cwd);
+	if (!project?.allowedSubs || project.allowedSubs.length === 0) return undefined;
+	const normalized = [...new Set(project.allowedSubs.map((value) => value.trim()).filter(Boolean))];
+	return normalized.length > 0 ? normalized : undefined;
+}
+
 function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
+	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
 	const seen = new Set<string>();
 	const accounts: QuotaAccount[] = [];
 	const pushAccount = (providerName: string, displayName: string) => {
+		if (allowed && !allowed.has(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		accounts.push({
@@ -1368,10 +1378,14 @@ async function showQuotaDetails(
 }
 
 async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
+	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
 	const accounts = collectQuotaAccounts(ctx);
 	if (accounts.length === 0) {
+		const suffix = allowedProviderNames && allowedProviderNames.length > 0
+			? ` for this project restriction (${allowedProviderNames.join(", ")})`
+			: "";
 		ctx.ui.notify(
-			"No supported subscription limits are available yet. Login to a supported provider first.",
+			`No supported subscription limits are available yet${suffix}. Login to a supported provider first.`,
 			"info",
 		);
 		return;
