@@ -177,6 +177,8 @@ Google quota is not a single flat subscription bucket, so the details view shows
 
 `/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now, but it does not proactively switch models by itself. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
 
+When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
+
 Future providers can add another checker without changing the `/subs` command surface.
 
 ## Environment variable (optional)
