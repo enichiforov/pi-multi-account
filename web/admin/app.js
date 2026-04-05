@@ -223,50 +223,6 @@ function AuthPanel({ onRefresh, reloadNames }) {
   </div>`;
 }
 
-// ── Subscriptions ──
-
-function SubEditor({ subs, onSave }) {
-  const [editing, setEditing] = useState(null);
-  const [draft, setDraft] = useState({});
-
-  function startEdit(s) { setEditing(s.name); setDraft({ ...s }); }
-  function startNew() { setEditing("__new__"); setDraft({ name: "", provider: BASE_PROVIDERS[0], enabled: true, alias: "" }); }
-  function cancel() { setEditing(null); }
-  async function save() {
-    if (editing === "__new__") { await api("/v1/config/subscriptions", jpost(draft)); }
-    else { await api(`/v1/config/subscriptions/${encodeURIComponent(editing)}`, jput(draft)); }
-    setEditing(null); onSave();
-  }
-  async function del(name) { if (confirm(`Delete subscription "${name}"?`)) { await api(`/v1/config/subscriptions/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
-
-  function renderForm(isNew) {
-    return html`
-      <div className="card">
-        <div className="form-grid">
-          <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. openai-codex-2" /></div>
-          <div><label>Base provider</label><select value=${draft.provider} onChange=${(e) => setDraft({ ...draft, provider: e.target.value })}>${BASE_PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
-          <div><label>Alias</label><input value=${draft.alias || ""} onInput=${(e) => setDraft({ ...draft, alias: e.target.value })} /></div>
-          <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
-        </div>
-        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
-      </div>
-    `;
-  }
-
-  return html`<div>
-    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Subscriptions</h2><button className="btn primary" onClick=${startNew}>+ Add</button></div>
-    ${subs.map((s) => editing === s.name ? renderForm(false) : html`
-      <div className="card" key=${s.name}>
-        <div className="card-row">
-          <div><span className="name">${s.name}</span><span className="badge neutral">${s.provider}</span><span className=${`badge ${s.enabled !== false ? "on" : "off"}`}>${s.enabled !== false ? "on" : "off"}</span>${s.alias ? html`<span className="badge neutral">${s.alias}</span>` : null}</div>
-          <div className="actions"><button className="btn" onClick=${() => startEdit(s)}>Edit</button><button className="btn danger" onClick=${() => del(s.name)}>Del</button></div>
-        </div>
-      </div>
-    `)}
-    ${editing === "__new__" ? renderForm(true) : null}
-  </div>`;
-}
-
 // ── Pools ──
 
 function PoolEditor({ pools, names, onSave }) {
@@ -471,8 +427,6 @@ function ConfigPanel({ onRefresh }) {
     <${AuthPanel} onRefresh=${refresh} reloadNames=${reloadNames} />
     <div style=${{ marginTop: "24px" }} />
     <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ~/.pi/agent/multi-pass.json</div>
-    <${SubEditor} subs=${config.subscriptions || []} onSave=${refresh} />
-    <div style=${{ marginTop: "20px" }} />
     <${PoolEditor} pools=${config.pools || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
     <${ChainEditor} chains=${config.chains || []} names=${names} onSave=${refresh} />
