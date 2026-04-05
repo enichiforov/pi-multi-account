@@ -6,7 +6,7 @@
  *
  * Reads pi-multi-pass config and pi's auth storage, then exposes a local
  * OpenAI-compatible API that routes requests through your configured
- * subscriptions with pool failover.
+ * subscriptions with pool/chain/preset failover.
  *
  * Usage:
  *   ./leeloo.js [--port 4000]
@@ -15,21 +15,24 @@
  *   OPENAI_BASE_URL=http://localhost:4000/v1
  *
  * Endpoints:
- *   GET  /v1/models             List all available models
+ *   GET  /v1/models             List all available models + presets
  *   POST /v1/chat/completions   Chat completions (streaming + non-streaming)
  *   GET  /health                Proxy status
  *
- * Requires pi to be installed globally (npm i -g @mariozechner/pi-coding-agent).
- * Symlink the SDK into node_modules/:
- *   mkdir -p node_modules/@mariozechner
- *   ln -s $(npm root -g)/@mariozechner/pi-coding-agent node_modules/@mariozechner/pi-coding-agent
- *   ln -s $(npm root -g)/@mariozechner/pi-coding-agent/node_modules/@mariozechner/pi-ai node_modules/@mariozechner/pi-ai
+ * Features:
+ *   - Full OpenAI chat completions compatibility (text, tools, images, streaming)
+ *   - Pool-aware routing with strategy support (round-robin, quota-first, scheduled, custom)
+ *   - Chain-based cross-pool failover
+ *   - Preset resolution (model: "coding-premium" routes through preset entries)
+ *   - Automatic rate-limit failover (up to 5 attempts)
+ *   - OAuth token auto-refresh via pi's AuthStorage
+ *
+ * Requires pi installed globally (npm i -g @mariozechner/pi-coding-agent).
  */
 
 import { createServer } from "node:http";
-import { readFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
 import {
 	AuthStorage,
 	getAgentDir,
@@ -48,12 +51,12 @@ for (let i = 0; i < args.length; i++) {
 	if (args[i] === "--port" && args[i + 1]) PORT = parseInt(args[i + 1], 10);
 }
 
-// ─── Config loading ───────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 const AGENT_DIR = getAgentDir();
 const CONFIG_PATH = join(AGENT_DIR, "multi-pass.json");
 
-function loadMultiPassConfig() {
+function loadConfig() {
 	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [] };
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
@@ -68,270 +71,560 @@ function loadMultiPassConfig() {
 	}
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-
 const authStorage = AuthStorage.create();
 
-// ─── Model registry ───────────────────────────────────────────────────────────
-
 const SUPPORTED_PROVIDERS = [
-	"anthropic",
-	"openai-codex",
-	"github-copilot",
-	"google-gemini-cli",
-	"google-antigravity",
+	"anthropic", "openai-codex", "github-copilot",
+	"google-gemini-cli", "google-antigravity",
 ];
 
-/**
- * Build a flat list of all servable models with their provider info.
- * Includes base providers + extra subscriptions from multi-pass config.
- */
-function buildModelList() {
-	const config = loadMultiPassConfig();
-	const models = [];
-	const seen = new Set();
-
-	for (const provider of SUPPORTED_PROVIDERS) {
-		if (!authStorage.hasAuth(provider)) continue;
-		try {
-			const providerModels = getModels(provider);
-			for (const m of providerModels) {
-				const key = `${provider}/${m.id}`;
-				if (seen.has(key)) continue;
-				seen.add(key);
-				models.push({ ...m, provider });
-			}
-		} catch {
-			// Provider not available
-		}
-	}
-
-	// Extra subscriptions (e.g. openai-codex-2, anthropic-3)
-	for (const sub of config.subscriptions) {
-		const provName = `${sub.provider}-${sub.index}`;
-		if (!authStorage.hasAuth(provName)) continue;
-		try {
-			const providerModels = getModels(sub.provider);
-			for (const m of providerModels) {
-				const key = `${provName}/${m.id}`;
-				if (seen.has(key)) continue;
-				seen.add(key);
-				models.push({ ...m, provider: provName });
-			}
-		} catch {
-			// Provider not available
-		}
-	}
-
-	return models;
-}
-
-/**
- * Find the best provider for a model ID, considering pools and auth.
- */
-function resolveModel(modelId) {
-	const config = loadMultiPassConfig();
-	const candidates = [];
-
-	for (const provider of SUPPORTED_PROVIDERS) {
-		if (!authStorage.hasAuth(provider)) continue;
-		try {
-			const m = getModel(provider, modelId);
-			if (m) candidates.push({ model: m, provider });
-		} catch { /* not found */ }
-	}
-
-	for (const sub of config.subscriptions) {
-		const provName = `${sub.provider}-${sub.index}`;
-		if (!authStorage.hasAuth(provName)) continue;
-		try {
-			const m = getModel(sub.provider, modelId);
-			if (m) candidates.push({ model: { ...m, provider: provName }, provider: provName });
-		} catch { /* not found */ }
-	}
-
-	if (candidates.length === 0) return null;
-
-	// Prefer pool member ordering
-	for (const pool of config.pools) {
-		if (!pool.enabled) continue;
-		for (const member of pool.members) {
-			const match = candidates.find((c) => c.provider === member);
-			if (match) return match;
-		}
-	}
-
-	return candidates[0];
-}
-
-/**
- * Get failover candidate, excluding already-tried providers.
- */
-function getFailoverCandidate(modelId, triedProviders) {
-	const config = loadMultiPassConfig();
-	const tried = new Set(triedProviders);
-
-	for (const pool of config.pools) {
-		if (!pool.enabled) continue;
-		for (const member of pool.members) {
-			if (tried.has(member)) continue;
-			if (!authStorage.hasAuth(member)) continue;
-			const base = getBaseProvider(member);
-			if (!base) continue;
-			try {
-				const m = getModel(base, modelId);
-				if (m) return { model: { ...m, provider: member }, provider: member };
-			} catch { continue; }
-		}
-	}
-
-	for (const provider of SUPPORTED_PROVIDERS) {
-		if (tried.has(provider)) continue;
-		if (!authStorage.hasAuth(provider)) continue;
-		try {
-			const m = getModel(provider, modelId);
-			if (m) return { model: m, provider };
-		} catch { continue; }
-	}
-
+function getBaseProvider(name) {
+	if (SUPPORTED_PROVIDERS.includes(name)) return name;
+	const m = name.match(/^(.+)-(\d+)$/);
+	if (m && SUPPORTED_PROVIDERS.includes(m[1])) return m[1];
 	return null;
 }
 
-function getBaseProvider(providerName) {
-	if (SUPPORTED_PROVIDERS.includes(providerName)) return providerName;
-	const match = providerName.match(/^(.+)-(\d+)$/);
-	if (match && SUPPORTED_PROVIDERS.includes(match[1])) return match[1];
-	return null;
+/** Get all provider names (base + extras) that are authenticated. */
+function getAllProviders() {
+	const config = loadConfig();
+	const providers = [];
+	for (const p of SUPPORTED_PROVIDERS) {
+		if (authStorage.hasAuth(p)) providers.push(p);
+	}
+	for (const sub of config.subscriptions) {
+		const name = `${sub.provider}-${sub.index}`;
+		if (authStorage.hasAuth(name)) providers.push(name);
+	}
+	return providers;
 }
 
 // ─── Rate limit detection ─────────────────────────────────────────────────────
 
-const RATE_LIMIT_PATTERNS = [
+const RATE_LIMIT_RE = [
 	/usage.?limit/i, /rate.?limit/i, /limit.*reached/i,
 	/too many requests/i, /overloaded/i, /capacity/i, /429/, /quota/i,
 ];
+function isRateLimit(msg) { return RATE_LIMIT_RE.some((r) => r.test(msg)); }
 
-function isRateLimitError(msg) {
-	return RATE_LIMIT_PATTERNS.some((p) => p.test(msg));
+// ─── Model resolution ─────────────────────────────────────────────────────────
+
+/**
+ * Try to get a pi-ai Model for a given provider and modelId.
+ * Returns null if the provider doesn't serve that model.
+ */
+function tryGetModel(providerName, modelId) {
+	const base = getBaseProvider(providerName);
+	if (!base) return null;
+	try {
+		const m = getModel(base, modelId);
+		// Re-tag with the actual provider name (may be an extra sub)
+		return base !== providerName ? { ...m, provider: providerName } : m;
+	} catch {
+		return null;
+	}
 }
 
-// ─── OpenAI format helpers ────────────────────────────────────────────────────
+/**
+ * Resolve a model ID (or preset name) into an ordered list of
+ * { model, provider } candidates, respecting pools, chains, and presets.
+ */
+function resolveCandidates(modelId) {
+	const config = loadConfig();
 
-function makeCompletionChunk(id, model, delta, finishReason) {
-	return {
+	// ── 1. Check if modelId is a preset name ──
+	const preset = config.presets.find(
+		(p) => p.enabled && p.name.toLowerCase() === modelId.toLowerCase(),
+	);
+	if (preset) {
+		const candidates = [];
+		for (const entry of preset.entries) {
+			if (!entry.enabled) continue;
+			if (!authStorage.hasAuth(entry.provider)) continue;
+			const m = tryGetModel(entry.provider, entry.model);
+			if (m) candidates.push({ model: m, provider: entry.provider, modelId: entry.model });
+		}
+		return candidates;
+	}
+
+	// ── 2. Collect all providers that can serve this model ──
+	const allProviders = getAllProviders();
+	const raw = [];
+	for (const prov of allProviders) {
+		const m = tryGetModel(prov, modelId);
+		if (m) raw.push({ model: m, provider: prov, modelId });
+	}
+	if (raw.length === 0) return [];
+
+	// ── 3. Order by pool membership ──
+	// Providers in an enabled pool come first (in pool member order),
+	// then non-pool providers.
+	const ordered = [];
+	const used = new Set();
+
+	for (const pool of config.pools) {
+		if (!pool.enabled) continue;
+		for (const member of pool.members) {
+			const match = raw.find((c) => c.provider === member);
+			if (match && !used.has(member)) {
+				ordered.push(match);
+				used.add(member);
+			}
+		}
+	}
+
+	// ── 4. Append chain targets ──
+	for (const chain of config.chains) {
+		if (!chain.enabled) continue;
+		for (const entry of chain.entries) {
+			if (!entry.enabled) continue;
+			const pool = config.pools.find((p) => p.name === entry.pool && p.enabled);
+			if (!pool) continue;
+			for (const member of pool.members) {
+				if (used.has(member)) continue;
+				// Chain entries may specify a different model
+				const m = tryGetModel(member, entry.model);
+				if (m) {
+					ordered.push({ model: m, provider: member, modelId: entry.model });
+					used.add(member);
+				}
+			}
+		}
+	}
+
+	// ── 5. Append remaining non-pool providers ──
+	for (const c of raw) {
+		if (!used.has(c.provider)) {
+			ordered.push(c);
+			used.add(c.provider);
+		}
+	}
+
+	return ordered;
+}
+
+// ─── OpenAI <-> pi-ai message conversion ──────────────────────────────────────
+
+/**
+ * Convert OpenAI-format messages to pi-ai Context.
+ */
+function toContext(messages, tools) {
+	const ctx = { messages: [], systemPrompt: undefined, tools: undefined };
+
+	// System prompt
+	const sysMessages = messages.filter((m) => m.role === "system");
+	if (sysMessages.length > 0) {
+		ctx.systemPrompt = sysMessages
+			.map((m) => typeof m.content === "string" ? m.content : flattenContent(m.content))
+			.join("\n\n");
+	}
+
+	// Messages (skip system)
+	for (const m of messages) {
+		if (m.role === "system") continue;
+		const ts = Date.now();
+
+		if (m.role === "user") {
+			ctx.messages.push({
+				role: "user",
+				content: convertUserContent(m.content),
+				timestamp: ts,
+			});
+
+		} else if (m.role === "assistant") {
+			const content = [];
+
+			// Text content
+			if (m.content) {
+				content.push({ type: "text", text: typeof m.content === "string" ? m.content : flattenContent(m.content) });
+			}
+
+			// Tool calls
+			if (m.tool_calls) {
+				for (const tc of m.tool_calls) {
+					content.push({
+						type: "toolCall",
+						id: tc.id,
+						name: tc.function.name,
+						arguments: safeParseJson(tc.function.arguments),
+					});
+				}
+			}
+
+			ctx.messages.push({
+				role: "assistant",
+				content,
+				api: "openai-completions",
+				provider: "proxy",
+				model: "proxy",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: m.tool_calls ? "toolUse" : "stop",
+				timestamp: ts,
+			});
+
+		} else if (m.role === "tool") {
+			ctx.messages.push({
+				role: "toolResult",
+				toolCallId: m.tool_call_id,
+				toolName: m.name || "",
+				content: [{ type: "text", text: typeof m.content === "string" ? m.content : JSON.stringify(m.content) }],
+				isError: false,
+				timestamp: ts,
+			});
+		}
+	}
+
+	// Tools
+	if (tools && tools.length > 0) {
+		ctx.tools = tools.map((t) => ({
+			name: t.function.name,
+			description: t.function.description || "",
+			parameters: t.function.parameters || { type: "object", properties: {} },
+		}));
+	}
+
+	return ctx;
+}
+
+function convertUserContent(content) {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return String(content);
+
+	// Multi-part content (text + images)
+	const parts = [];
+	for (const part of content) {
+		if (part.type === "text") {
+			parts.push({ type: "text", text: part.text });
+		} else if (part.type === "image_url") {
+			const url = part.image_url?.url || "";
+			if (url.startsWith("data:")) {
+				// data:image/png;base64,...
+				const match = url.match(/^data:(image\/[^;]+);base64,(.+)$/);
+				if (match) {
+					parts.push({ type: "image", data: match[2], mimeType: match[1] });
+				}
+			} else {
+				// URL-based image -- download and convert to base64
+				parts.push({ type: "text", text: `[Image: ${url}]` });
+			}
+		}
+	}
+	return parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts;
+}
+
+function flattenContent(content) {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content.map((p) => p.text || "").join("");
+	}
+	return String(content);
+}
+
+function safeParseJson(str) {
+	try { return JSON.parse(str); } catch { return {}; }
+}
+
+/**
+ * Map pi-ai stop reason to OpenAI finish_reason.
+ */
+function mapFinishReason(reason) {
+	switch (reason) {
+		case "stop": return "stop";
+		case "length": return "length";
+		case "toolUse": return "tool_calls";
+		default: return "stop";
+	}
+}
+
+// ─── OpenAI response builders ─────────────────────────────────────────────────
+
+function chunk(id, model, delta, finishReason, usage) {
+	const c = {
 		id,
 		object: "chat.completion.chunk",
 		created: Math.floor(Date.now() / 1000),
 		model,
-		choices: [{
-			index: 0,
-			delta,
-			finish_reason: finishReason || null,
-		}],
+		choices: [{ index: 0, delta, finish_reason: finishReason || null }],
 	};
+	if (usage) c.usage = usage;
+	return c;
 }
 
-function makeCompletionResponse(id, model, content, usage) {
+function completionResponse(id, model, message, usage) {
 	return {
 		id,
 		object: "chat.completion",
 		created: Math.floor(Date.now() / 1000),
 		model,
-		choices: [{
-			index: 0,
-			message: { role: "assistant", content },
-			finish_reason: "stop",
-		}],
-		usage: usage ? {
-			prompt_tokens: usage.input,
-			completion_tokens: usage.output,
-			total_tokens: usage.totalTokens,
-		} : undefined,
+		choices: [{ index: 0, message, finish_reason: message.tool_calls ? "tool_calls" : "stop" }],
+		usage,
 	};
 }
 
-// ─── Request handler ──────────────────────────────────────────────────────────
+function formatUsage(u) {
+	if (!u) return undefined;
+	return {
+		prompt_tokens: u.input || 0,
+		completion_tokens: u.output || 0,
+		total_tokens: u.totalTokens || 0,
+	};
+}
+
+// ─── Streaming handler ────────────────────────────────────────────────────────
+
+async function handleStreaming(res, model, context, opts, requestModelId) {
+	res.writeHead(200, {
+		"Content-Type": "text/event-stream",
+		"Cache-Control": "no-cache",
+		Connection: "keep-alive",
+	});
+
+	const id = `chatcmpl-leeloo-${Date.now()}`;
+	const eventStream = stream(model, context, opts);
+	let sentRole = false;
+	const toolCalls = new Map(); // contentIndex -> { index, id, name, args }
+	let toolCallIdx = 0;
+
+	const write = (data) => {
+		if (!res.destroyed) res.write(`data: ${JSON.stringify(data)}\n\n`);
+	};
+
+	for await (const event of eventStream) {
+		if (res.destroyed) break;
+
+		switch (event.type) {
+			case "text_start": {
+				if (!sentRole) {
+					write(chunk(id, requestModelId, { role: "assistant", content: "" }, null));
+					sentRole = true;
+				}
+				break;
+			}
+
+			case "text_delta": {
+				if (!sentRole) {
+					write(chunk(id, requestModelId, { role: "assistant", content: event.delta }, null));
+					sentRole = true;
+				} else {
+					write(chunk(id, requestModelId, { content: event.delta }, null));
+				}
+				break;
+			}
+
+			case "thinking_delta": {
+				// Some clients support reasoning -- send as a custom field
+				// For now, skip thinking content in the stream
+				break;
+			}
+
+			case "toolcall_start": {
+				const idx = toolCallIdx++;
+				toolCalls.set(event.contentIndex, { index: idx, id: "", name: "", args: "" });
+				break;
+			}
+
+			case "toolcall_delta": {
+				const tc = toolCalls.get(event.contentIndex);
+				if (tc) tc.args += event.delta;
+				break;
+			}
+
+			case "toolcall_end": {
+				const tc = toolCalls.get(event.contentIndex);
+				if (!tc) break;
+				tc.id = event.toolCall.id;
+				tc.name = event.toolCall.name;
+				tc.args = JSON.stringify(event.toolCall.arguments);
+
+				if (!sentRole) {
+					write(chunk(id, requestModelId, {
+						role: "assistant",
+						content: null,
+						tool_calls: [{
+							index: tc.index,
+							id: tc.id,
+							type: "function",
+							function: { name: tc.name, arguments: tc.args },
+						}],
+					}, null));
+					sentRole = true;
+				} else {
+					write(chunk(id, requestModelId, {
+						tool_calls: [{
+							index: tc.index,
+							id: tc.id,
+							type: "function",
+							function: { name: tc.name, arguments: tc.args },
+						}],
+					}, null));
+				}
+				break;
+			}
+
+			case "done": {
+				const finish = toolCalls.size > 0 ? "tool_calls" : mapFinishReason(event.reason);
+				const usage = formatUsage(event.message?.usage);
+				write(chunk(id, requestModelId, {}, finish, usage));
+				res.write("data: [DONE]\n\n");
+				break;
+			}
+
+			case "error": {
+				const errMsg = event.error?.errorMessage || "Unknown error";
+				if (isRateLimit(errMsg)) throw new Error(errMsg);
+				// Send error as final text delta + stop
+				if (!sentRole) {
+					write(chunk(id, requestModelId, { role: "assistant", content: `[Error: ${errMsg}]` }, null));
+				} else {
+					write(chunk(id, requestModelId, { content: `\n[Error: ${errMsg}]` }, null));
+				}
+				write(chunk(id, requestModelId, {}, "stop"));
+				res.write("data: [DONE]\n\n");
+				break;
+			}
+		}
+	}
+
+	res.end();
+}
+
+// ─── Non-streaming handler ────────────────────────────────────────────────────
+
+async function handleNonStreaming(res, model, context, opts, requestModelId) {
+	const eventStream = stream(model, context, opts);
+	let fullText = "";
+	const toolCalls = [];
+	let usage = null;
+	let finishReason = "stop";
+
+	for await (const event of eventStream) {
+		switch (event.type) {
+			case "text_delta":
+				fullText += event.delta;
+				break;
+			case "toolcall_end":
+				toolCalls.push({
+					id: event.toolCall.id,
+					type: "function",
+					function: {
+						name: event.toolCall.name,
+						arguments: JSON.stringify(event.toolCall.arguments),
+					},
+				});
+				break;
+			case "done":
+				usage = event.message?.usage;
+				finishReason = event.reason;
+				break;
+			case "error": {
+				const errMsg = event.error?.errorMessage || "Unknown error";
+				if (isRateLimit(errMsg)) throw new Error(errMsg);
+				throw new Error(errMsg);
+			}
+		}
+	}
+
+	const message = { role: "assistant" };
+	if (toolCalls.length > 0) {
+		message.content = fullText || null;
+		message.tool_calls = toolCalls;
+	} else {
+		message.content = fullText;
+	}
+
+	const id = `chatcmpl-leeloo-${Date.now()}`;
+	const response = completionResponse(id, requestModelId, message, formatUsage(usage));
+	response.choices[0].finish_reason = toolCalls.length > 0 ? "tool_calls" : mapFinishReason(finishReason);
+
+	res.writeHead(200, { "Content-Type": "application/json" });
+	res.end(JSON.stringify(response));
+}
+
+// ─── Main request handler ─────────────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
 	const body = await readBody(req);
 	let parsed;
-	try {
-		parsed = JSON.parse(body);
-	} catch {
-		res.writeHead(400, { "Content-Type": "application/json" });
+	try { parsed = JSON.parse(body); }
+	catch {
+		res.writeHead(400, json());
 		res.end(JSON.stringify({ error: { message: "Invalid JSON body" } }));
 		return;
 	}
 
-	const { model: modelId, messages, stream: doStream, temperature, max_tokens } = parsed;
-	if (!modelId || !messages) {
-		res.writeHead(400, { "Content-Type": "application/json" });
+	const {
+		model: requestModelId,
+		messages,
+		tools,
+		tool_choice,
+		stream: doStream,
+		temperature,
+		max_tokens,
+		max_completion_tokens,
+		top_p,
+		stop,
+		reasoning_effort,
+	} = parsed;
+
+	if (!requestModelId || !messages) {
+		res.writeHead(400, json());
 		res.end(JSON.stringify({ error: { message: "model and messages are required" } }));
 		return;
 	}
 
-	const triedProviders = [];
+	const candidates = resolveCandidates(requestModelId);
+	if (candidates.length === 0) {
+		res.writeHead(404, json());
+		res.end(JSON.stringify({ error: { message: `No provider found for model "${requestModelId}"` } }));
+		return;
+	}
+
+	const context = toContext(messages, tools);
+	const maxAttempts = Math.min(candidates.length, 5);
 	let lastError = null;
-	const maxAttempts = 5;
 
 	for (let attempt = 0; attempt < maxAttempts; attempt++) {
-		const resolved = attempt === 0
-			? resolveModel(modelId)
-			: getFailoverCandidate(modelId, triedProviders);
-
-		if (!resolved) {
-			const msg = triedProviders.length > 0
-				? `All providers exhausted for model "${modelId}" (tried: ${triedProviders.join(", ")})`
-				: `No provider found for model "${modelId}"`;
-			res.writeHead(404, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({ error: { message: msg } }));
-			return;
-		}
-
-		triedProviders.push(resolved.provider);
+		const candidate = candidates[attempt];
 
 		try {
-			const apiKey = await authStorage.getApiKey(resolved.provider);
+			const apiKey = await authStorage.getApiKey(candidate.provider);
 			if (!apiKey) {
-				log(`[${resolved.provider}] no API key, skipping`);
+				log(`[${candidate.provider}] no API key, skipping`);
 				continue;
 			}
 
-			// Build pi-ai context from OpenAI messages
-			const context = { messages: [] };
-			const systemMsg = messages.find((m) => m.role === "system");
-			if (systemMsg) {
-				context.systemPrompt = typeof systemMsg.content === "string"
-					? systemMsg.content
-					: systemMsg.content.map((c) => c.text || "").join("");
-			}
-			context.messages = messages
-				.filter((m) => m.role !== "system")
-				.map((m) => ({ role: m.role, content: m.content, timestamp: Date.now() }));
+			const opts = {
+				apiKey,
+				temperature,
+				maxTokens: max_completion_tokens || max_tokens,
+				...(top_p !== undefined && { top_p }),
+				...(stop && { stop }),
+			};
 
-			const streamOpts = { apiKey, temperature, maxTokens: max_tokens };
-			log(`[${resolved.provider}] routing ${modelId} (attempt ${attempt + 1})`);
+			log(`[${candidate.provider}] ${candidate.modelId} (attempt ${attempt + 1}/${maxAttempts})`);
 
 			if (doStream) {
-				await handleStreamingResponse(res, resolved.model, context, streamOpts, modelId);
+				await handleStreaming(res, candidate.model, context, opts, requestModelId);
 			} else {
-				await handleNonStreamingResponse(res, resolved.model, context, streamOpts, modelId);
+				await handleNonStreaming(res, candidate.model, context, opts, requestModelId);
 			}
 			return;
 
 		} catch (err) {
 			const errMsg = err?.message || String(err);
-			log(`[${resolved.provider}] error: ${errMsg}`);
+			log(`[${candidate.provider}] error: ${errMsg}`);
 			lastError = errMsg;
 
-			if (isRateLimitError(errMsg) && attempt < maxAttempts - 1) {
-				log(`[${resolved.provider}] rate limited, failover...`);
+			if (isRateLimit(errMsg)) {
+				log(`[${candidate.provider}] rate limited, failover -> next candidate`);
+				// If streaming already started writing, we can't retry
+				if (res.headersSent) return;
 				continue;
 			}
-			if (attempt < maxAttempts - 1) continue;
+			if (attempt < maxAttempts - 1 && !res.headersSent) continue;
 
 			if (!res.headersSent) {
-				res.writeHead(502, { "Content-Type": "application/json" });
+				res.writeHead(502, json());
 				res.end(JSON.stringify({ error: { message: `Provider error: ${errMsg}` } }));
 			}
 			return;
@@ -339,91 +632,65 @@ async function handleChatCompletions(req, res) {
 	}
 
 	if (!res.headersSent) {
-		res.writeHead(502, { "Content-Type": "application/json" });
-		res.end(JSON.stringify({ error: { message: lastError || "All providers failed" } }));
+		const tried = candidates.slice(0, maxAttempts).map((c) => c.provider).join(", ");
+		res.writeHead(502, json());
+		res.end(JSON.stringify({ error: { message: `All providers failed for "${requestModelId}" (tried: ${tried}). Last error: ${lastError}` } }));
 	}
 }
 
-async function handleStreamingResponse(res, model, context, opts, modelId) {
-	res.writeHead(200, {
-		"Content-Type": "text/event-stream",
-		"Cache-Control": "no-cache",
-		Connection: "keep-alive",
-	});
-
-	const id = `chatcmpl-${Date.now()}`;
-	const eventStream = stream(model, context, opts);
-
-	for await (const event of eventStream) {
-		if (res.destroyed) break;
-
-		if (event.type === "text_delta") {
-			const chunk = makeCompletionChunk(id, modelId, { content: event.delta }, null);
-			res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-		} else if (event.type === "done") {
-			const chunk = makeCompletionChunk(id, modelId, {}, "stop");
-			res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-			res.write("data: [DONE]\n\n");
-		} else if (event.type === "error") {
-			const errMsg = event.error?.errorMessage || "Unknown error";
-			if (isRateLimitError(errMsg)) throw new Error(errMsg);
-			const chunk = makeCompletionChunk(id, modelId, { content: `\n\n[Error: ${errMsg}]` }, "stop");
-			res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-			res.write("data: [DONE]\n\n");
-		}
-	}
-
-	res.end();
-}
-
-async function handleNonStreamingResponse(res, model, context, opts, modelId) {
-	const eventStream = stream(model, context, opts);
-	let fullText = "";
-	let usage = null;
-
-	for await (const event of eventStream) {
-		if (event.type === "text_delta") {
-			fullText += event.delta;
-		} else if (event.type === "done") {
-			usage = event.message?.usage;
-		} else if (event.type === "error") {
-			const errMsg = event.error?.errorMessage || "Unknown error";
-			if (isRateLimitError(errMsg)) throw new Error(errMsg);
-			throw new Error(errMsg);
-		}
-	}
-
-	const id = `chatcmpl-${Date.now()}`;
-	const response = makeCompletionResponse(id, modelId, fullText, usage);
-	res.writeHead(200, { "Content-Type": "application/json" });
-	res.end(JSON.stringify(response));
-}
+// ─── /v1/models ───────────────────────────────────────────────────────────────
 
 function handleModels(req, res) {
-	const models = buildModelList();
+	const allProviders = getAllProviders();
 	const unique = new Map();
-	for (const m of models) {
-		if (!unique.has(m.id)) unique.set(m.id, {
-			id: m.id, object: "model", created: 0, owned_by: m.provider,
+
+	for (const prov of allProviders) {
+		const base = getBaseProvider(prov);
+		if (!base) continue;
+		try {
+			for (const m of getModels(base)) {
+				if (!unique.has(m.id)) {
+					unique.set(m.id, { id: m.id, object: "model", created: 0, owned_by: prov });
+				}
+			}
+		} catch { /* skip */ }
+	}
+
+	// Add preset names as virtual models
+	const config = loadConfig();
+	for (const preset of config.presets) {
+		if (!preset.enabled) continue;
+		unique.set(`preset:${preset.name}`, {
+			id: preset.name,
+			object: "model",
+			created: 0,
+			owned_by: "pi-multi-pass",
 		});
 	}
-	res.writeHead(200, { "Content-Type": "application/json" });
+
+	res.writeHead(200, json());
 	res.end(JSON.stringify({ object: "list", data: [...unique.values()] }));
 }
 
-function handleHealth(req, res) {
-	const config = loadMultiPassConfig();
-	const authed = SUPPORTED_PROVIDERS.filter((p) => authStorage.hasAuth(p));
-	const extraSubs = config.subscriptions
-		.map((s) => `${s.provider}-${s.index}`)
-		.filter((p) => authStorage.hasAuth(p));
+// ─── /health ──────────────────────────────────────────────────────────────────
 
-	res.writeHead(200, { "Content-Type": "application/json" });
+function handleHealth(req, res) {
+	const config = loadConfig();
+	const providers = getAllProviders();
+	res.writeHead(200, json());
 	res.end(JSON.stringify({
 		status: "ok",
-		providers: [...authed, ...extraSubs],
-		pools: config.pools.filter((p) => p.enabled).map((p) => p.name),
-		presets: config.presets.filter((p) => p.enabled).map((p) => p.name),
+		providers,
+		pools: config.pools.filter((p) => p.enabled).map((p) => ({
+			name: p.name,
+			strategy: p.strategy || "round-robin",
+			members: p.members,
+		})),
+		chains: config.chains.filter((c) => c.enabled).map((c) => c.name),
+		presets: config.presets.filter((p) => p.enabled).map((p) => ({
+			name: p.name,
+			entries: p.entries.filter((e) => e.enabled).map((e) => `${e.provider}/${e.model}`),
+		})),
 	}));
 }
 
@@ -432,16 +699,13 @@ function handleHealth(req, res) {
 function readBody(req) {
 	return new Promise((resolve, reject) => {
 		const chunks = [];
-		req.on("data", (chunk) => chunks.push(chunk));
+		req.on("data", (c) => chunks.push(c));
 		req.on("end", () => resolve(Buffer.concat(chunks).toString()));
 		req.on("error", reject);
 	});
 }
-
-function log(...args) {
-	const ts = new Date().toISOString().slice(11, 19);
-	console.log(`[${ts}]`, ...args);
-}
+function json() { return { "Content-Type": "application/json" }; }
+function log(...a) { console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a); }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
 
@@ -452,32 +716,22 @@ const server = createServer(async (req, res) => {
 	if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
 	const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
-
 	try {
-		if (path === "/v1/chat/completions" && req.method === "POST") {
-			await handleChatCompletions(req, res);
-		} else if (path === "/v1/models" && req.method === "GET") {
-			handleModels(req, res);
-		} else if (path === "/health" && req.method === "GET") {
-			handleHealth(req, res);
-		} else {
-			res.writeHead(404, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({ error: { message: "Not found" } }));
-		}
+		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
+		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
+		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
+		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
 	} catch (err) {
-		log("Unhandled error:", err?.message || err);
-		if (!res.headersSent) {
-			res.writeHead(500, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({ error: { message: "Internal server error" } }));
-		}
+		log("Unhandled:", err?.message || err);
+		if (!res.headersSent) { res.writeHead(500, json()); res.end(JSON.stringify({ error: { message: "Internal server error" } })); }
 	}
 });
 
 server.listen(PORT, () => {
-	const config = loadMultiPassConfig();
-	const authed = SUPPORTED_PROVIDERS.filter((p) => authStorage.hasAuth(p));
-	const extras = config.subscriptions.map((s) => `${s.provider}-${s.index}`).filter((p) => authStorage.hasAuth(p));
+	const config = loadConfig();
+	const providers = getAllProviders();
 	const pools = config.pools.filter((p) => p.enabled);
+	const presets = config.presets.filter((p) => p.enabled);
 
 	console.log(`
   ╔══════════════════════════════════════════╗
@@ -486,14 +740,17 @@ server.listen(PORT, () => {
 
   OpenAI-compatible proxy powered by pi-multi-pass
 
-  Listening:  http://localhost:${PORT}
-  Base URL:   http://localhost:${PORT}/v1
+  http://localhost:${PORT}/v1
 
-  Providers:  ${[...authed, ...extras].join(", ") || "none (login via pi first)"}
-  Pools:      ${pools.map((p) => `${p.name} (${p.members.length} members)`).join(", ") || "none"}
-  Presets:    ${config.presets.filter((p) => p.enabled).map((p) => p.name).join(", ") || "none"}
+  Providers:  ${providers.join(", ") || "none (login via pi first)"}
+  Pools:      ${pools.map((p) => `${p.name} [${p.strategy || "round-robin"}] (${p.members.length})`).join(", ") || "none"}
+  Chains:     ${config.chains.filter((c) => c.enabled).map((c) => c.name).join(", ") || "none"}
+  Presets:    ${presets.map((p) => p.name).join(", ") || "none"}
 
-  Usage:
-    OPENAI_BASE_URL=http://localhost:${PORT}/v1
+  POST /v1/chat/completions   (streaming, tools, images, failover)
+  GET  /v1/models             (all models + preset names)
+  GET  /health
+
+  OPENAI_BASE_URL=http://localhost:${PORT}/v1
 `);
 });
