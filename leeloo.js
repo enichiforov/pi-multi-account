@@ -535,7 +535,7 @@ async function resolveCandidates(modelId) {
  * Convert OpenAI-format messages to pi-ai Context.
  */
 function toContext(messages, tools) {
-	const ctx = { messages: [], systemPrompt: undefined, tools: undefined };
+	const ctx = { messages: [], systemPrompt: "You are a helpful assistant.", tools: undefined };
 
 	// System prompt
 	const sysMessages = messages.filter((m) => m.role === "system");
