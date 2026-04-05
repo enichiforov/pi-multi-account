@@ -21,6 +21,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
+- **Leeloo proxy**: OpenAI-compatible local proxy with full pool/chain/preset routing, chat UI, and quota dashboard (`npx pi-multi-pass`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
@@ -345,6 +346,147 @@ Presets are stored in `~/.pi/agent/multi-pass.json`:
 
 Presets work with pools: if an entry's provider belongs to a pool, rate-limit failover still rotates within that pool before trying the next preset entry.
 
+## Leeloo -- OpenAI-compatible proxy
+
+Leeloo is a standalone local proxy that exposes all of multi-pass's routing intelligence as a standard OpenAI-compatible API. Point any tool, editor, or script at it and get automatic pool rotation, chain failover, preset routing, and quota-aware selection -- no pi integration required.
+
+### Quick start
+
+```bash
+# Run directly (installs deps automatically)
+npx pi-multi-pass
+
+# Or with a custom port
+npx pi-multi-pass --port 8080
+
+# Then point your tools at it
+export OPENAI_BASE_URL=http://localhost:4000/v1
+```
+
+Open `http://localhost:4000/ui` for the built-in chat UI with streaming markdown, model/pool/preset picker, and live quota dashboard.
+
+### Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/chat/completions` | Chat completions (streaming + non-streaming, tools, images) |
+| `GET /v1/models` | List all available models + presets |
+| `GET /v1/routing` | Models grouped by presets, pools, providers (used by chat UI) |
+| `GET /v1/quota` | Detailed quota per provider (windows, reset times, model-level) |
+| `GET /v1/stats` | Usage stats: per-provider aggregates + recent request log |
+| `GET /health` | Provider status, pools, chains, presets, exhausted state |
+| `GET /ui` | Chat UI |
+
+### How routing works
+
+The `model` field in a chat completion request can be:
+
+| Format | Example | Behavior |
+|---|---|---|
+| Preset name | `coding-premium` | Tries preset entries in order. If an entry's provider is in a pool, all pool members are tried (with strategy) before moving to the next entry. |
+| Pool + model | `pool:codex-pool/gpt-5.1` | Routes through the pool's members using its strategy (quota-first, scheduled, custom, round-robin). |
+| Pool only | `pool:codex-pool` | Same as above, auto-picks the default model for the pool's base provider. |
+| Provider + model | `provider:anthropic/claude-sonnet-4-20250514` | Routes to that specific provider. |
+| Raw model ID | `claude-sonnet-4-20250514` | Finds any provider that serves this model, prefers pool members. |
+
+### Failover
+
+On rate limit errors, Leeloo automatically:
+
+1. Marks the provider as exhausted (5-minute cooldown, same as the extension)
+2. Tries the next candidate in the ordered list (up to 5 attempts)
+3. Pool strategies (quota-first, scheduled, custom) are applied when ordering candidates
+4. Chain entries are traversed in order, each chain pool's strategy is applied
+5. Preset entries expand to full pool membership before trying the next preset entry
+
+### Pool strategy support
+
+All four strategies work in the proxy, same as the extension:
+
+| Strategy | Proxy behavior |
+|---|---|
+| `round-robin` | Sequential pool member order |
+| `quota-first` | Queries Codex usage API (5h/7d windows) and Google quota APIs, sorts by remaining headroom |
+| `scheduled` | Evaluates time windows, roles (preferred/default/overflow), shortest-remaining-first |
+| `custom` | Loads and runs JS selector scripts with same `PoolSelectorContext` interface |
+
+### Quota endpoints
+
+`GET /v1/quota` returns detailed per-provider quota data:
+
+```json
+{
+  "providers": [
+    {
+      "provider": "openai-codex",
+      "label": "ChatGPT Plus/Pro (Codex)",
+      "score": 85,
+      "status": "ready",
+      "plan": "plus",
+      "email": "user@example.com",
+      "windows": [
+        { "name": "5-hour", "used": 15, "remaining": 85, "resetAt": "2025-06-01T14:00:00Z" },
+        { "name": "7-day", "used": 5, "remaining": 95, "resetAt": "2025-06-07T09:00:00Z" }
+      ]
+    },
+    {
+      "provider": "google-gemini-cli",
+      "label": "Google Cloud Code Assist",
+      "score": 100,
+      "status": "ready",
+      "models": [
+        { "model": "Pro", "remaining": 100, "resetAt": "2025-06-01T12:00:00Z" },
+        { "model": "Flash", "remaining": 100, "resetAt": "2025-06-01T12:00:00Z" }
+      ]
+    }
+  ]
+}
+```
+
+`GET /v1/stats` returns usage tracking:
+
+```json
+{
+  "session": {
+    "total_requests": 42,
+    "total_tokens_in": 12500,
+    "total_tokens_out": 8300,
+    "total_errors": 1
+  },
+  "providers": [
+    { "provider": "anthropic", "label": "Anthropic (Claude Pro/Max)", "requests": 30, "tokens_in": 9000, "tokens_out": 6000, "errors": 0, "last_used": "..." }
+  ],
+  "recent": [
+    { "timestamp": "...", "provider": "anthropic", "model": "claude-sonnet-4-20250514", "tokens_in": 300, "tokens_out": 200, "duration_ms": 1200, "error": null }
+  ]
+}
+```
+
+### Chat UI
+
+The built-in chat UI at `/ui` includes:
+
+- **Model picker**: grouped by Presets, Pools (with strategy labels), and Providers
+- **Streaming markdown**: live rendering via [streaming-markdown](https://github.com/thetarnav/streaming-markdown)
+- **Thinking indicator**: animated spinner while waiting for first token
+- **Response footer**: shows preset/pool name, actual provider label, model ID, token counts, response time
+- **Config strip**: always-visible top bar showing pools (with strategy), presets, and per-provider quota bars with color coding (green >50%, yellow 20-50%, red <20%)
+- **Quota auto-refresh**: bars update after each response
+
+### Response metadata
+
+Chat completion responses include extra fields showing the actual routing:
+
+```json
+{
+  "x_provider": "openai-codex",
+  "x_model": "gpt-5.1",
+  "x_label": "ChatGPT Plus/Pro (Codex)"
+}
+```
+
+For streaming, these fields appear in the final chunk (alongside `usage`).
+
 ## Supported providers
 
 | Provider key | Service |
@@ -387,7 +529,8 @@ Env entries merge with saved config.
 
 | File | Scope | Contains |
 |---|---|---|
-| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
+| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains + presets |
+| `~/.pi/agent/auth.json` | Global | OAuth credentials (used by extension + Leeloo) |
 | `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
 
 ## License
