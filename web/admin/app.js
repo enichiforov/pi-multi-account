@@ -223,6 +223,93 @@ function AuthPanel({ onRefresh, reloadNames }) {
   </div>`;
 }
 
+// ── Schedule editor ──
+
+const ALL_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const ROLES = [{ value: "", label: "default (always available)" }, { value: "preferred", label: "preferred (active in windows only)" }, { value: "overflow", label: "overflow (last resort)" }];
+
+function ScheduleEditor({ members, schedule, onChange }) {
+  // schedule = { memberName: { role, windows: [{ hours, days, dateRange }] } }
+  const sched = schedule || {};
+
+  function setMemberField(member, field, value) {
+    const ms = { ...sched, [member]: { ...(sched[member] || {}), [field]: value } };
+    if (field === "role" && !value) delete ms[member].role;
+    onChange(ms);
+  }
+
+  function getWindows(member) { return sched[member]?.windows || []; }
+
+  function setWindows(member, windows) {
+    const ms = { ...sched, [member]: { ...(sched[member] || {}), windows } };
+    onChange(ms);
+  }
+
+  function addWindow(member) {
+    setWindows(member, [...getWindows(member), { hours: [9, 17], days: [...ALL_DAYS] }]);
+  }
+
+  function updateWindow(member, idx, field, value) {
+    const wins = [...getWindows(member)];
+    wins[idx] = { ...wins[idx], [field]: value };
+    setWindows(member, wins);
+  }
+
+  function removeWindow(member, idx) {
+    setWindows(member, getWindows(member).filter((_, i) => i !== idx));
+  }
+
+  function toggleDay(member, idx, day) {
+    const wins = [...getWindows(member)];
+    const w = { ...wins[idx] };
+    const days = w.days || [...ALL_DAYS];
+    w.days = days.includes(day) ? days.filter((d) => d !== day) : [...days, day];
+    wins[idx] = w;
+    setWindows(member, wins);
+  }
+
+  if (members.length === 0) return html`<div className="empty" style=${{ padding: "10px" }}>Add members first, then configure their schedules.</div>`;
+
+  return html`
+    <div>
+      ${members.map((member) => {
+        const ms = sched[member] || {};
+        const windows = ms.windows || [];
+        return html`
+          <div key=${member} className="card" style=${{ marginBottom: "8px", padding: "10px 14px" }}>
+            <div style=${{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span className="name" style=${{ fontSize: "13px" }}>${member}</span>
+              <select value=${ms.role || ""} onChange=${(e) => setMemberField(member, "role", e.target.value || undefined)} style=${{ width: "240px", fontSize: "12px" }}>
+                ${ROLES.map((r) => html`<option key=${r.value} value=${r.value}>${r.label}</option>`)}
+              </select>
+            </div>
+            ${windows.map((w, wi) => html`
+              <div key=${wi} style=${{ background: "#0d0d0f", border: "1px solid #27272a", borderRadius: "8px", padding: "8px 10px", marginBottom: "6px" }}>
+                <div style=${{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "6px", flexWrap: "wrap" }}>
+                  <label style=${{ margin: 0, width: "auto" }}>Hours:</label>
+                  <input type="number" min="0" max="23" value=${w.hours?.[0] ?? 0} onInput=${(e) => updateWindow(member, wi, "hours", [parseInt(e.target.value) || 0, w.hours?.[1] ?? 24])} style=${{ width: "60px" }} />
+                  <span style=${{ color: "#52525b" }}>to</span>
+                  <input type="number" min="0" max="24" value=${w.hours?.[1] ?? 24} onInput=${(e) => updateWindow(member, wi, "hours", [w.hours?.[0] ?? 0, parseInt(e.target.value) || 24])} style=${{ width: "60px" }} />
+                  <span style=${{ color: "#3f3f46", fontSize: "11px" }}>(24h, wraps midnight)</span>
+                  <div className="spacer" />
+                  <button className="btn danger" onClick=${() => removeWindow(member, wi)} style=${{ padding: "2px 8px", fontSize: "11px" }}>Remove</button>
+                </div>
+                <div style=${{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                  ${ALL_DAYS.map((day) => {
+                    const active = (w.days || ALL_DAYS).includes(day);
+                    return html`<button key=${day} className=${`btn ${active ? "primary" : ""}`} onClick=${() => toggleDay(member, wi, day)} style=${{ padding: "2px 8px", fontSize: "11px", minWidth: "36px" }}>${day}</button>`;
+                  })}
+                </div>
+              </div>
+            `)}
+            <button className="btn" onClick=${() => addWindow(member)} style=${{ fontSize: "11px" }}>+ Add time window</button>
+          </div>
+        `;
+      })}
+    </div>
+  `;
+}
+
 // ── Pools ──
 
 function PoolEditor({ pools, names, onSave }) {
@@ -266,7 +353,7 @@ function PoolEditor({ pools, names, onSave }) {
               </select>
             </div>
           </div>
-          ${draft.strategy === "scheduled" ? html`<div className="full"><label>Schedule (JSON)</label><textarea value=${JSON.stringify(draft.memberSchedule || {}, null, 2)} onInput=${(e) => { try { setDraft({ ...draft, memberSchedule: JSON.parse(e.target.value) }); } catch {} }} rows="4" /></div>` : null}
+          ${draft.strategy === "scheduled" ? html`<div className="full"><label>Member schedules</label><${ScheduleEditor} members=${draft.members} schedule=${draft.memberSchedule || {}} onChange=${(s) => setDraft({ ...draft, memberSchedule: s })} /></div>` : null}
           ${draft.strategy === "custom" ? html`<div className="full"><label>Selector Script Path</label><input value=${draft.selectorScript || ""} onInput=${(e) => setDraft({ ...draft, selectorScript: e.target.value })} placeholder="./my-selector.js" /></div>` : null}
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
