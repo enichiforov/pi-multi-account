@@ -1676,7 +1676,7 @@ td{color:#ccc}
 
 <script>
 const BASE = location.origin;
-function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"\x26lt;").replace(/>/g,"\x26gt;")}
 function showTab(id){document.querySelectorAll(".tab").forEach((t,i)=>{t.classList.toggle("active",t.textContent.toLowerCase().replace(" ","")===id)});document.querySelectorAll(".panel").forEach(p=>{p.classList.toggle("active",p.id===id)});loaders[id]?.()}
 function qc(pct){return pct==null?"#555":pct>50?"#4a4":pct>20?"#ca0":"#e44"}
 function bar(pct){if(pct==null)return"--";return'<span class="bar"><span class="bar-fill" style="width:'+pct+"%;background:"+qc(pct)+'"></span></span> '+pct+"%"}
@@ -2064,7 +2064,7 @@ function clearChat() {
   chat.innerHTML = '<div class="welcome"><h2>Leeloo on multi-pass</h2>Chat cleared.</div>';
 }
 
-function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"\x26lt;").replace(/>/g,"\x26gt;"); }
 
 async function sendMessage() {
   const text = input.value.trim();
