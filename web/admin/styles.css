@@ -83,6 +83,12 @@ details>summary{cursor:pointer;color:#71717a;font-size:11px}
 details>summary:hover{color:#a1a1aa}
 pre{margin:6px 0 0;max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d0d0f;border:1px solid #27272a;border-radius:8px;padding:10px;font-size:12px;font-family:"JetBrains Mono",Menlo,monospace;color:#a1a1aa}
 
+/* diff view */
+.diff-view{margin:6px 0 0;max-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d0d0f;border:1px solid #27272a;border-radius:8px;padding:10px;font-size:12px;font-family:"JetBrains Mono",Menlo,monospace;color:#a1a1aa;line-height:1.6}
+.diff-del{background:#3b1219;color:#fca5a5;text-decoration:line-through;border-radius:2px;padding:0 1px}
+.diff-ins{background:#052e16;color:#86efac;border-radius:2px;padding:0 1px}
+.diff-eq{color:#a1a1aa}
+
 .empty{color:#3f3f46;font-style:italic;padding:20px;text-align:center}
 
 /* scrollbar */

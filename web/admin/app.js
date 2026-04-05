@@ -1,6 +1,7 @@
-import React, { useEffect, useState, useCallback } from "https://esm.sh/react@18.3.1";
+import React, { useEffect, useState, useCallback, useRef } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import htm from "https://esm.sh/htm@3.1.1";
+import DiffMatchPatch from "https://esm.sh/diff-match-patch@1.0.5";
 
 const html = htm.bind(React.createElement);
 const BASE = location.origin;
@@ -648,9 +649,39 @@ function RulesPanel({ rules, onRefresh }) {
 // AUDIT
 // ════════════════════════════════════════════════════════════════════════════════
 
+const dmp = new DiffMatchPatch();
+
+function InlineDiff({ before, after }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!ref.current || !before || !after) return;
+    const diffs = dmp.diff_main(before, after);
+    dmp.diff_cleanupSemantic(diffs);
+    let html = "";
+    for (const [op, text] of diffs) {
+      const esc = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      if (op === -1) html += '<span class="diff-del">' + esc + "</span>";
+      else if (op === 1) html += '<span class="diff-ins">' + esc + "</span>";
+      else html += '<span class="diff-eq">' + esc + "</span>";
+    }
+    ref.current.innerHTML = html;
+  }, [before, after]);
+  return React.createElement("pre", { ref, className: "diff-view" });
+}
+
 function AuditPanel({ entries, onRefresh }) {
   const [filter, setFilter] = useState("");
-  const filtered = filter ? entries.filter((e) => e.rule?.includes(filter) || e.action?.includes(filter) || e.detail?.includes(filter)) : entries;
+  const filtered = filter ? entries.filter((e) => e.rule?.includes(filter) || e.action?.includes(filter) || e.detail?.includes(filter) || e.matched_text?.includes(filter)) : entries;
+
+  function renderContent(e) {
+    if (e.full_message && e.redacted_message && e.full_message !== e.redacted_message) {
+      return html`<details><summary>diff</summary><${InlineDiff} before=${e.full_message} after=${e.redacted_message} /></details>`;
+    }
+    if (e.full_message) {
+      return html`<details><summary>view</summary><pre>${e.full_message}</pre></details>`;
+    }
+    return "--";
+  }
 
   return html`<div>
     <div className="card-row" style=${{ marginBottom: "12px" }}>
@@ -663,9 +694,17 @@ function AuditPanel({ entries, onRefresh }) {
     <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Persisted to: ~/.pi/agent/leeloo-audit.jsonl</div>
     ${filtered.length === 0 ? html`<div className="empty">No audit events${filter ? " matching filter" : ""}.</div>` : html`
       <div className="table-wrap"><table>
-        <thead><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Matched</th><th>Before</th><th>After</th></tr></thead>
+        <thead><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Matched</th><th>Content</th></tr></thead>
         <tbody>${filtered.map((e, i) => html`
-          <tr key=${i}><td>${ago(e.timestamp)}</td><td style=${{ fontWeight: 600 }}>${e.rule}</td><td><span className=${`badge ${e.type}`}>${e.type}</span></td><td>${e.action}</td><td>${e.source || "--"}</td><td style=${{ color: "#ef4444", fontFamily: "monospace", fontSize: "11px" }}>${e.matched_text || "--"}</td><td>${e.full_message ? html`<details><summary>view</summary><pre>${e.full_message}</pre></details>` : "--"}</td><td>${e.redacted_message ? html`<details><summary>view</summary><pre>${e.redacted_message}</pre></details>` : "--"}</td></tr>
+          <tr key=${i}>
+            <td>${ago(e.timestamp)}</td>
+            <td style=${{ fontWeight: 600 }}>${e.rule}</td>
+            <td><span className=${`badge ${e.type}`}>${e.type}</span></td>
+            <td>${e.action}</td>
+            <td>${e.source || "--"}</td>
+            <td style=${{ color: "#ef4444", fontFamily: "monospace", fontSize: "11px" }}>${e.matched_text || "--"}</td>
+            <td>${renderContent(e)}</td>
+          </tr>
         `)}</tbody>
       </table></div>
     `}
