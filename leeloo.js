@@ -482,6 +482,29 @@ function tryGetModel(providerName, modelId) {
  * { model, provider, modelId } candidates, respecting pools, chains,
  * presets, strategies, and exhausted state.
  */
+/** Apply a pool's strategy to order its members. Returns reordered array. */
+async function applyPoolStrategy(pool, members, modelId) {
+	if (members.length <= 1) return members;
+	const strategy = pool.strategy || "round-robin";
+	let ordered = members;
+
+	if (strategy === "scheduled" && pool.memberSchedule) {
+		ordered = getScheduledOrder(pool, members);
+		if (ordered.length > 0) log(`[pool:${pool.name}] scheduled: ${ordered[0]} selected`);
+	} else if (strategy === "custom" && pool.selectorScript) {
+		const best = await runCustomSelector(pool, members, "", modelId);
+		if (best) {
+			ordered = [best, ...members.filter((m) => m !== best)];
+			log(`[pool:${pool.name}] custom: selector chose ${best}`);
+		}
+	} else if (strategy === "quota-first") {
+		ordered = await sortByQuota(members);
+		if (ordered.length > 0) log(`[pool:${pool.name}] quota-first: ${ordered[0]} preferred`);
+	}
+
+	return ordered;
+}
+
 async function resolveCandidates(modelId) {
 	const config = loadConfig();
 
@@ -504,18 +527,7 @@ async function resolveCandidates(modelId) {
 
 		const candidates = [];
 		const members = pool.members.filter((m) => isAvailable(m));
-
-		// Apply pool strategy
-		const strategy = pool.strategy || "round-robin";
-		let ordered = members;
-		if (strategy === "scheduled" && pool.memberSchedule) {
-			ordered = getScheduledOrder(pool, members);
-		} else if (strategy === "custom" && pool.selectorScript) {
-			const best = await runCustomSelector(pool, members, "", actualModel);
-			if (best) ordered = [best, ...members.filter((m) => m !== best)];
-		} else if (strategy === "quota-first") {
-			ordered = await sortByQuota(members);
-		}
+		const ordered = await applyPoolStrategy(pool, members, actualModel);
 
 		for (const member of ordered) {
 			const m = tryGetModel(member, actualModel);
@@ -539,11 +551,30 @@ async function resolveCandidates(modelId) {
 	);
 	if (preset) {
 		const candidates = [];
+		const used = new Set();
 		for (const entry of preset.entries) {
 			if (!entry.enabled) continue;
-			if (!isAvailable(entry.provider)) continue;
-			const m = tryGetModel(entry.provider, entry.model);
-			if (m) candidates.push({ model: m, provider: entry.provider, modelId: entry.model });
+
+			// If the entry's provider belongs to a pool, expand to all
+			// pool members (with strategy) so pool rotation happens before
+			// moving to the next preset entry.
+			const pool = config.pools.find(
+				(p) => p.enabled && p.members.includes(entry.provider),
+			);
+			if (pool) {
+				let members = pool.members.filter((m) => isAvailable(m) && !used.has(m));
+				if (members.length > 0) {
+					members = await applyPoolStrategy(pool, members, entry.model);
+					for (const member of members) {
+						const m = tryGetModel(member, entry.model);
+						if (m) { candidates.push({ model: m, provider: member, modelId: entry.model }); used.add(member); }
+					}
+				}
+			} else {
+				if (!isAvailable(entry.provider) || used.has(entry.provider)) continue;
+				const m = tryGetModel(entry.provider, entry.model);
+				if (m) { candidates.push({ model: m, provider: entry.provider, modelId: entry.model }); used.add(entry.provider); }
+			}
 		}
 		return candidates;
 	}
@@ -567,27 +598,7 @@ async function resolveCandidates(modelId) {
 		const poolMembers = pool.members.filter((m) => raw.some((c) => c.provider === m));
 		if (poolMembers.length === 0) continue;
 
-		const strategy = pool.strategy || "round-robin";
-		let memberOrder = poolMembers;
-
-		if (strategy === "scheduled" && pool.memberSchedule) {
-			memberOrder = getScheduledOrder(pool, poolMembers);
-			if (memberOrder.length > 0) {
-				log(`[pool:${pool.name}] scheduled: ${memberOrder[0]} selected by schedule priority`);
-			}
-		} else if (strategy === "custom" && pool.selectorScript) {
-			const best = await runCustomSelector(pool, poolMembers, "", modelId);
-			if (best) {
-				memberOrder = [best, ...poolMembers.filter((m) => m !== best)];
-				log(`[pool:${pool.name}] custom: selector chose ${best}`);
-			}
-		}
-		if (strategy === "quota-first") {
-			memberOrder = await sortByQuota(poolMembers);
-			if (memberOrder.length > 0) {
-				log(`[pool:${pool.name}] quota-first: ${memberOrder[0]} preferred`);
-			}
-		}
+		const memberOrder = await applyPoolStrategy(pool, poolMembers, modelId);
 
 		for (const member of memberOrder) {
 			const match = raw.find((c) => c.provider === member);
@@ -598,15 +609,17 @@ async function resolveCandidates(modelId) {
 		}
 	}
 
-	// ── 4. Chain targets ──
+	// ── 4. Chain targets (with pool strategy) ──
 	for (const chain of config.chains) {
 		if (!chain.enabled) continue;
 		for (const entry of chain.entries) {
 			if (!entry.enabled) continue;
 			const pool = config.pools.find((p) => p.name === entry.pool && p.enabled);
 			if (!pool) continue;
-			for (const member of pool.members) {
-				if (used.has(member) || !isAvailable(member)) continue;
+			let members = pool.members.filter((m) => isAvailable(m) && !used.has(m));
+			if (members.length === 0) continue;
+			members = await applyPoolStrategy(pool, members, entry.model);
+			for (const member of members) {
 				const m = tryGetModel(member, entry.model);
 				if (m) {
 					ordered.push({ model: m, provider: member, modelId: entry.model });
