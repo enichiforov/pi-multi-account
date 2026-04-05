@@ -162,12 +162,12 @@ function AuthPanel({ onRefresh, reloadNames }) {
   }
 
   async function addAccount() {
-    const name = newName.trim() || `${newBase}-2`;
-    const subId = `${newBase}-${name}`;
+    const label = newName.trim();
     setBusy((b) => ({ ...b, __new__: "creating..." }));
     try {
-      // 1. Create subscription entry
-      await api("/v1/config/subscriptions", jpost({ name, provider: newBase, enabled: true, alias: name }));
+      // 1. Create subscription entry (backend auto-assigns index)
+      const res = await api("/v1/config/subscriptions", jpost({ provider: newBase, label }));
+      const subId = res.subId; // e.g. "openai-codex-2"
       setShowAdd(false);
       setNewName("");
       if (onRefresh) onRefresh();
@@ -192,7 +192,7 @@ function AuthPanel({ onRefresh, reloadNames }) {
       <div className="card" style=${{ marginBottom: "12px" }}>
         <div className="form-grid">
           <div><label>Base provider</label><select value=${newBase} onChange=${(e) => setNewBase(e.target.value)}>${BASE_PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
-          <div><label>Account name</label><input value=${newName} onInput=${(e) => setNewName(e.target.value)} placeholder=${`e.g. ${newBase}-2`} /></div>
+          <div><label>Label (optional)</label><input value=${newName} onInput=${(e) => setNewName(e.target.value)} placeholder="e.g. work account, helmut@..." /></div>
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}>
           <button className="btn primary" onClick=${addAccount} disabled=${!!busy.__new__}>${busy.__new__ || "Create & Login"}</button>

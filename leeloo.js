@@ -917,22 +917,43 @@ function handlePresetDelete(req, res, presetName) {
 async function handleSubCreate(req, res) {
 	const body = JSON.parse(await readBody(req));
 	const config = loadConfig();
+	const provider = body.provider;
+	if (!provider) {
+		res.writeHead(400, json());
+		res.end(JSON.stringify({ error: { message: "provider is required" } }));
+		return;
+	}
+
+	// Auto-assign next available index for this provider (matches extension format)
+	const existingIndices = config.subscriptions
+		.filter((s) => s.provider === provider)
+		.map((s) => s.index || 0);
+	const nextIndex = existingIndices.length === 0 ? 2 : Math.max(...existingIndices) + 1;
+
 	const sub = {
-		name: body.name || `sub-${Date.now()}`,
-		provider: body.provider,
-		enabled: body.enabled !== false,
-		alias: body.alias || body.name || `sub-${Date.now()}`,
+		provider,
+		index: body.index || nextIndex,
+		label: body.label || body.alias || "",
 	};
+
+	// The canonical ID is "${provider}-${index}" (e.g. "openai-codex-2")
+	const subId = `${sub.provider}-${sub.index}`;
+
 	config.subscriptions.push(sub);
 	saveConfig(config);
 	res.writeHead(201, json());
-	res.end(JSON.stringify({ subscription: sub }));
+	res.end(JSON.stringify({ subscription: sub, subId }));
+}
+
+// subName here is the canonical ID like "openai-codex-2"
+function findSubIndex(config, subId) {
+	return config.subscriptions.findIndex((s) => `${s.provider}-${s.index}` === subId);
 }
 
 async function handleSubUpdate(req, res, subName) {
 	const body = JSON.parse(await readBody(req));
 	const config = loadConfig();
-	const idx = config.subscriptions.findIndex((s) => s.name === subName);
+	const idx = findSubIndex(config, subName);
 	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Subscription not found" } })); return; }
 	config.subscriptions[idx] = { ...config.subscriptions[idx], ...body };
 	saveConfig(config);
@@ -942,7 +963,11 @@ async function handleSubUpdate(req, res, subName) {
 
 function handleSubDelete(req, res, subName) {
 	const config = loadConfig();
-	config.subscriptions = config.subscriptions.filter((s) => s.name !== subName);
+	const idx = findSubIndex(config, subName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Subscription not found" } })); return; }
+	// Also remove auth
+	try { authStorage.remove(subName); } catch {}
+	config.subscriptions.splice(idx, 1);
 	saveConfig(config);
 	res.writeHead(200, json());
 	res.end(JSON.stringify({ deleted: subName }));
@@ -970,16 +995,17 @@ function handleAuthProviders(req, res) {
 
 	// Extra subscription accounts
 	for (const sub of config.subscriptions) {
-		const subId = `${sub.provider}-${sub.index || sub.name}`;
+		const subId = `${sub.provider}-${sub.index}`;
 		if (result.some((r) => r.id === subId)) continue;
 		const baseProv = provs.find((p) => p.id === sub.provider);
 		result.push({
 			id: subId,
-			name: `${baseProv?.name || sub.provider} #${sub.index || sub.name}`,
+			name: `${baseProv?.name || sub.provider} #${sub.index}${sub.label ? " (" + sub.label + ")" : ""}`,
 			baseProvider: sub.provider,
 			authenticated: authStorage.hasAuth(subId),
 			isBuiltin: false,
-			subscription: sub.name,
+			index: sub.index,
+			label: sub.label,
 		});
 	}
 
@@ -998,10 +1024,10 @@ function handleKnownNames(req, res) {
 		allNames.push({ id: p.id, label: p.name, type: "provider", authenticated: authStorage.hasAuth(p.id) });
 	}
 	for (const sub of config.subscriptions) {
-		const subId = `${sub.provider}-${sub.index || sub.name}`;
+		const subId = `${sub.provider}-${sub.index}`;
 		if (allNames.some((n) => n.id === subId)) continue;
 		const baseProv = provs.find((p) => p.id === sub.provider);
-		allNames.push({ id: subId, label: `${baseProv?.name || sub.provider} #${sub.index || sub.name}`, type: "subscription", authenticated: authStorage.hasAuth(subId) });
+		allNames.push({ id: subId, label: `${baseProv?.name || sub.provider} #${sub.index}${sub.label ? " (" + sub.label + ")" : ""}`, type: "subscription", authenticated: authStorage.hasAuth(subId) });
 	}
 
 	// Pool names
