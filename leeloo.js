@@ -2,7 +2,7 @@
 /**
  * leeloo.js -- OpenAI-compatible proxy powered by pi-multi-pass
  *
- * "Leeloo Dallas Multi Pass!"
+ * "Leeloo on multi-pass!"
  *
  * Reads pi-multi-pass config and pi's auth storage, then exposes a local
  * OpenAI-compatible API that routes requests through your configured
@@ -1059,7 +1059,7 @@ function handleUI(req, res) {
 const CHAT_UI_HTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Leeloo Dallas Multi Pass</title>
+<title>Leeloo on multi-pass</title>
 
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1138,7 +1138,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 
 <div id="topbar">
   <div id="bar-main">
-    <h1>LEELOO DALLAS MULTI PASS</h1>
+    <h1>Leeloo on multi-pass</h1>
     <select id="model-select"><option>Loading...</option></select>
     <div class="bar-actions">
       <button class="bar-btn" onclick="clearChat()">Clear</button>
@@ -1152,7 +1152,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 
 <div id="chat">
   <div class="welcome">
-    <h2>LEELOO DALLAS MULTI PASS</h2>
+    <h2>Leeloo on multi-pass</h2>
     Select a preset or model above and start chatting.<br>
     Requests route through your multi-pass pools with automatic failover.
   </div>
@@ -1235,7 +1235,7 @@ async function loadRouting() {
 
 function clearChat() {
   messages = [];
-  chat.innerHTML = '<div class="welcome"><h2>LEELOO DALLAS MULTI PASS</h2>Chat cleared.</div>';
+  chat.innerHTML = '<div class="welcome"><h2>Leeloo on multi-pass</h2>Chat cleared.</div>';
 }
 
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
@@ -1395,9 +1395,9 @@ server.listen(PORT, () => {
 	const presets = config.presets.filter((p) => p.enabled);
 
 	console.log(`
-  ╔══════════════════════════════════════════╗
-  ║         LEELOO DALLAS MULTI PASS         ║
-  ╚══════════════════════════════════════════╝
+  ╔════════════════════════════════════╗
+  ║       Leeloo on multi-pass       ║
+  ╚════════════════════════════════════╝
 
   OpenAI-compatible proxy powered by pi-multi-pass
 
