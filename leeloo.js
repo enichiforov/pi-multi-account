@@ -71,6 +71,29 @@ const SUPPORTED_PROVIDERS = [
 	"google-gemini-cli", "google-antigravity",
 ];
 
+const PROVIDER_DISPLAY_NAMES = {
+	"anthropic": "Anthropic (Claude Pro/Max)",
+	"openai-codex": "ChatGPT Plus/Pro (Codex)",
+	"github-copilot": "GitHub Copilot",
+	"google-gemini-cli": "Google Cloud Code Assist",
+	"google-antigravity": "Antigravity",
+};
+
+/** Get a human-readable label for a provider name. */
+function getProviderLabel(providerName) {
+	const config = loadConfig();
+	// Check if it's an extra subscription with a label
+	for (const sub of config.subscriptions) {
+		const subName = sub.provider + "-" + sub.index;
+		if (subName === providerName) {
+			const base = PROVIDER_DISPLAY_NAMES[sub.provider] || sub.provider;
+			const display = base + " #" + sub.index;
+			return sub.label ? sub.label + " -- " + display : display;
+		}
+	}
+	return PROVIDER_DISPLAY_NAMES[providerName] || providerName;
+}
+
 function getBaseProvider(name) {
 	if (SUPPORTED_PROVIDERS.includes(name)) return name;
 	const m = name.match(/^(.+)-(\d+)$/);
@@ -793,6 +816,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 				const finalChunk = chunk(id, requestModelId, {}, finish, usage);
 				finalChunk.x_provider = actualProvider;
 				finalChunk.x_model = model.id;
+				finalChunk.x_label = getProviderLabel(actualProvider);
 				write(finalChunk);
 				res.write("data: [DONE]\n\n");
 				break;
@@ -866,6 +890,7 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 	response.choices[0].finish_reason = toolCalls.length > 0 ? "tool_calls" : mapFinishReason(finishReason);
 	response.x_provider = actualProvider;
 	response.x_model = model.id;
+	response.x_label = getProviderLabel(actualProvider);
 
 	res.writeHead(200, { "Content-Type": "application/json" });
 	res.end(JSON.stringify(response));
@@ -1405,7 +1430,7 @@ async function sendMessage() {
 
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", usage = null, xProvider = "", xModel = "";
+    let buf = "", usage = null, xProvider = "", xModel = "", xLabel = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1456,6 +1481,7 @@ async function sendMessage() {
           if (j.usage) usage = j.usage;
           if (j.x_provider) xProvider = j.x_provider;
           if (j.x_model) xModel = j.x_model;
+          if (j.x_label) xLabel = j.x_label;
 
           if (j.choices?.[0]?.finish_reason) {
             if (smdParser && smd) smd.parser_end(smdParser);
@@ -1464,8 +1490,8 @@ async function sendMessage() {
             meta.className = "meta";
             const parts = [];
             parts.push('<span class="provider-tag">' + esc(selectedRoute) + '</span>');
-            if (xProvider || xModel) {
-              parts.push('<span style="color:#8af">' + esc(xProvider) + '</span> / <span style="color:#aaa">' + esc(xModel) + '</span>');
+            if (xLabel || xProvider) {
+              parts.push('<span style="color:#8af">' + esc(xLabel || xProvider) + '</span> / <span style="color:#aaa">' + esc(xModel) + '</span>');
             }
             if (usage) parts.push(usage.prompt_tokens + " in / " + usage.completion_tokens + " out");
             parts.push((ms / 1000).toFixed(1) + "s");
