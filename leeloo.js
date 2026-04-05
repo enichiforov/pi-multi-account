@@ -2199,6 +2199,12 @@ async function sendMessage() {
     }
     messages.push({ role: "assistant", content: full });
   } catch (e) {
+    // If request failed (e.g. blocked by policy), remove the just-added user turn
+    // from request history so future messages are not repeatedly blocked.
+    const last = messages[messages.length - 1];
+    if (last && last.role === "user" && last.content === text) {
+      messages.pop();
+    }
     msgDiv.innerHTML = '<div class="md-body" style="color:#f44;padding:12px 16px">[Error: ' + esc(e.message) + ']</div>';
   }
 
