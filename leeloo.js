@@ -31,9 +31,10 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, createReadStream } from "node:fs";
 import { join, extname, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline";
 import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel, getModels, stream } from "@mariozechner/pi-ai";
 
@@ -51,9 +52,16 @@ const AGENT_DIR = getAgentDir();
 const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(ROOT_DIR, "web");
 const CONFIG_PATH = join(AGENT_DIR, "multi-pass.json");
+const RULES_PATH = join(AGENT_DIR, "multi-pass-rules.json");
+const AUDIT_PATH = join(AGENT_DIR, "leeloo-audit.jsonl");
+const AUDIT_MAX_LINES = 5000; // max lines in JSONL file before rotation
+
+function ensureDir() {
+	if (!existsSync(AGENT_DIR)) mkdirSync(AGENT_DIR, { recursive: true });
+}
 
 function loadConfig() {
-	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], rules: [] };
+	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [] };
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 		return {
@@ -61,17 +69,87 @@ function loadConfig() {
 			pools: Array.isArray(raw.pools) ? raw.pools : [],
 			chains: Array.isArray(raw.chains) ? raw.chains : [],
 			presets: Array.isArray(raw.presets) ? raw.presets : [],
-			rules: Array.isArray(raw.rules) ? raw.rules : [],
 		};
 	} catch {
-		return { subscriptions: [], pools: [], chains: [], presets: [], rules: [] };
+		return { subscriptions: [], pools: [], chains: [], presets: [] };
 	}
 }
 
 function saveConfig(config) {
-	const dir = join(AGENT_DIR);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+	ensureDir();
+	// Strip rules from config if they were accidentally included
+	const { rules, ...clean } = config;
+	writeFileSync(CONFIG_PATH, JSON.stringify(clean, null, 2), "utf-8");
+}
+
+function loadRules() {
+	// Migrate: if rules exist in multi-pass.json, move them to multi-pass-rules.json
+	if (!existsSync(RULES_PATH)) {
+		if (existsSync(CONFIG_PATH)) {
+			try {
+				const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+				if (Array.isArray(raw.rules) && raw.rules.length > 0) {
+					ensureDir();
+					writeFileSync(RULES_PATH, JSON.stringify({ rules: raw.rules }, null, 2), "utf-8");
+					delete raw.rules;
+					writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2), "utf-8");
+					log("[rules] migrated rules from multi-pass.json to multi-pass-rules.json");
+					return raw.rules;
+				}
+			} catch {}
+		}
+		return [];
+	}
+	try {
+		const raw = JSON.parse(readFileSync(RULES_PATH, "utf-8"));
+		return Array.isArray(raw.rules) ? raw.rules : [];
+	} catch {
+		return [];
+	}
+}
+
+function saveRules(rules) {
+	ensureDir();
+	writeFileSync(RULES_PATH, JSON.stringify({ rules }, null, 2), "utf-8");
+}
+
+// ─── Persistent audit log (JSONL) ───────────────────────────────────────────
+
+function appendAuditLine(entry) {
+	try {
+		ensureDir();
+		appendFileSync(AUDIT_PATH, JSON.stringify(entry) + "\n", "utf-8");
+	} catch (e) {
+		log("[audit] write error:", e.message);
+	}
+}
+
+async function loadAuditFromDisk(maxLines = 1000) {
+	if (!existsSync(AUDIT_PATH)) return [];
+	const entries = [];
+	try {
+		const rl = createInterface({ input: createReadStream(AUDIT_PATH, "utf-8"), crlfDelay: Infinity });
+		for await (const line of rl) {
+			if (!line.trim()) continue;
+			try { entries.push(JSON.parse(line)); } catch {}
+		}
+	} catch (e) {
+		log("[audit] load error:", e.message);
+	}
+	// Keep only the most recent entries
+	return entries.slice(-maxLines);
+}
+
+function rotateAuditFile() {
+	if (!existsSync(AUDIT_PATH)) return;
+	try {
+		const content = readFileSync(AUDIT_PATH, "utf-8");
+		const lines = content.split("\n").filter(Boolean);
+		if (lines.length <= AUDIT_MAX_LINES) return;
+		const keep = lines.slice(-Math.floor(AUDIT_MAX_LINES * 0.8));
+		writeFileSync(AUDIT_PATH, keep.join("\n") + "\n", "utf-8");
+		log(`[audit] rotated: ${lines.length} -> ${keep.length} lines`);
+	} catch {}
 }
 
 const authStorage = AuthStorage.create();
@@ -434,9 +512,18 @@ function trackRequest(provider, modelId, usage, durationMs, error, requestText, 
 //
 // Each rule has: name, enabled, type, scope (request|response|both), patterns, action config
 
-const auditLog = [];
+let auditLog = [];
 const AUDIT_LOG_MAX = 1000;
 const rateLimitCounters = {}; // { ruleName: { count, windowStart } }
+
+// Load persisted audit log on startup
+(async () => {
+	try {
+		auditLog = await loadAuditFromDisk(AUDIT_LOG_MAX);
+		if (auditLog.length > 0) log(`[audit] loaded ${auditLog.length} entries from disk`);
+		rotateAuditFile();
+	} catch {}
+})();
 
 function auditEvent(rule, action, detail, matchedText, fullMessage, source, redactedMessage) {
 	const matched = typeof matchedText === "string" ? matchedText : null;
@@ -457,6 +544,7 @@ function auditEvent(rule, action, detail, matchedText, fullMessage, source, reda
 	};
 	auditLog.push(entry);
 	if (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
+	appendAuditLine(entry);
 	log(`[rule:${rule.name}] ${action}: ${detail}`);
 }
 
@@ -650,14 +738,13 @@ function checkResponseBlock(rules, text) {
 // ─── Rules API handlers ──────────────────────────────────────────────────────
 
 function handleRulesList(req, res) {
-	const config = loadConfig();
 	res.writeHead(200, json());
-	res.end(JSON.stringify({ rules: config.rules || [] }));
+	res.end(JSON.stringify({ rules: loadRules() }));
 }
 
 async function handleRulesCreate(req, res) {
 	const body = JSON.parse(await readBody(req));
-	const config = loadConfig();
+	const rules = loadRules();
 	const rule = {
 		name: body.name || `rule-${Date.now()}`,
 		enabled: body.enabled !== false,
@@ -671,29 +758,194 @@ async function handleRulesCreate(req, res) {
 		maxRequests: body.maxRequests,
 		windowSeconds: body.windowSeconds,
 	};
-	config.rules.push(rule);
-	saveConfig(config);
+	rules.push(rule);
+	saveRules(rules);
 	res.writeHead(201, json());
 	res.end(JSON.stringify({ rule }));
 }
 
 async function handleRulesUpdate(req, res, ruleName) {
 	const body = JSON.parse(await readBody(req));
-	const config = loadConfig();
-	const idx = config.rules.findIndex((r) => r.name === ruleName);
+	const rules = loadRules();
+	const idx = rules.findIndex((r) => r.name === ruleName);
 	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Rule not found" } })); return; }
-	config.rules[idx] = { ...config.rules[idx], ...body };
-	saveConfig(config);
+	rules[idx] = { ...rules[idx], ...body };
+	saveRules(rules);
 	res.writeHead(200, json());
-	res.end(JSON.stringify({ rule: config.rules[idx] }));
+	res.end(JSON.stringify({ rule: rules[idx] }));
 }
 
 function handleRulesDelete(req, res, ruleName) {
-	const config = loadConfig();
-	config.rules = config.rules.filter((r) => r.name !== ruleName);
-	saveConfig(config);
+	const rules = loadRules().filter((r) => r.name !== ruleName);
+	saveRules(rules);
 	res.writeHead(200, json());
 	res.end(JSON.stringify({ deleted: ruleName }));
+}
+
+// ─── Config CRUD API ─────────────────────────────────────────────────────────
+
+function handleConfigGet(req, res) {
+	res.writeHead(200, json());
+	res.end(JSON.stringify(loadConfig()));
+}
+
+async function handleConfigPut(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	// Merge only known keys
+	if (body.subscriptions !== undefined) config.subscriptions = body.subscriptions;
+	if (body.pools !== undefined) config.pools = body.pools;
+	if (body.chains !== undefined) config.chains = body.chains;
+	if (body.presets !== undefined) config.presets = body.presets;
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify(config));
+}
+
+// Granular: pools
+async function handlePoolsGet(req, res) {
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ pools: loadConfig().pools }));
+}
+
+async function handlePoolCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const pool = {
+		name: body.name || `pool-${Date.now()}`,
+		enabled: body.enabled !== false,
+		baseProvider: body.baseProvider || "",
+		members: body.members || [],
+		strategy: body.strategy || "round-robin",
+		memberSchedule: body.memberSchedule || undefined,
+		selectorScript: body.selectorScript || undefined,
+	};
+	config.pools.push(pool);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ pool }));
+}
+
+async function handlePoolUpdate(req, res, poolName) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.pools.findIndex((p) => p.name === poolName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Pool not found" } })); return; }
+	config.pools[idx] = { ...config.pools[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ pool: config.pools[idx] }));
+}
+
+function handlePoolDelete(req, res, poolName) {
+	const config = loadConfig();
+	config.pools = config.pools.filter((p) => p.name !== poolName);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: poolName }));
+}
+
+// Granular: chains
+async function handleChainCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const chain = {
+		name: body.name || `chain-${Date.now()}`,
+		enabled: body.enabled !== false,
+		steps: body.steps || [],
+	};
+	config.chains.push(chain);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ chain }));
+}
+
+async function handleChainUpdate(req, res, chainName) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.chains.findIndex((c) => c.name === chainName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Chain not found" } })); return; }
+	config.chains[idx] = { ...config.chains[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ chain: config.chains[idx] }));
+}
+
+function handleChainDelete(req, res, chainName) {
+	const config = loadConfig();
+	config.chains = config.chains.filter((c) => c.name !== chainName);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: chainName }));
+}
+
+// Granular: presets
+async function handlePresetCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const preset = {
+		name: body.name || `preset-${Date.now()}`,
+		enabled: body.enabled !== false,
+		entries: body.entries || [],
+	};
+	config.presets.push(preset);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ preset }));
+}
+
+async function handlePresetUpdate(req, res, presetName) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.presets.findIndex((p) => p.name === presetName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Preset not found" } })); return; }
+	config.presets[idx] = { ...config.presets[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ preset: config.presets[idx] }));
+}
+
+function handlePresetDelete(req, res, presetName) {
+	const config = loadConfig();
+	config.presets = config.presets.filter((p) => p.name !== presetName);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: presetName }));
+}
+
+// Granular: subscriptions
+async function handleSubCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const sub = {
+		name: body.name || `sub-${Date.now()}`,
+		provider: body.provider,
+		enabled: body.enabled !== false,
+		alias: body.alias || body.name || `sub-${Date.now()}`,
+	};
+	config.subscriptions.push(sub);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ subscription: sub }));
+}
+
+async function handleSubUpdate(req, res, subName) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.subscriptions.findIndex((s) => s.name === subName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Subscription not found" } })); return; }
+	config.subscriptions[idx] = { ...config.subscriptions[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ subscription: config.subscriptions[idx] }));
+}
+
+function handleSubDelete(req, res, subName) {
+	const config = loadConfig();
+	config.subscriptions = config.subscriptions.filter((s) => s.name !== subName);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: subName }));
 }
 
 function handleAuditLog(req, res) {
@@ -1306,7 +1558,7 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 	}
 
 	// ── Response-side rule evaluation ──
-	const respRules = loadConfig().rules || [];
+	const respRules = loadRules();
 	if (respRules.length > 0 && fullText) {
 		const respBlock = checkResponseBlock(respRules, fullText);
 		if (respBlock.blocked) {
@@ -1373,7 +1625,7 @@ async function handleChatCompletions(req, res) {
 	}
 
 	// ── Rule evaluation: pre-flight ──
-	const rules = loadConfig().rules || [];
+	const rules = loadRules();
 	if (rules.length > 0) {
 		// Rate limits
 		const rateCheck = evaluateRateLimitRules(rules);
@@ -1702,6 +1954,21 @@ const server = createServer(async (req, res) => {
 		else if (path.startsWith("/v1/rules/") && req.method === "PUT") await handleRulesUpdate(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
 		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
 		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
+		else if (path === "/v1/config" && req.method === "GET") handleConfigGet(req, res);
+		else if (path === "/v1/config" && req.method === "PUT") await handleConfigPut(req, res);
+		else if (path === "/v1/config/pools" && req.method === "GET") await handlePoolsGet(req, res);
+		else if (path === "/v1/config/pools" && req.method === "POST") await handlePoolCreate(req, res);
+		else if (path.startsWith("/v1/config/pools/") && req.method === "PUT") await handlePoolUpdate(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1]));
+		else if (path.startsWith("/v1/config/pools/") && req.method === "DELETE") handlePoolDelete(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1]));
+		else if (path === "/v1/config/chains" && req.method === "POST") await handleChainCreate(req, res);
+		else if (path.startsWith("/v1/config/chains/") && req.method === "PUT") await handleChainUpdate(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1]));
+		else if (path.startsWith("/v1/config/chains/") && req.method === "DELETE") handleChainDelete(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1]));
+		else if (path === "/v1/config/presets" && req.method === "POST") await handlePresetCreate(req, res);
+		else if (path.startsWith("/v1/config/presets/") && req.method === "PUT") await handlePresetUpdate(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1]));
+		else if (path.startsWith("/v1/config/presets/") && req.method === "DELETE") handlePresetDelete(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1]));
+		else if (path === "/v1/config/subscriptions" && req.method === "POST") await handleSubCreate(req, res);
+		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "PUT") await handleSubUpdate(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1]));
+		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "DELETE") handleSubDelete(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1]));
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
 		else if (path.startsWith("/web/") && req.method === "GET") handleWebAsset(req, res, path);
 		else if (path === "/admin") handleAdmin(req, res);
