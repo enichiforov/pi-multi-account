@@ -1012,41 +1012,53 @@ function handleRouting(req, res) {
 		});
 	}
 
-	// Pools -- models scoped to pool via "pool:<name>/<model>" ID
-	for (const pool of config.pools) {
-		if (!pool.enabled) continue;
-		try {
-			const models = getModels(pool.baseProvider);
-			const available = pool.members.filter((m) => authStorage.hasAuth(m));
-			if (available.length === 0) continue;
-			groups.push({
-				label: `${pool.name} [${pool.strategy || "round-robin"}] (${available.length} members)`,
-				items: models.map((m) => ({
-					id: `pool:${pool.name}/${m.id}`,
-					name: m.id,
-					detail: `via ${available.join(", ")}`,
-				})),
-			});
-		} catch { /* skip */ }
+	// Pools -- each pool as a selectable group with specific models
+	const enabledPools = config.pools.filter((p) => p.enabled);
+	if (enabledPools.length > 0) {
+		const poolItems = [];
+		for (const pool of enabledPools) {
+			try {
+				const models = getModels(pool.baseProvider);
+				const available = pool.members.filter((m) => authStorage.hasAuth(m));
+				if (available.length === 0) continue;
+				const strat = pool.strategy || "round-robin";
+				// Pool-level entries with specific models
+				for (const m of models) {
+					poolItems.push({
+						id: `pool:${pool.name}/${m.id}`,
+						name: `${pool.name} / ${m.id}`,
+						detail: `[${strat}] via ${available.join(", ")}`,
+					});
+				}
+			} catch { /* skip */ }
+		}
+		if (poolItems.length > 0) {
+			groups.push({ label: "Pools", items: poolItems });
+		}
 	}
 
-	// Non-pool providers scoped via "provider:<name>/<model>" ID
+	// Non-pool providers
 	const pooled = new Set(config.pools.flatMap((p) => p.members));
 	const standalone = getAllProviders().filter((p) => !pooled.has(p));
-	for (const prov of standalone) {
-		const base = getBaseProvider(prov);
-		if (!base) continue;
-		try {
-			const models = getModels(base);
-			groups.push({
-				label: prov,
-				items: models.map((m) => ({
-					id: `provider:${prov}/${m.id}`,
-					name: m.id,
-					detail: prov,
-				})),
-			});
-		} catch { /* skip */ }
+	if (standalone.length > 0) {
+		const provItems = [];
+		for (const prov of standalone) {
+			const base = getBaseProvider(prov);
+			if (!base) continue;
+			try {
+				const models = getModels(base);
+				for (const m of models) {
+					provItems.push({
+						id: `provider:${prov}/${m.id}`,
+						name: `${prov} / ${m.id}`,
+						detail: prov,
+					});
+				}
+			} catch { /* skip */ }
+		}
+		if (provItems.length > 0) {
+			groups.push({ label: "Providers", items: provItems });
+		}
 	}
 
 	res.writeHead(200, json());
