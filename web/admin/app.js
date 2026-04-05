@@ -113,28 +113,34 @@ function AuthPanel({ onRefresh, reloadNames }) {
   }
   useEffect(() => { loadProviders(); }, []);
 
-  async function startLogin(providerId) {
-    setBusy((b) => ({ ...b, [providerId]: "connecting..." }));
+  // startLogin: oauthProvider = the base provider to run OAuth against
+  //             storeAs = the name to store credentials under (for new subscriptions)
+  async function startLogin(oauthProvider, storeAs) {
+    const trackId = storeAs || oauthProvider;
+    setBusy((b) => ({ ...b, [trackId]: "connecting..." }));
     try {
-      const res = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`, { method: "POST" });
+      const qs = storeAs ? `?storeAs=${encodeURIComponent(storeAs)}` : "";
+      const res = await api(`/v1/auth/login/${encodeURIComponent(oauthProvider)}${qs}`, { method: "POST" });
       if (res.authUrl) {
         window.open(res.authUrl, "_blank");
-        setBusy((b) => ({ ...b, [providerId]: "waiting for browser..." }));
-        pollLogin(providerId);
+        setBusy((b) => ({ ...b, [trackId]: "waiting for browser..." }));
+        pollLogin(oauthProvider, storeAs);
       }
     } catch (e) {
-      setBusy((b) => ({ ...b, [providerId]: `error: ${e.message}` }));
-      setTimeout(() => setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; }), 3000);
+      setBusy((b) => ({ ...b, [trackId]: `error: ${e.message}` }));
+      setTimeout(() => setBusy((b) => { const n = { ...b }; delete n[trackId]; return n; }), 3000);
     }
   }
 
-  async function pollLogin(providerId) {
+  async function pollLogin(oauthProvider, storeAs) {
+    const trackId = storeAs || oauthProvider;
     for (let i = 0; i < 120; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       try {
-        const s = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`);
+        const qs = storeAs ? `?storeAs=${encodeURIComponent(storeAs)}` : "";
+        const s = await api(`/v1/auth/login/${encodeURIComponent(oauthProvider)}${qs}`);
         if (s.status === "authenticated" || s.hasAuth) {
-          setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; });
+          setBusy((b) => { const n = { ...b }; delete n[trackId]; return n; });
           await loadProviders();
           if (reloadNames) reloadNames();
           if (onRefresh) onRefresh();
@@ -142,7 +148,7 @@ function AuthPanel({ onRefresh, reloadNames }) {
         }
       } catch {}
     }
-    setBusy((b) => ({ ...b, [providerId]: "timed out" }));
+    setBusy((b) => ({ ...b, [trackId]: "timed out" }));
   }
 
   async function logout(providerId) {
@@ -156,19 +162,19 @@ function AuthPanel({ onRefresh, reloadNames }) {
   }
 
   async function addAccount() {
-    const name = newName.trim() || `${newBase}-${Date.now()}`;
+    const name = newName.trim() || `${newBase}-2`;
+    const subId = `${newBase}-${name}`;
     setBusy((b) => ({ ...b, __new__: "creating..." }));
     try {
       // 1. Create subscription entry
       await api("/v1/config/subscriptions", jpost({ name, provider: newBase, enabled: true, alias: name }));
-      // 2. Start OAuth login for the new subscription name
       setShowAdd(false);
       setNewName("");
       if (onRefresh) onRefresh();
       if (reloadNames) reloadNames();
       await loadProviders();
-      // 3. Auto-start login for the new account (use base provider OAuth since it shares the flow)
-      startLogin(newBase);
+      // 2. Start OAuth for base provider, store credentials under the subscription ID
+      startLogin(newBase, subId);
     } catch (e) {
       setBusy((b) => ({ ...b, __new__: `error: ${e.message}` }));
     }
@@ -206,7 +212,7 @@ function AuthPanel({ onRefresh, reloadNames }) {
             ${busy[p.id]
               ? html`<span style=${{ fontSize: "12px", color: "#f59e0b" }}>${busy[p.id]}</span>`
               : html`
-                <button className="btn primary" onClick=${() => startLogin(p.isBuiltin ? p.id : p.baseProvider)}>${p.authenticated ? "Re-login" : "Login"}</button>
+                <button className="btn primary" onClick=${() => startLogin(p.baseProvider || p.id, p.isBuiltin ? null : p.id)}>${p.authenticated ? "Re-login" : "Login"}</button>
                 ${p.authenticated ? html`<button className="btn danger" onClick=${() => logout(p.id)}>Logout</button>` : null}
               `}
           </div>

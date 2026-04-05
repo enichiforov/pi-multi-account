@@ -1025,9 +1025,14 @@ function handleAuthStatus(req, res) {
 }
 
 async function handleAuthLogin(req, res, providerId) {
+	// Support ?storeAs=name to run OAuth for base provider but store under a different name
+	const url = new URL(req.url, `http://localhost:${PORT}`);
+	const storeAs = url.searchParams.get("storeAs") || null;
+	const trackId = storeAs || providerId; // ID used for pending tracking + final storage
+
 	// Check if already logging in
-	if (pendingLogins.has(providerId)) {
-		const pending = pendingLogins.get(providerId);
+	if (pendingLogins.has(trackId)) {
+		const pending = pendingLogins.get(trackId);
 		if (pending.authUrl) {
 			res.writeHead(200, json());
 			res.end(JSON.stringify({ status: "pending", authUrl: pending.authUrl, message: "Login already in progress. Open the URL to complete." }));
@@ -1035,37 +1040,48 @@ async function handleAuthLogin(req, res, providerId) {
 		}
 	}
 
-	log(`[auth] starting OAuth login for ${providerId}`);
+	log(`[auth] starting OAuth login for ${providerId}${storeAs ? ` (store as ${storeAs})` : ""}`);
+
+	// Find the OAuth provider to use (always the base provider's flow)
+	const oauthProviders = authStorage.getOAuthProviders();
+	const oauthProvider = oauthProviders.find((p) => p.id === providerId);
+	if (!oauthProvider) {
+		res.writeHead(400, json());
+		res.end(JSON.stringify({ error: { message: `Unknown OAuth provider: ${providerId}. Known: ${oauthProviders.map((p) => p.id).join(", ")}` } }));
+		return;
+	}
 
 	let authUrl = null;
 	let loginResolve, loginReject;
 	const loginPromise = new Promise((resolve, reject) => { loginResolve = resolve; loginReject = reject; });
 
-	pendingLogins.set(providerId, { authUrl: null, status: "starting" });
+	pendingLogins.set(trackId, { authUrl: null, status: "starting" });
 
-	// Start login in background
-	authStorage.login(providerId, {
+	// Run the OAuth login flow from the base provider
+	oauthProvider.login({
 		onAuth(info) {
-			const url = typeof info === "string" ? info : info?.url || info;
-			authUrl = url;
-			const pending = pendingLogins.get(providerId);
-			if (pending) { pending.authUrl = url; pending.status = "waiting"; }
-			log(`[auth] ${providerId} auth URL ready`);
+			const u = typeof info === "string" ? info : info?.url || info;
+			authUrl = u;
+			const pending = pendingLogins.get(trackId);
+			if (pending) { pending.authUrl = u; pending.status = "waiting"; }
+			log(`[auth] ${trackId} auth URL ready`);
 		},
-		onPrompt(msg) { log(`[auth] ${providerId} prompt: ${msg}`); },
-		onProgress(msg) { log(`[auth] ${providerId} progress: ${msg}`); },
+		onPrompt(msg) { log(`[auth] ${trackId} prompt: ${msg}`); },
+		onProgress(msg) { log(`[auth] ${trackId} progress: ${msg}`); },
 		onManualCodeInput() {
 			// Return a promise that never resolves -- we rely on the callback server
 			return new Promise(() => {});
 		},
 		signal: undefined,
-	}).then(() => {
-		log(`[auth] ${providerId} login successful`);
-		pendingLogins.delete(providerId);
+	}).then((credentials) => {
+		// Store credentials under the target name (storeAs or providerId)
+		authStorage.set(trackId, { type: "oauth", ...credentials });
+		log(`[auth] ${trackId} login successful, credentials stored`);
+		pendingLogins.delete(trackId);
 		loginResolve({ success: true });
 	}).catch((err) => {
-		log(`[auth] ${providerId} login failed: ${err.message}`);
-		pendingLogins.delete(providerId);
+		log(`[auth] ${trackId} login failed: ${err.message}`);
+		pendingLogins.delete(trackId);
 		loginReject(err);
 	});
 
@@ -1076,25 +1092,30 @@ async function handleAuthLogin(req, res, providerId) {
 	}
 
 	if (!authUrl) {
-		pendingLogins.delete(providerId);
+		pendingLogins.delete(trackId);
 		res.writeHead(500, json());
 		res.end(JSON.stringify({ error: { message: "Timed out waiting for auth URL" } }));
 		return;
 	}
 
 	res.writeHead(200, json());
-	res.end(JSON.stringify({ status: "pending", authUrl, message: "Open the URL to complete OAuth login." }));
+	res.end(JSON.stringify({ status: "pending", authUrl, trackId, message: "Open the URL to complete OAuth login." }));
 }
 
 function handleAuthLoginStatus(req, res, providerId) {
-	const pending = pendingLogins.get(providerId);
+	// Check query param for storeAs tracking
+	const url = new URL(req.url, `http://localhost:${PORT}`);
+	const storeAs = url.searchParams.get("storeAs") || null;
+	const trackId = storeAs || providerId;
+
+	const pending = pendingLogins.get(trackId);
 	if (pending) {
 		res.writeHead(200, json());
 		res.end(JSON.stringify({ status: pending.status, authUrl: pending.authUrl }));
 		return;
 	}
 	// Check if now authenticated
-	const hasAuth = authStorage.hasAuth(providerId);
+	const hasAuth = authStorage.hasAuth(trackId);
 	res.writeHead(200, json());
 	res.end(JSON.stringify({ status: hasAuth ? "authenticated" : "not_authenticated", hasAuth }));
 }
