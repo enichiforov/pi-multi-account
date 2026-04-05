@@ -98,7 +98,7 @@ function SortableList({ items, onReorder, renderItem }) {
           transition: "background .1s, border .1s",
         }}
       >
-        <span style=${{ color: "#3f3f46", fontSize: "14px", cursor: "grab", userSelect: "none" }}>&#x2630;</span>
+        <span style=${{ color: "#3f3f46", fontSize: "14px", cursor: "grab", userSelect: "none" }}>${"\u2630"}</span>
         ${renderItem(item, i)}
       </div>
     `)}
