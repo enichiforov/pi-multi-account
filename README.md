@@ -346,9 +346,9 @@ Presets are stored in `~/.pi/agent/multi-pass.json`:
 
 Presets work with pools: if an entry's provider belongs to a pool, rate-limit failover still rotates within that pool before trying the next preset entry.
 
-## Leeloo -- OpenAI-compatible proxy
+## Leeloo -- OpenAI-compatible proxy & admin
 
-Leeloo is a standalone local proxy that exposes all of multi-pass's routing intelligence as a standard OpenAI-compatible API. Point any tool, editor, or script at it and get automatic pool rotation, chain failover, preset routing, and quota-aware selection -- no pi integration required.
+Leeloo is a standalone local proxy that exposes all of multi-pass's routing intelligence as a standard OpenAI-compatible API. It includes a full admin dashboard for managing configuration, users, DLP rules, and observability -- plus a chat UI for testing. Point any tool, editor, or script at it and get automatic pool rotation, chain failover, preset routing, and quota-aware selection.
 
 ### Quick start
 
@@ -359,27 +359,149 @@ npx pi-multi-pass
 # Or with a custom port
 npx pi-multi-pass --port 8080
 
-# Local dev mode with auto-restart on leeloo/web changes
-# (run from repo root)
+# Set a persistent admin token (random if not set)
+LEELOO_KEY=my-secret-token npx pi-multi-pass
+
+# Local dev mode with auto-restart on file changes
 yarn web-dev
 
 # Then point your tools at it
 export OPENAI_BASE_URL=http://localhost:4000/v1
+export OPENAI_API_KEY=<admin-token-or-user-key>
 ```
 
-Open `http://localhost:4000/ui` for the built-in chat UI with streaming markdown, model/pool/preset picker, and live quota dashboard.
+On startup, Leeloo prints an admin token to the console. Use this token for `/admin` access and API authentication.
 
-### Endpoints
+### Web interfaces
 
-| Endpoint | Description |
+| URL | Description |
 |---|---|
-| `POST /v1/chat/completions` | Chat completions (streaming + non-streaming, tools, images) |
-| `GET /v1/models` | List all available models + presets |
-| `GET /v1/routing` | Models grouped by presets, pools, providers (used by chat UI) |
-| `GET /v1/quota` | Detailed quota per provider (windows, reset times, model-level) |
-| `GET /v1/stats` | Usage stats: per-provider aggregates + recent request log |
-| `GET /health` | Provider status, pools, chains, presets, exhausted state |
-| `GET /ui` | Chat UI |
+| `http://localhost:4000/admin` | Admin dashboard (requires admin token) |
+| `http://localhost:4000/ui` | Chat UI (accepts admin or user token) |
+
+Both require token login on first visit.
+
+### API endpoints
+
+All `/v1/*` endpoints require `Authorization: Bearer <token>` header.
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `POST /v1/chat/completions` | any token | Chat completions (streaming + non-streaming, tools, images) |
+| `GET /v1/models` | any token | List all available models + presets |
+| `GET /v1/routing` | any token | Models grouped by presets, pools, providers |
+| `GET /v1/quota` | admin | Detailed quota per provider |
+| `GET /v1/stats` | admin | Usage stats + per-user + recent request log |
+| `GET/POST /v1/rules` | admin | Policy rules CRUD |
+| `GET /v1/audit` | admin | Rule violation audit log |
+| `GET/POST /v1/users` | admin | User management CRUD |
+| `GET/PUT /v1/config` | admin | Multi-pass config editor |
+| `POST /v1/auth/login/:provider` | admin | Start OAuth login flow |
+| `POST /v1/auth/verify` | public | Verify a token (for login screens) |
+| `GET /health` | public | Provider status, pools, exhausted state |
+
+### Authentication & users
+
+Leeloo uses token-based authentication at two levels:
+
+**Admin token** -- full access to all endpoints, config, rules, users:
+```bash
+# Set via environment (persists across restarts)
+LEELOO_KEY=my-admin-token npx pi-multi-pass
+
+# Or let Leeloo generate a random one (shown in startup banner)
+npx pi-multi-pass
+```
+
+**User tokens** -- scoped access for sharing with team members:
+```bash
+# Create a user via API
+curl -X POST http://localhost:4000/v1/users \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","allowedPresets":["coding-premium","fastest"]}'
+
+# Response includes the API key
+# {"user":{"username":"alice","key":"abc123...","allowedPresets":["coding-premium","fastest"]}}
+
+# Alice can now use the proxy
+export OPENAI_API_KEY=abc123...
+```
+
+User access restrictions:
+
+| Field | Effect |
+|---|---|
+| `allowedPresets` | Whitelist of preset names (empty = all) |
+| `allowedPools` | Whitelist of pool names, matched as `pool:name` (empty = all) |
+| `enabled` | Toggle user on/off without deleting |
+
+Users are stored in `~/.pi/agent/multi-pass-users.json`.
+
+### Admin dashboard
+
+The admin UI (`/admin`) provides a full control plane:
+
+**Dashboard tab:**
+- Session stats (requests, tokens, errors)
+- Provider health with quota bars and status badges
+- Per-user usage table (requests, tokens, errors per user)
+- Recent chats with expandable request/response previews + user column
+
+**Config tab:**
+- OAuth accounts: login/logout/re-login, add extra accounts per provider
+- Pools: create/edit with drag-to-reorder members, strategy picker, schedule editor
+- Chains: create/edit with drag-to-reorder failover steps
+- Presets: create/edit with drag-to-reorder entries
+- All changes saved to `~/.pi/agent/multi-pass.json` immediately
+
+**Users tab:**
+- Create users with auto-generated API keys
+- Edit allowed presets/pools via chip picker dropdowns
+- Enable/disable, reveal/copy keys, delete
+- Per-user stats shown on each card
+
+**Rules tab:**
+- Create/edit DLP policy rules (block, redact, warn, model, limit)
+- Toggle rules on/off, persisted to `~/.pi/agent/multi-pass-rules.json`
+
+**Audit tab:**
+- Filterable audit log of all rule violations
+- Inline character-level diffs for redaction events (red strikethrough = removed, green = replacement)
+- Persisted to `~/.pi/agent/leeloo-audit.jsonl` (survives restarts)
+
+### DLP / policy rules
+
+Leeloo can intercept and enforce policies on both requests and responses:
+
+| Rule type | What it does |
+|---|---|
+| `block` | Reject if regex pattern matches (AWS keys, private keys, connection strings) |
+| `redact` | Replace pattern matches with placeholder before sending to LLM (`[EMAIL]`, `[REDACTED]`) |
+| `warn` | Log to audit trail but allow through |
+| `model` | Allow/deny model lists with glob patterns |
+| `limit` | Rate limiting (max N requests per M seconds) |
+
+Rules apply to `request`, `response`, or `both` scopes. Examples:
+
+```bash
+# Block AWS access keys in prompts
+curl -X POST http://localhost:4000/v1/rules \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"block-aws-keys","type":"block","scope":"request",
+       "patterns":["AKIA[0-9A-Z]{16}"],"message":"Blocked: AWS key detected"}'
+
+# Redact email addresses in both directions
+curl -X POST http://localhost:4000/v1/rules \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"redact-emails","type":"redact","scope":"both",
+       "patterns":["[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"],
+       "replacement":"[EMAIL]"}'
+```
+
+Rules are stored in `~/.pi/agent/multi-pass-rules.json` (separate from main config).
 
 ### How routing works
 
@@ -387,99 +509,37 @@ The `model` field in a chat completion request can be:
 
 | Format | Example | Behavior |
 |---|---|---|
-| Preset name | `coding-premium` | Tries preset entries in order. If an entry's provider is in a pool, all pool members are tried (with strategy) before moving to the next entry. |
-| Pool + model | `pool:codex-pool/gpt-5.1` | Routes through the pool's members using its strategy (quota-first, scheduled, custom, round-robin). |
-| Pool only | `pool:codex-pool` | Same as above, auto-picks the default model for the pool's base provider. |
-| Provider + model | `provider:anthropic/claude-sonnet-4-20250514` | Routes to that specific provider. |
-| Raw model ID | `claude-sonnet-4-20250514` | Finds any provider that serves this model, prefers pool members. |
+| Preset name | `coding-premium` | Tries preset entries in order with pool failover |
+| Pool + model | `pool:codex-pool/gpt-5.1` | Routes through pool members using strategy |
+| Pool only | `pool:codex-pool` | Auto-picks the default model |
+| Provider + model | `provider:anthropic/claude-sonnet-4-20250514` | Direct provider routing |
+| Raw model ID | `claude-sonnet-4-20250514` | Finds any provider that serves this model |
 
 ### Failover
 
 On rate limit errors, Leeloo automatically:
 
-1. Marks the provider as exhausted (5-minute cooldown, same as the extension)
-2. Tries the next candidate in the ordered list (up to 5 attempts)
-3. Pool strategies (quota-first, scheduled, custom) are applied when ordering candidates
-4. Chain entries are traversed in order, each chain pool's strategy is applied
-5. Preset entries expand to full pool membership before trying the next preset entry
-
-### Pool strategy support
-
-All four strategies work in the proxy, same as the extension:
-
-| Strategy | Proxy behavior |
-|---|---|
-| `round-robin` | Sequential pool member order |
-| `quota-first` | Queries Codex usage API (5h/7d windows) and Google quota APIs, sorts by remaining headroom |
-| `scheduled` | Evaluates time windows, roles (preferred/default/overflow), shortest-remaining-first |
-| `custom` | Loads and runs JS selector scripts with same `PoolSelectorContext` interface |
-
-### Quota endpoints
-
-`GET /v1/quota` returns detailed per-provider quota data:
-
-```json
-{
-  "providers": [
-    {
-      "provider": "openai-codex",
-      "label": "ChatGPT Plus/Pro (Codex)",
-      "score": 85,
-      "status": "ready",
-      "plan": "plus",
-      "email": "user@example.com",
-      "windows": [
-        { "name": "5-hour", "used": 15, "remaining": 85, "resetAt": "2025-06-01T14:00:00Z" },
-        { "name": "7-day", "used": 5, "remaining": 95, "resetAt": "2025-06-07T09:00:00Z" }
-      ]
-    },
-    {
-      "provider": "google-gemini-cli",
-      "label": "Google Cloud Code Assist",
-      "score": 100,
-      "status": "ready",
-      "models": [
-        { "model": "Pro", "remaining": 100, "resetAt": "2025-06-01T12:00:00Z" },
-        { "model": "Flash", "remaining": 100, "resetAt": "2025-06-01T12:00:00Z" }
-      ]
-    }
-  ]
-}
-```
-
-`GET /v1/stats` returns usage tracking:
-
-```json
-{
-  "session": {
-    "total_requests": 42,
-    "total_tokens_in": 12500,
-    "total_tokens_out": 8300,
-    "total_errors": 1
-  },
-  "providers": [
-    { "provider": "anthropic", "label": "Anthropic (Claude Pro/Max)", "requests": 30, "tokens_in": 9000, "tokens_out": 6000, "errors": 0, "last_used": "..." }
-  ],
-  "recent": [
-    { "timestamp": "...", "provider": "anthropic", "model": "claude-sonnet-4-20250514", "tokens_in": 300, "tokens_out": 200, "duration_ms": 1200, "error": null }
-  ]
-}
-```
+1. Marks the provider as exhausted (5-minute cooldown)
+2. Tries the next candidate (up to 5 attempts)
+3. Pool strategies are applied when ordering candidates
+4. Chain entries are traversed in order
+5. Preset entries expand to full pool membership
 
 ### Chat UI
 
 The built-in chat UI at `/ui` includes:
 
-- **Model picker**: grouped by Presets, Pools (with strategy labels), and Providers
-- **Streaming markdown**: live rendering via [streaming-markdown](https://github.com/thetarnav/streaming-markdown)
-- **Thinking indicator**: animated spinner while waiting for first token
-- **Response footer**: shows preset/pool name, actual provider label, model ID, token counts, response time
-- **Config strip**: always-visible top bar showing pools (with strategy), presets, and per-provider quota bars with color coding (green >50%, yellow 20-50%, red <20%)
-- **Quota auto-refresh**: bars update after each response
+- **Markdown rendering** with syntax highlighting (JS, Python, Bash, Rust, C++, etc.)
+- **Copy button** on code blocks
+- **Model picker** grouped by Presets, Pools, Providers
+- **Streaming** with animated thinking indicator
+- **Response metadata** (route, provider, model, tokens, duration)
+- **Quota bars** with color coding (green >50%, yellow 20-50%, red <20%)
+- **Token login** with localStorage persistence
 
 ### Response metadata
 
-Chat completion responses include extra fields showing the actual routing:
+Chat completion responses include extra fields:
 
 ```json
 {
@@ -489,7 +549,16 @@ Chat completion responses include extra fields showing the actual routing:
 }
 ```
 
-For streaming, these fields appear in the final chunk (alongside `usage`).
+### Persistent data files
+
+| File | Contents |
+|---|---|
+| `~/.pi/agent/multi-pass.json` | Config (subscriptions, pools, chains, presets) |
+| `~/.pi/agent/multi-pass-rules.json` | DLP policy rules |
+| `~/.pi/agent/multi-pass-users.json` | User accounts and permissions |
+| `~/.pi/agent/leeloo-audit.jsonl` | Audit log (rule violations, persisted) |
+| `~/.pi/agent/leeloo-usage.jsonl` | Usage log (per-user request tracking) |
+| `~/.pi/agent/auth.json` | OAuth credentials |
 
 ## Supported providers
 
@@ -534,7 +603,11 @@ Env entries merge with saved config.
 | File | Scope | Contains |
 |---|---|---|
 | `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains + presets |
+| `~/.pi/agent/multi-pass-rules.json` | Global | DLP policy rules (Leeloo) |
+| `~/.pi/agent/multi-pass-users.json` | Global | User accounts + permissions (Leeloo) |
 | `~/.pi/agent/auth.json` | Global | OAuth credentials (used by extension + Leeloo) |
+| `~/.pi/agent/leeloo-audit.jsonl` | Global | Audit log -- rule violations (persistent) |
+| `~/.pi/agent/leeloo-usage.jsonl` | Global | Usage log -- per-user request tracking |
 | `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
 
 ## License
