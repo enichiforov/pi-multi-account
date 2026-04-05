@@ -1204,8 +1204,11 @@ function handleKnownNames(req, res) {
 	// Chain names
 	const chainNames = config.chains.filter((c) => c.enabled).map((c) => ({ id: `chain:${c.name}`, label: c.name, type: "chain" }));
 
+	// Preset names
+	const presetNames = config.presets.filter((p) => p.enabled).map((p) => ({ id: p.name, label: p.name, type: "preset" }));
+
 	res.writeHead(200, json());
-	res.end(JSON.stringify({ providers: allNames, pools: poolNames, chains: chainNames }));
+	res.end(JSON.stringify({ providers: allNames, pools: poolNames, chains: chainNames, presets: presetNames }));
 }
 
 function handleAuthStatus(req, res) {

@@ -790,14 +790,50 @@ function UsersPanel() {
     // We need preset names too - fetch from config
   );
 
+  function ChipPicker({ label, items, available, onChange, emptyText }) {
+    function add(val) { if (val && !items.includes(val)) onChange([...items, val]); }
+    function remove(i) { onChange(items.filter((_, idx) => idx !== i)); }
+    const remaining = available.filter((a) => !items.includes(a));
+    return html`
+      <div className="full">
+        <label>${label}</label>
+        <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px", minHeight: "24px" }}>
+          ${items.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>${emptyText || "None (all access)"}</span>` : null}
+          ${items.map((item, i) => html`<span key=${item} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => remove(i)}>${item} ${"x"}</span>`)}
+        </div>
+        ${remaining.length > 0 ? html`
+          <select onChange=${(e) => { add(e.target.value); e.target.value = ""; }} style=${{ width: "100%" }}>
+            <option value="">+ Add...</option>
+            ${remaining.map((a) => html`<option key=${a} value=${a}>${a}</option>`)}
+          </select>
+        ` : null}
+      </div>
+    `;
+  }
+
+  const availablePresetNames = (names?.presets || []).map((p) => p.label);
+  const availablePoolNames = (names?.pools || []).map((p) => p.label);
+
   function renderForm() {
     const isNew = editing === "__new__";
     return html`
       <div className="card" style=${{ marginBottom: "12px" }}>
         <div className="form-grid">
-          ${isNew ? html`<div><label>Username</label><input value=${draft.username} onInput=${(e) => setDraft({ ...draft, username: e.target.value })} placeholder="e.g. alice" /></div>` : html`<div><label>Username</label><input value=${draft.username} disabled /></div>`}
-          <div className="full"><label>Allowed presets (comma-separated, empty = all)</label><input value=${draft.allowedPresets.join(", ")} onInput=${(e) => setDraft({ ...draft, allowedPresets: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} placeholder="coding-premium, fastest" /></div>
-          <div className="full"><label>Allowed pools (comma-separated, empty = all)</label><input value=${draft.allowedPools.join(", ")} onInput=${(e) => setDraft({ ...draft, allowedPools: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} placeholder="codex-pool, google-pool" /></div>
+          ${isNew ? html`<div className="full"><label>Username</label><input value=${draft.username} onInput=${(e) => setDraft({ ...draft, username: e.target.value })} placeholder="e.g. alice" /></div>` : html`<div className="full"><label>Username</label><input value=${draft.username} disabled style=${{ opacity: 0.6 }} /></div>`}
+          <${ChipPicker}
+            label="Allowed presets (empty = all access)"
+            items=${draft.allowedPresets}
+            available=${availablePresetNames}
+            onChange=${(v) => setDraft({ ...draft, allowedPresets: v })}
+            emptyText="No restrictions -- all presets allowed"
+          />
+          <${ChipPicker}
+            label="Allowed pools (empty = all access)"
+            items=${draft.allowedPools}
+            available=${availablePoolNames}
+            onChange=${(v) => setDraft({ ...draft, allowedPools: v })}
+            emptyText="No restrictions -- all pools allowed"
+          />
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save} disabled=${busy}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancelForm}>Cancel</button></div>
       </div>
