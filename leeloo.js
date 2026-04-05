@@ -1218,7 +1218,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </div>
 
 <script type="module">
-import * as smd from "https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js";
+let smd = null;
+try { smd = await import("https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js"); } catch {}
 const BASE = location.origin;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
@@ -1355,7 +1356,8 @@ async function sendMessage() {
   const t0 = Date.now();
   const rawSelection = sel.value;
   // Clean display: "pool:codex-pool/gpt-5.1" -> "codex-pool / gpt-5.1"
-  const selectedModel = rawSelection.replace(/^pool:([^/]+)\/(.+)$/, "$1 / $2").replace(/^provider:([^/]+)\/(.+)$/, "$1 / $2");
+  const selectedModel = rawSelection.includes("/") ? rawSelection.split("/").pop() : rawSelection;
+  const selectedRoute = rawSelection.replace("pool:", "").replace("provider:", "").replace("/", " / ");
 
   try {
     const resp = await fetch(BASE + "/v1/chat/completions", {
@@ -1394,11 +1396,12 @@ async function sendMessage() {
               mdBody.className = "md-body";
               msgDiv.innerHTML = "";
               msgDiv.appendChild(mdBody);
-              smdParser = smd.parser(smd.default_renderer(mdBody));
+              if (smd) smdParser = smd.parser(smd.default_renderer(mdBody));
               setStatus("busy", "receiving...");
             }
             full += d.content;
-            smd.parser_write(smdParser, d.content);
+            if (smdParser) smd.parser_write(smdParser, d.content);
+            else mdBody.textContent = full;
             chat.scrollTop = chat.scrollHeight;
           }
 
@@ -1409,12 +1412,13 @@ async function sendMessage() {
               mdBody.className = "md-body";
               msgDiv.innerHTML = "";
               msgDiv.appendChild(mdBody);
-              smdParser = smd.parser(smd.default_renderer(mdBody));
+              if (smd) smdParser = smd.parser(smd.default_renderer(mdBody));
             }
             const tc = d.tool_calls[0];
             const tcText = "\\n**Tool call:** \`" + (tc?.function?.name || "?") + "\`\\n";
             full += tcText;
-            smd.parser_write(smdParser, tcText);
+            if (smdParser) smd.parser_write(smdParser, tcText);
+            else mdBody.textContent = full;
           }
 
           if (j.usage) usage = j.usage;
@@ -1422,12 +1426,12 @@ async function sendMessage() {
           if (j.x_model) xModel = j.x_model;
 
           if (j.choices?.[0]?.finish_reason) {
-            if (smdParser) smd.parser_end(smdParser);
+            if (smdParser && smd) smd.parser_end(smdParser);
             const ms = Date.now() - t0;
             const meta = document.createElement("div");
             meta.className = "meta";
             const parts = [];
-            parts.push('<span class="provider-tag">' + esc(selectedModel) + '</span>');
+            parts.push('<span class="provider-tag">' + esc(selectedRoute) + '</span>');
             if (xProvider || xModel) {
               parts.push('<span style="color:#8af">' + esc(xProvider) + '</span> / <span style="color:#aaa">' + esc(xModel) + '</span>');
             }
