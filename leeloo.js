@@ -31,7 +31,7 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel, getModels, stream } from "@mariozechner/pi-ai";
@@ -50,7 +50,7 @@ const AGENT_DIR = getAgentDir();
 const CONFIG_PATH = join(AGENT_DIR, "multi-pass.json");
 
 function loadConfig() {
-	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [] };
+	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], rules: [] };
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 		return {
@@ -58,10 +58,17 @@ function loadConfig() {
 			pools: Array.isArray(raw.pools) ? raw.pools : [],
 			chains: Array.isArray(raw.chains) ? raw.chains : [],
 			presets: Array.isArray(raw.presets) ? raw.presets : [],
+			rules: Array.isArray(raw.rules) ? raw.rules : [],
 		};
 	} catch {
-		return { subscriptions: [], pools: [], chains: [], presets: [] };
+		return { subscriptions: [], pools: [], chains: [], presets: [], rules: [] };
 	}
+}
+
+function saveConfig(config) {
+	const dir = join(AGENT_DIR);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
 }
 
 const authStorage = AuthStorage.create();
@@ -400,6 +407,272 @@ function trackRequest(provider, modelId, usage, durationMs, error) {
 	s.tokens_out += entry.tokens_out;
 	if (error) s.errors++;
 	s.last_used = entry.timestamp;
+}
+
+// ─── Rule engine (DLP / policy enforcement) ─────────────────────────────────
+//
+// Rule types:
+//   block    - reject request/response if pattern matches
+//   redact   - replace pattern matches with placeholder text
+//   warn     - log but allow (audit trail)
+//   model    - restrict allowed models (allow/deny list)
+//   limit    - rate limiting per time window
+//   custom   - run a JS function for custom logic
+//
+// Each rule has: name, enabled, type, scope (request|response|both), patterns, action config
+
+const auditLog = [];
+const AUDIT_LOG_MAX = 1000;
+const rateLimitCounters = {}; // { ruleName: { count, windowStart } }
+
+function auditEvent(rule, action, detail, content) {
+	const entry = {
+		timestamp: new Date().toISOString(),
+		rule: rule.name,
+		type: rule.type,
+		action,
+		detail,
+		snippet: content ? content.slice(0, 200) : null,
+	};
+	auditLog.push(entry);
+	if (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
+	log(`[rule:${rule.name}] ${action}: ${detail}`);
+}
+
+/**
+ * Extract all text from OpenAI-format messages for pattern matching.
+ */
+function extractText(messages) {
+	const parts = [];
+	for (const m of messages) {
+		if (typeof m.content === "string") parts.push(m.content);
+		else if (Array.isArray(m.content)) {
+			for (const p of m.content) {
+				if (p.type === "text") parts.push(p.text);
+			}
+		}
+		if (m.tool_calls) {
+			for (const tc of m.tool_calls) {
+				parts.push(tc.function?.name || "");
+				parts.push(tc.function?.arguments || "");
+			}
+		}
+	}
+	return parts.join("\n");
+}
+
+/**
+ * Run content rules (block/redact/warn) against text.
+ * Returns { blocked, message, redacted } where redacted is the
+ * potentially modified messages array.
+ */
+function evaluateContentRules(rules, messages, scope) {
+	let text = extractText(messages);
+	let blocked = false;
+	let blockMessage = "";
+	let modified = false;
+
+	for (const rule of rules) {
+		if (!rule.enabled) continue;
+		if (rule.type !== "block" && rule.type !== "redact" && rule.type !== "warn") continue;
+		const ruleScope = rule.scope || "request";
+		if (ruleScope !== "both" && ruleScope !== scope) continue;
+
+		const patterns = (rule.patterns || []).map((p) => {
+			try { return new RegExp(p, "gi"); } catch { return null; }
+		}).filter(Boolean);
+
+		for (const re of patterns) {
+			if (re.test(text)) {
+				if (rule.type === "block") {
+					blocked = true;
+					blockMessage = rule.message || `Blocked by rule: ${rule.name}`;
+					auditEvent(rule, "blocked", blockMessage, text.match(re)?.[0]);
+				} else if (rule.type === "warn") {
+					auditEvent(rule, "warned", `Pattern matched: ${re.source}`, text.match(re)?.[0]);
+				} else if (rule.type === "redact") {
+					const replacement = rule.replacement || "[REDACTED]";
+					// Redact in all message contents
+					messages = messages.map((m) => {
+						if (typeof m.content === "string") {
+							return { ...m, content: m.content.replace(re, replacement) };
+						}
+						if (Array.isArray(m.content)) {
+							return { ...m, content: m.content.map((p) =>
+								p.type === "text" ? { ...p, text: p.text.replace(re, replacement) } : p
+							)};
+						}
+						return m;
+					});
+					modified = true;
+					auditEvent(rule, "redacted", `Pattern replaced: ${re.source}`, replacement);
+				}
+			}
+			re.lastIndex = 0; // reset global regex
+		}
+	}
+
+	return { blocked, message: blockMessage, messages: modified ? messages : messages };
+}
+
+/**
+ * Check model access rules. Returns { allowed, message }.
+ */
+function evaluateModelRules(rules, modelId) {
+	for (const rule of rules) {
+		if (!rule.enabled || rule.type !== "model") continue;
+		const allowList = rule.allow || [];
+		const denyList = rule.deny || [];
+
+		if (denyList.length > 0) {
+			for (const pattern of denyList) {
+				const re = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
+				if (re.test(modelId)) {
+					auditEvent(rule, "denied", `Model ${modelId} denied by ${pattern}`);
+					return { allowed: false, message: rule.message || `Model "${modelId}" is not allowed by policy "${rule.name}"` };
+				}
+			}
+		}
+		if (allowList.length > 0) {
+			const matched = allowList.some((pattern) => {
+				const re = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
+				return re.test(modelId);
+			});
+			if (!matched) {
+				auditEvent(rule, "denied", `Model ${modelId} not in allow list`);
+				return { allowed: false, message: rule.message || `Model "${modelId}" is not in the allowed list for policy "${rule.name}"` };
+			}
+		}
+	}
+	return { allowed: true };
+}
+
+/**
+ * Check rate limit rules. Returns { allowed, message, retryAfter }.
+ */
+function evaluateRateLimitRules(rules) {
+	const now = Date.now();
+	for (const rule of rules) {
+		if (!rule.enabled || rule.type !== "limit") continue;
+		const windowMs = (rule.windowSeconds || 60) * 1000;
+		const maxRequests = rule.maxRequests || 60;
+
+		if (!rateLimitCounters[rule.name]) {
+			rateLimitCounters[rule.name] = { count: 0, windowStart: now };
+		}
+		const counter = rateLimitCounters[rule.name];
+		if (now - counter.windowStart >= windowMs) {
+			counter.count = 0;
+			counter.windowStart = now;
+		}
+		counter.count++;
+		if (counter.count > maxRequests) {
+			const retryAfter = Math.ceil((counter.windowStart + windowMs - now) / 1000);
+			auditEvent(rule, "rate-limited", `${counter.count}/${maxRequests} in ${rule.windowSeconds || 60}s window`);
+			return { allowed: false, message: rule.message || `Rate limit exceeded: ${maxRequests} requests per ${rule.windowSeconds || 60}s`, retryAfter };
+		}
+	}
+	return { allowed: true };
+}
+
+/**
+ * Redact patterns in response text (for response-scoped rules).
+ */
+function redactResponse(rules, text) {
+	for (const rule of rules) {
+		if (!rule.enabled || rule.type !== "redact") continue;
+		const scope = rule.scope || "request";
+		if (scope !== "response" && scope !== "both") continue;
+		const replacement = rule.replacement || "[REDACTED]";
+		for (const p of (rule.patterns || [])) {
+			try {
+				const re = new RegExp(p, "gi");
+				if (re.test(text)) {
+					auditEvent(rule, "redacted-response", `Pattern replaced: ${re.source}`);
+					re.lastIndex = 0;
+					text = text.replace(re, replacement);
+				}
+			} catch {}
+		}
+	}
+	return text;
+}
+
+/**
+ * Check response text against block rules.
+ */
+function checkResponseBlock(rules, text) {
+	for (const rule of rules) {
+		if (!rule.enabled || rule.type !== "block") continue;
+		const scope = rule.scope || "request";
+		if (scope !== "response" && scope !== "both") continue;
+		for (const p of (rule.patterns || [])) {
+			try {
+				const re = new RegExp(p, "gi");
+				if (re.test(text)) {
+					auditEvent(rule, "blocked-response", `Pattern matched: ${re.source}`, text.match(re)?.[0]);
+					return { blocked: true, message: rule.message || `Response blocked by rule: ${rule.name}` };
+				}
+			} catch {}
+		}
+	}
+	return { blocked: false };
+}
+
+// ─── Rules API handlers ──────────────────────────────────────────────────────
+
+function handleRulesList(req, res) {
+	const config = loadConfig();
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ rules: config.rules || [] }));
+}
+
+async function handleRulesCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const rule = {
+		name: body.name || `rule-${Date.now()}`,
+		enabled: body.enabled !== false,
+		type: body.type || "warn",
+		scope: body.scope || "request",
+		patterns: body.patterns || [],
+		replacement: body.replacement,
+		message: body.message,
+		allow: body.allow,
+		deny: body.deny,
+		maxRequests: body.maxRequests,
+		windowSeconds: body.windowSeconds,
+	};
+	config.rules.push(rule);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ rule }));
+}
+
+async function handleRulesUpdate(req, res, ruleName) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.rules.findIndex((r) => r.name === ruleName);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Rule not found" } })); return; }
+	config.rules[idx] = { ...config.rules[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ rule: config.rules[idx] }));
+}
+
+function handleRulesDelete(req, res, ruleName) {
+	const config = loadConfig();
+	config.rules = config.rules.filter((r) => r.name !== ruleName);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: ruleName }));
+}
+
+function handleAuditLog(req, res) {
+	const url = new URL(req.url, `http://localhost:${PORT}`);
+	const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ entries: auditLog.slice(-limit).reverse() }));
 }
 
 /** Sort providers by quota (best first). Providers with unknown quota go last. */
@@ -967,6 +1240,18 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 		}
 	}
 
+	// ── Response-side rule evaluation ──
+	const respRules = loadConfig().rules || [];
+	if (respRules.length > 0 && fullText) {
+		const respBlock = checkResponseBlock(respRules, fullText);
+		if (respBlock.blocked) {
+			res.writeHead(403, json());
+			res.end(JSON.stringify({ error: { message: respBlock.message } }));
+			return;
+		}
+		fullText = redactResponse(respRules, fullText);
+	}
+
 	const message = { role: "assistant" };
 	if (toolCalls.length > 0) {
 		message.content = fullText || null;
@@ -1016,6 +1301,33 @@ async function handleChatCompletions(req, res) {
 		res.writeHead(400, json());
 		res.end(JSON.stringify({ error: { message: "model and messages are required" } }));
 		return;
+	}
+
+	// ── Rule evaluation: pre-flight ──
+	const rules = loadConfig().rules || [];
+	if (rules.length > 0) {
+		// Rate limits
+		const rateCheck = evaluateRateLimitRules(rules);
+		if (!rateCheck.allowed) {
+			res.writeHead(429, { ...json(), ...(rateCheck.retryAfter ? { "Retry-After": String(rateCheck.retryAfter) } : {}) });
+			res.end(JSON.stringify({ error: { message: rateCheck.message } }));
+			return;
+		}
+		// Model access
+		const modelCheck = evaluateModelRules(rules, requestModelId);
+		if (!modelCheck.allowed) {
+			res.writeHead(403, json());
+			res.end(JSON.stringify({ error: { message: modelCheck.message } }));
+			return;
+		}
+		// Content: block/redact/warn on request
+		const contentCheck = evaluateContentRules(rules, parsed.messages, "request");
+		if (contentCheck.blocked) {
+			res.writeHead(403, json());
+			res.end(JSON.stringify({ error: { message: contentCheck.message } }));
+			return;
+		}
+		parsed.messages = contentCheck.messages; // may be redacted
 	}
 
 	const candidates = await resolveCandidates(requestModelId);
@@ -1288,6 +1600,248 @@ function json() { return { "Content-Type": "application/json" }; }
 function log(...a) { console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a); }
 
 // ─── Chat UI ──────────────────────────────────────────────────────────────────
+
+function handleAdmin(req, res) {
+	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+	res.end(ADMIN_UI_HTML);
+}
+
+const ADMIN_UI_HTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leeloo Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:16px}
+header h1{font-size:15px;color:#f90;font-weight:700}
+header a{color:#666;text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid #333;border-radius:5px}
+header a:hover{color:#aaa;border-color:#666}
+.tabs{display:flex;gap:0;border-bottom:1px solid #222;background:#111}
+.tab{padding:10px 20px;font-size:13px;color:#888;cursor:pointer;border-bottom:2px solid transparent}
+.tab:hover{color:#ccc}
+.tab.active{color:#f90;border-color:#f90}
+.panel{flex:1;overflow-y:auto;padding:20px;display:none}
+.panel.active{display:block}
+h2{font-size:14px;color:#999;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px}
+.card{background:#111;border:1px solid #222;border-radius:8px;padding:14px;margin-bottom:10px}
+.card .name{font-weight:600;color:#eee;font-size:14px}
+.card .meta{font-size:11px;color:#666;margin-top:4px}
+.card .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600}
+.badge.on{background:#1a3a1a;color:#4a4;border:1px solid #2a4a2a}
+.badge.off{background:#3a1a1a;color:#a44;border:1px solid #4a2a2a}
+.badge.block{background:#3a1a1a;color:#f66}
+.badge.redact{background:#3a2a1a;color:#fa0}
+.badge.warn{background:#1a2a3a;color:#6af}
+.badge.model{background:#2a1a3a;color:#a6f}
+.badge.limit{background:#1a1a2a;color:#66f}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #1a1a1a}
+th{color:#888;font-weight:600;font-size:11px;text-transform:uppercase}
+td{color:#ccc}
+.bar{display:inline-block;width:50px;height:8px;background:#222;border-radius:4px;overflow:hidden;vertical-align:middle}
+.bar-fill{height:100%;border-radius:4px}
+.btn{background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:5px;padding:5px 12px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:#666;color:#fff}
+.btn.danger{border-color:#4a2a2a;color:#f66}
+.btn.danger:hover{background:#3a1a1a}
+.btn.primary{background:#f90;color:#000;border-color:#f90;font-weight:600}
+.form{display:flex;flex-direction:column;gap:8px;max-width:500px}
+.form label{font-size:12px;color:#888}
+.form input,.form select,.form textarea{background:#1a1a1a;color:#eee;border:1px solid #333;border-radius:5px;padding:6px 10px;font-size:13px;font-family:inherit}
+.form input:focus,.form select:focus,.form textarea:focus{border-color:#f90;outline:none}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px}
+.stat-card{background:#111;border:1px solid #222;border-radius:8px;padding:14px;text-align:center}
+.stat-card .num{font-size:24px;font-weight:700;color:#f90}
+.stat-card .label{font-size:11px;color:#666;margin-top:4px}
+.empty{color:#555;font-style:italic;padding:20px;text-align:center}
+</style>
+</head><body>
+<header>
+  <h1>Leeloo Admin</h1>
+  <a href="/ui">Chat UI</a>
+  <a href="/health">Health API</a>
+</header>
+<div class="tabs">
+  <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
+  <div class="tab" onclick="showTab('rules')">Rules</div>
+  <div class="tab" onclick="showTab('audit')">Audit Log</div>
+  <div class="tab" onclick="showTab('config')">Config</div>
+</div>
+
+<div id="dashboard" class="panel active"></div>
+<div id="rules" class="panel"></div>
+<div id="audit" class="panel"></div>
+<div id="config" class="panel"></div>
+
+<script>
+const BASE = location.origin;
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function showTab(id){document.querySelectorAll(".tab").forEach((t,i)=>{t.classList.toggle("active",t.textContent.toLowerCase().replace(" ","")===id)});document.querySelectorAll(".panel").forEach(p=>{p.classList.toggle("active",p.id===id)});loaders[id]?.()}
+function qc(pct){return pct==null?"#555":pct>50?"#4a4":pct>20?"#ca0":"#e44"}
+function bar(pct){if(pct==null)return"--";return'<span class="bar"><span class="bar-fill" style="width:'+pct+"%;background:"+qc(pct)+'"></span></span> '+pct+"%"}
+function ago(ts){if(!ts)return"--";const d=Date.now()-new Date(ts).getTime();if(d<60000)return Math.round(d/1000)+"s ago";if(d<3600000)return Math.round(d/60000)+"m ago";return Math.round(d/3600000)+"h ago"}
+
+const loaders = {
+  async dashboard() {
+    const [stats,quota,health] = await Promise.all([
+      fetch(BASE+"/v1/stats").then(r=>r.json()),
+      fetch(BASE+"/v1/quota").then(r=>r.json()),
+      fetch(BASE+"/health").then(r=>r.json()),
+    ]);
+    const s = stats.session||{};
+    let h = '<h2>Session Overview</h2><div class="stat-grid">';
+    h += '<div class="stat-card"><div class="num">'+s.total_requests+'</div><div class="label">Requests</div></div>';
+    h += '<div class="stat-card"><div class="num">'+s.total_tokens_in+'</div><div class="label">Tokens In</div></div>';
+    h += '<div class="stat-card"><div class="num">'+s.total_tokens_out+'</div><div class="label">Tokens Out</div></div>';
+    h += '<div class="stat-card"><div class="num">'+s.total_errors+'</div><div class="label">Errors</div></div>';
+    h += '</div>';
+
+    h += '<h2>Provider Health</h2><table><tr><th>Provider</th><th>Quota</th><th>Status</th><th>Requests</th><th>Tokens</th><th>Last Used</th></tr>';
+    for(const p of quota.providers||[]){
+      const ps = (stats.providers||[]).find(x=>x.provider===p.provider)||{};
+      const exh = (health.exhausted||[]).includes(p.provider);
+      h+='<tr><td>'+esc(p.label||p.provider)+'</td><td>'+bar(p.score)+'</td>';
+      h+='<td>'+(exh?'<span class="badge off">exhausted</span>':'<span class="badge on">'+esc(p.status)+'</span>')+'</td>';
+      h+='<td>'+(ps.requests||0)+'</td><td>'+(ps.tokens_in||0)+' / '+(ps.tokens_out||0)+'</td>';
+      h+='<td>'+ago(ps.last_used)+'</td></tr>';
+    }
+    h+='</table>';
+
+    h+='<h2>Recent Requests</h2><table><tr><th>Time</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th></tr>';
+    for(const r of (stats.recent||[]).slice(0,20)){
+      h+='<tr><td>'+ago(r.timestamp)+'</td><td>'+esc(r.provider)+'</td><td>'+esc(r.model)+'</td>';
+      h+='<td>'+r.tokens_in+' / '+r.tokens_out+'</td><td>'+r.duration_ms+'ms</td>';
+      h+='<td>'+(r.error?'<span class="badge off">'+esc(r.error).slice(0,40)+'</span>':'--')+'</td></tr>';
+    }
+    h+='</table>';
+    document.getElementById("dashboard").innerHTML = h;
+  },
+
+  async rules() {
+    const data = await fetch(BASE+"/v1/rules").then(r=>r.json());
+    let h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><h2 style="margin:0">Policy Rules</h2><button class="btn primary" onclick="showRuleForm()">+ Add Rule</button></div>';
+    h += '<div id="rule-form-area"></div>';
+    if(!data.rules||data.rules.length===0){h+='<div class="empty">No rules configured. Add rules to enforce DLP policies, model restrictions, or rate limits.</div>';}
+    else{for(const r of data.rules){
+      h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div>';
+      h+='<span class="name">'+esc(r.name)+'</span> ';
+      h+='<span class="badge '+esc(r.type)+'">'+esc(r.type)+'</span> ';
+      h+='<span class="badge '+(r.enabled?"on":"off")+'">'+(r.enabled?"enabled":"disabled")+'</span>';
+      h+='</div><div>';
+      h+='<button class="btn" onclick="toggleRule(\''+esc(r.name)+'\','+(!r.enabled)+')">'+(r.enabled?"Disable":"Enable")+'</button> ';
+      h+='<button class="btn danger" onclick="deleteRule(\''+esc(r.name)+'\')">Delete</button>';
+      h+='</div></div>';
+      h+='<div class="meta">';
+      if(r.scope)h+='scope: '+esc(r.scope)+' | ';
+      if(r.patterns?.length)h+='patterns: '+r.patterns.map(p=>esc(p)).join(", ")+' | ';
+      if(r.allow?.length)h+='allow: '+r.allow.join(", ")+' | ';
+      if(r.deny?.length)h+='deny: '+r.deny.join(", ")+' | ';
+      if(r.maxRequests)h+=r.maxRequests+' req/'+r.windowSeconds+'s | ';
+      if(r.replacement)h+='replacement: '+esc(r.replacement)+' | ';
+      if(r.message)h+='message: '+esc(r.message);
+      h+='</div></div>';
+    }}
+    document.getElementById("rules").innerHTML = h;
+  },
+
+  async audit() {
+    const data = await fetch(BASE+"/v1/audit").then(r=>r.json());
+    let h = '<h2>Audit Log</h2>';
+    if(!data.entries?.length){h+='<div class="empty">No audit events yet. Events appear when rules match requests or responses.</div>';}
+    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Detail</th><th>Snippet</th></tr>';
+    for(const e of data.entries){
+      h+='<tr><td>'+ago(e.timestamp)+'</td><td>'+esc(e.rule)+'</td>';
+      h+='<td><span class="badge '+esc(e.type)+'">'+esc(e.type)+'</span></td>';
+      h+='<td>'+esc(e.action)+'</td><td>'+esc(e.detail)+'</td>';
+      h+='<td>'+(e.snippet?esc(e.snippet):'--')+'</td></tr>';
+    }h+='</table>';}
+    document.getElementById("audit").innerHTML = h;
+  },
+
+  async config() {
+    const [health,routing] = await Promise.all([
+      fetch(BASE+"/health").then(r=>r.json()),
+      fetch(BASE+"/v1/routing").then(r=>r.json()),
+    ]);
+    let h = '<h2>Active Configuration</h2>';
+    h+='<h2 style="font-size:12px;margin-top:16px">Pools</h2>';
+    for(const p of health.pools||[]){
+      h+='<div class="card"><span class="name">'+esc(p.name)+'</span> <span class="badge on">'+esc(p.strategy)+'</span>';
+      h+='<div class="meta">Members: '+p.members.map(m=>esc(m)).join(", ")+'</div></div>';
+    }
+    h+='<h2 style="font-size:12px;margin-top:16px">Chains</h2>';
+    if(!health.chains?.length)h+='<div class="empty">No chains</div>';
+    else for(const c of health.chains){h+='<div class="card"><span class="name">'+esc(c)+'</span></div>';}
+    h+='<h2 style="font-size:12px;margin-top:16px">Presets</h2>';
+    for(const p of health.presets||[]){
+      h+='<div class="card"><span class="name">'+esc(p.name)+'</span>';
+      h+='<div class="meta">'+p.entries.map(e=>esc(e)).join(" -> ")+'</div></div>';
+    }
+    h+='<h2 style="font-size:12px;margin-top:16px">Providers</h2>';
+    for(const p of health.providers||[]){
+      const exh=(health.exhausted||[]).includes(p);
+      h+='<div class="card"><span class="name">'+esc(p)+'</span> <span class="badge '+(exh?"off":"on")+'">'+(exh?"exhausted":"ok")+'</span></div>';
+    }
+    document.getElementById("config").innerHTML = h;
+  }
+};
+
+async function toggleRule(name,enabled){
+  await fetch(BASE+"/v1/rules/"+encodeURIComponent(name),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});
+  loaders.rules();
+}
+async function deleteRule(name){
+  if(!confirm("Delete rule "+name+"?"))return;
+  await fetch(BASE+"/v1/rules/"+encodeURIComponent(name),{method:"DELETE"});
+  loaders.rules();
+}
+function showRuleForm(){
+  const area=document.getElementById("rule-form-area");
+  if(area.innerHTML){area.innerHTML="";return;}
+  area.innerHTML='<div class="card"><div class="form">'
+    +'<label>Name</label><input id="rf-name" placeholder="e.g. block-secrets">'
+    +'<label>Type</label><select id="rf-type"><option value="block">block</option><option value="redact">redact</option><option value="warn">warn</option><option value="model">model (allow/deny)</option><option value="limit">rate limit</option></select>'
+    +'<label>Scope</label><select id="rf-scope"><option value="request">request</option><option value="response">response</option><option value="both">both</option></select>'
+    +'<label>Patterns (one per line, regex)</label><textarea id="rf-patterns" rows="3" placeholder="AKIA[0-9A-Z]{16}\\nsk-[a-zA-Z0-9]{48}"></textarea>'
+    +'<label>Replacement (for redact)</label><input id="rf-replacement" placeholder="[REDACTED]">'
+    +'<label>Message (shown when blocked)</label><input id="rf-message" placeholder="Request blocked: contains secrets">'
+    +'<label>Model allow list (comma-separated, for model type)</label><input id="rf-allow" placeholder="claude-*, gpt-5*">'
+    +'<label>Model deny list</label><input id="rf-deny" placeholder="gpt-4o*">'
+    +'<label>Max requests (for limit type)</label><input id="rf-max" type="number" placeholder="60">'
+    +'<label>Window seconds</label><input id="rf-window" type="number" placeholder="60">'
+    +'<div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary" onclick="createRule()">Create Rule</button><button class="btn" onclick="document.getElementById(\'rule-form-area\').innerHTML=\'\'">Cancel</button></div>'
+    +'</div></div>';
+}
+async function createRule(){
+  const type=document.getElementById("rf-type").value;
+  const rule={
+    name:document.getElementById("rf-name").value||"rule-"+Date.now(),
+    type,
+    enabled:true,
+    scope:document.getElementById("rf-scope").value,
+    patterns:document.getElementById("rf-patterns").value.split("\\n").filter(Boolean),
+    replacement:document.getElementById("rf-replacement").value||undefined,
+    message:document.getElementById("rf-message").value||undefined,
+  };
+  if(type==="model"){
+    const allow=document.getElementById("rf-allow").value;
+    const deny=document.getElementById("rf-deny").value;
+    if(allow)rule.allow=allow.split(",").map(s=>s.trim()).filter(Boolean);
+    if(deny)rule.deny=deny.split(",").map(s=>s.trim()).filter(Boolean);
+  }
+  if(type==="limit"){
+    rule.maxRequests=parseInt(document.getElementById("rf-max").value)||60;
+    rule.windowSeconds=parseInt(document.getElementById("rf-window").value)||60;
+  }
+  await fetch(BASE+"/v1/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rule)});
+  document.getElementById("rule-form-area").innerHTML="";
+  loaders.rules();
+}
+
+loaders.dashboard();
+</script>
+</body></html>`;
 
 function handleUI(req, res) {
 	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -1664,7 +2218,13 @@ const server = createServer(async (req, res) => {
 		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
 		else if (path === "/v1/quota" && req.method === "GET") await handleQuota(req, res);
 		else if (path === "/v1/stats" && req.method === "GET") handleStats(req, res);
+		else if (path === "/v1/rules" && req.method === "GET") handleRulesList(req, res);
+		else if (path === "/v1/rules" && req.method === "POST") await handleRulesCreate(req, res);
+		else if (path.startsWith("/v1/rules/") && req.method === "PUT") await handleRulesUpdate(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
+		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
+		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
+		else if (path === "/admin") handleAdmin(req, res);
 		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
 	} catch (err) {
@@ -1697,7 +2257,10 @@ server.listen(PORT, () => {
   GET  /v1/models             (all models + preset names)
   GET  /v1/quota              (detailed quota per provider)
   GET  /v1/stats              (usage stats + request log)
+  GET  /v1/rules              (policy rules CRUD)
+  GET  /v1/audit              (rule violation audit log)
   GET  /health
+  GET  /admin                 Admin dashboard + rule editor
   GET  /ui                    Chat UI
 
   OPENAI_BASE_URL=http://localhost:${PORT}/v1
