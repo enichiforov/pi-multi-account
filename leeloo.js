@@ -390,12 +390,23 @@ function tryGetModel(providerName, modelId) {
 async function resolveCandidates(modelId) {
 	const config = loadConfig();
 
-	// ── 0. Pool-scoped: "pool:<name>/<model>" ──
-	const poolMatch = modelId.match(/^pool:([^/]+)\/(.+)$/);
+	// ── 0. Pool-scoped: "pool:<name>" or "pool:<name>/<model>" ──
+	const poolMatch = modelId.match(/^pool:([^/]+)(?:\/(.+))?$/);
 	if (poolMatch) {
-		const [, poolName, actualModel] = poolMatch;
+		const poolName = poolMatch[1];
+		let actualModel = poolMatch[2];
 		const pool = config.pools.find((p) => p.name === poolName && p.enabled);
 		if (!pool) return [];
+
+		// Auto-pick default model if none specified
+		if (!actualModel) {
+			try {
+				const models = getModels(pool.baseProvider);
+				if (models.length > 0) actualModel = models[0].id;
+			} catch {}
+			if (!actualModel) return [];
+		}
+
 		const candidates = [];
 		const members = pool.members.filter((m) => isAvailable(m));
 
@@ -1012,7 +1023,7 @@ function handleRouting(req, res) {
 		});
 	}
 
-	// Pools -- each pool as a selectable group with specific models
+	// Pools -- pool-level entry (auto-picks default model) + per-model entries
 	const enabledPools = config.pools.filter((p) => p.enabled);
 	if (enabledPools.length > 0) {
 		const poolItems = [];
@@ -1022,11 +1033,20 @@ function handleRouting(req, res) {
 				const available = pool.members.filter((m) => authStorage.hasAuth(m));
 				if (available.length === 0) continue;
 				const strat = pool.strategy || "round-robin";
-				// Pool-level entries with specific models
+				const defaultModel = models[0]?.id || "?";
+
+				// Pool-level auto entry
+				poolItems.push({
+					id: `pool:${pool.name}`,
+					name: `${pool.name}`,
+					detail: `[${strat}] ${available.length} members, default: ${defaultModel}`,
+				});
+
+				// Per-model entries
 				for (const m of models) {
 					poolItems.push({
 						id: `pool:${pool.name}/${m.id}`,
-						name: `${pool.name} / ${m.id}`,
+						name: `  ${pool.name} / ${m.id}`,
 						detail: `[${strat}] via ${available.join(", ")}`,
 					});
 				}
