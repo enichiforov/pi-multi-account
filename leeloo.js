@@ -1729,8 +1729,8 @@ const loaders = {
       h+='<span class="badge '+esc(r.type)+'">'+esc(r.type)+'</span> ';
       h+='<span class="badge '+(r.enabled?"on":"off")+'">'+(r.enabled?"enabled":"disabled")+'</span>';
       h+='</div><div>';
-      h+='<button class="btn" onclick="toggleRule(\''+esc(r.name)+'\','+(!r.enabled)+')">'+(r.enabled?"Disable":"Enable")+'</button> ';
-      h+='<button class="btn danger" onclick="deleteRule(\''+esc(r.name)+'\')">Delete</button>';
+      h+='<button class="btn" data-action="toggle" data-rule="'+esc(r.name)+'" data-val="'+(!r.enabled)+'">'+(r.enabled?"Disable":"Enable")+'</button> ';
+      h+='<button class="btn danger" data-action="delete" data-rule="'+esc(r.name)+'">Delete</button>';
       h+='</div></div>';
       h+='<div class="meta">';
       if(r.scope)h+='scope: '+esc(r.scope)+' | ';
@@ -1810,7 +1810,7 @@ function showRuleForm(){
     +'<label>Model deny list</label><input id="rf-deny" placeholder="gpt-4o*">'
     +'<label>Max requests (for limit type)</label><input id="rf-max" type="number" placeholder="60">'
     +'<label>Window seconds</label><input id="rf-window" type="number" placeholder="60">'
-    +'<div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary" onclick="createRule()">Create Rule</button><button class="btn" onclick="document.getElementById(\'rule-form-area\').innerHTML=\'\'">Cancel</button></div>'
+    +'<div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary" data-action="create-rule">Create Rule</button><button class="btn" data-action="cancel-form">Cancel</button></div>'
     +'</div></div>';
 }
 async function createRule(){
@@ -1838,6 +1838,17 @@ async function createRule(){
   document.getElementById("rule-form-area").innerHTML="";
   loaders.rules();
 }
+
+// Event delegation for dynamic buttons
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const action = btn.dataset.action;
+  if (action === "toggle") { await toggleRule(btn.dataset.rule, btn.dataset.val === "true"); }
+  else if (action === "delete") { await deleteRule(btn.dataset.rule); }
+  else if (action === "create-rule") { await createRule(); }
+  else if (action === "cancel-form") { document.getElementById("rule-form-area").innerHTML = ""; }
+});
 
 loaders.dashboard();
 </script>
