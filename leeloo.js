@@ -1060,7 +1060,7 @@ const CHAT_UI_HTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Leeloo Dallas Multi Pass</title>
-<script src="https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js"></script>
+
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
@@ -1163,7 +1163,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
 
-<script>
+<script type="module">
+import * as smd from "https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js";
 const BASE = location.origin;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
