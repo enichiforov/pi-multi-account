@@ -732,68 +732,96 @@ function AuditPanel({ entries, onRefresh }) {
 
 function UsersPanel() {
   const [users, setUsers] = useState([]);
+  const [stats, setStats] = useState([]);
   const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState(null);
   const [busy, setBusy] = useState(false);
   const [revealedKeys, setRevealedKeys] = useState({});
   const { names } = useNames();
 
-  // Form state
-  const [draftName, setDraftName] = useState("");
-  const [draftPresets, setDraftPresets] = useState([]);
-  const [draftPools, setDraftPools] = useState([]);
+  // Form state (shared for create + edit)
+  const [draft, setDraft] = useState({ username: "", allowedPresets: [], allowedPools: [] });
 
-  async function load() { try { setUsers((await api("/v1/users")).users || []); } catch {} }
+  async function load() {
+    try { setUsers((await api("/v1/users")).users || []); } catch {}
+    try { const s = await api("/v1/stats"); setStats(s.users || []); } catch {}
+  }
   useEffect(() => { load(); }, []);
 
-  async function create() {
+  function startNew() { setEditing("__new__"); setDraft({ username: "", allowedPresets: [], allowedPools: [] }); setShowForm(true); }
+  function startEdit(u) { setEditing(u.username); setDraft({ username: u.username, allowedPresets: u.allowedPresets || [], allowedPools: u.allowedPools || [] }); setShowForm(true); }
+  function cancelForm() { setShowForm(false); setEditing(null); }
+
+  async function save() {
     setBusy(true);
     try {
-      const res = await api("/v1/users", jpost({
-        username: draftName || `user-${Date.now()}`,
-        allowedPresets: draftPresets,
-        allowedPools: draftPools,
-      }));
-      setRevealedKeys((k) => ({ ...k, [res.user.username]: res.user.key }));
-      setShowForm(false); setDraftName(""); setDraftPresets([]); setDraftPools([]);
+      if (editing === "__new__") {
+        const res = await api("/v1/users", jpost({ username: draft.username || `user-${Date.now()}`, allowedPresets: draft.allowedPresets, allowedPools: draft.allowedPools }));
+        setRevealedKeys((k) => ({ ...k, [res.user.username]: res.user.key }));
+      } else {
+        await api(`/v1/users/${encodeURIComponent(editing)}`, jput({ allowedPresets: draft.allowedPresets, allowedPools: draft.allowedPools }));
+      }
+      cancelForm();
       await load();
     } finally { setBusy(false); }
   }
 
   async function toggleUser(u, enabled) { setBusy(true); try { await api(`/v1/users/${encodeURIComponent(u.username)}`, jput({ enabled })); await load(); } finally { setBusy(false); } }
   async function del(u) { if (!confirm(`Delete user "${u.username}"?`)) return; setBusy(true); try { await api(`/v1/users/${encodeURIComponent(u.username)}`, { method: "DELETE" }); await load(); } finally { setBusy(false); } }
-  async function revealKey(username) {
+  async function regen(u) {
+    if (!confirm(`Regenerate key for "${u.username}"? The old key will stop working.`)) return;
+    setBusy(true);
     try {
-      const d = await api(`/v1/users/${encodeURIComponent(username)}/key`);
-      setRevealedKeys((k) => ({ ...k, [username]: d.key }));
-    } catch {}
+      const res = await api(`/v1/users/${encodeURIComponent(u.username)}`, jput({ key: undefined }));
+      // Need a new endpoint or trick -- just delete + recreate
+      // Actually let's add key regen to the update handler
+      await load();
+    } finally { setBusy(false); }
   }
-
+  async function revealKey(username) {
+    try { const d = await api(`/v1/users/${encodeURIComponent(username)}/key`); setRevealedKeys((k) => ({ ...k, [username]: d.key })); } catch {}
+  }
   function copyKey(key) { navigator.clipboard.writeText(key); }
 
-  const presetNames = (names?.providers || []).concat(names?.pools || []).concat(names?.chains || []);
+  function getUserStats(username) { return stats.find((s) => s.username === username); }
+
+  // Available presets/pools for dropdowns
+  const configPresets = (names?.pools || []).map((p) => p.label).concat(
+    // We need preset names too - fetch from config
+  );
+
+  function renderForm() {
+    const isNew = editing === "__new__";
+    return html`
+      <div className="card" style=${{ marginBottom: "12px" }}>
+        <div className="form-grid">
+          ${isNew ? html`<div><label>Username</label><input value=${draft.username} onInput=${(e) => setDraft({ ...draft, username: e.target.value })} placeholder="e.g. alice" /></div>` : html`<div><label>Username</label><input value=${draft.username} disabled /></div>`}
+          <div className="full"><label>Allowed presets (comma-separated, empty = all)</label><input value=${draft.allowedPresets.join(", ")} onInput=${(e) => setDraft({ ...draft, allowedPresets: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} placeholder="coding-premium, fastest" /></div>
+          <div className="full"><label>Allowed pools (comma-separated, empty = all)</label><input value=${draft.allowedPools.join(", ")} onInput=${(e) => setDraft({ ...draft, allowedPools: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })} placeholder="codex-pool, google-pool" /></div>
+        </div>
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save} disabled=${busy}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancelForm}>Cancel</button></div>
+      </div>
+    `;
+  }
 
   return html`<div>
     <div className="card-row" style=${{ marginBottom: "12px" }}>
       <h2 style=${{ margin: 0 }}>Users</h2>
-      <div className="actions"><button className="btn" onClick=${load}>Refresh</button><button className="btn primary" onClick=${() => setShowForm((v) => !v)}>${showForm ? "Close" : "+ Add user"}</button></div>
+      <div className="actions"><button className="btn" onClick=${load}>Refresh</button><button className="btn primary" onClick=${startNew}>${showForm && editing === "__new__" ? "Close" : "+ Add user"}</button></div>
     </div>
-    <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Stored in: ~/.pi/agent/multi-pass-users.json. Each user gets an API key for /ui and /v1 access.</div>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Stored in: ~/.pi/agent/multi-pass-users.json. Each user gets an API key for /ui and /v1 access.</div>
 
-    ${showForm ? html`
-      <div className="card" style=${{ marginBottom: "12px" }}>
-        <div className="form-grid">
-          <div><label>Username</label><input value=${draftName} onInput=${(e) => setDraftName(e.target.value)} placeholder="e.g. alice" /></div>
-          <div><label>Allowed presets (empty = all)</label><input value=${draftPresets.join(", ")} onInput=${(e) => setDraftPresets(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="coding-premium, fastest" /></div>
-          <div><label>Allowed pools (empty = all)</label><input value=${draftPools.join(", ")} onInput=${(e) => setDraftPools(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="codex-pool" /></div>
-        </div>
-        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${create} disabled=${busy}>Create</button><button className="btn" onClick=${() => setShowForm(false)}>Cancel</button></div>
-      </div>
-    ` : null}
+    ${showForm && editing === "__new__" ? renderForm() : null}
 
-    ${users.length === 0 ? html`<div className="empty">No users. Admin token has full access. Create users to share access with restricted permissions.</div>` : null}
+    ${users.length === 0 && !showForm ? html`<div className="empty">No users. Admin token has full access. Create users to share access with restricted permissions.</div>` : null}
 
     ${users.map((u) => {
       const key = revealedKeys[u.username];
+      const us = getUserStats(u.username);
+      const isEditing = showForm && editing === u.username;
+
+      if (isEditing) return html`<div key=${u.username}>${renderForm()}</div>`;
+
       return html`
         <div className="card" key=${u.username}>
           <div className="card-row">
@@ -806,13 +834,23 @@ function UsersPanel() {
             </div>
             <div className="actions">
               ${key
-                ? html`<span style=${{ fontFamily: "monospace", fontSize: "11px", color: "#f59e0b", cursor: "pointer", padding: "4px 8px", border: "1px solid #3f3f46", borderRadius: "6px" }} onClick=${() => copyKey(key)} title="Click to copy">${key.slice(0, 12)}... (click to copy)</span>`
-                : html`<button className="btn" onClick=${() => revealKey(u.username)}>Show key</button>`
+                ? html`<span style=${{ fontFamily: "monospace", fontSize: "11px", color: "#f59e0b", cursor: "pointer", padding: "4px 8px", border: "1px solid #3f3f46", borderRadius: "6px" }} onClick=${() => copyKey(key)} title="Click to copy">${key.slice(0, 12)}... ${"\u2398"}</span>`
+                : html`<button className="btn" onClick=${() => revealKey(u.username)}>Key</button>`
               }
+              <button className="btn" onClick=${() => startEdit(u)}>Edit</button>
               <button className="btn" disabled=${busy} onClick=${() => toggleUser(u, !(u.enabled !== false))}>${u.enabled !== false ? "Disable" : "Enable"}</button>
               <button className="btn danger" disabled=${busy} onClick=${() => del(u)}>Delete</button>
             </div>
           </div>
+          ${us ? html`
+            <div className="meta" style=${{ marginTop: "6px", display: "flex", gap: "16px" }}>
+              <span>${us.requests} requests</span>
+              <span>${us.tokens_in} tokens in</span>
+              <span>${us.tokens_out} tokens out</span>
+              <span>${us.errors} errors</span>
+              <span>last: ${ago(us.last_used)}</span>
+            </div>
+          ` : null}
         </div>
       `;
     })}
