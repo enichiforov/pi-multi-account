@@ -425,10 +425,11 @@ const auditLog = [];
 const AUDIT_LOG_MAX = 1000;
 const rateLimitCounters = {}; // { ruleName: { count, windowStart } }
 
-function auditEvent(rule, action, detail, matchedText, fullMessage, source) {
+function auditEvent(rule, action, detail, matchedText, fullMessage, source, redactedMessage) {
 	const matched = typeof matchedText === "string" ? matchedText : null;
 	const full = typeof fullMessage === "string" ? fullMessage : null;
-	const base = full || matched;
+	const redacted = typeof redactedMessage === "string" ? redactedMessage : null;
+	const base = full || redacted || matched;
 	const entry = {
 		timestamp: new Date().toISOString(),
 		rule: rule.name,
@@ -439,6 +440,7 @@ function auditEvent(rule, action, detail, matchedText, fullMessage, source) {
 		snippet: base ? base.slice(0, 200) : null,
 		matched_text: matched,
 		full_message: full,
+		redacted_message: redacted,
 	};
 	auditLog.push(entry);
 	if (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
@@ -499,6 +501,7 @@ function evaluateContentRules(rules, messages, scope) {
 					auditEvent(rule, "warned", `Pattern matched: ${re.source}`, matched, text, scope);
 				} else if (rule.type === "redact") {
 					const replacement = rule.replacement || "[REDACTED]";
+					const beforeText = text;
 					// Redact in all message contents
 					messages = messages.map((m) => {
 						if (typeof m.content === "string") {
@@ -512,7 +515,8 @@ function evaluateContentRules(rules, messages, scope) {
 						return m;
 					});
 					modified = true;
-					auditEvent(rule, "redacted", `Pattern replaced: ${re.source}`, matched, text, scope);
+					text = extractText(messages);
+					auditEvent(rule, "redacted", `Pattern replaced: ${re.source}`, matched, beforeText, scope, text);
 				}
 			}
 			re.lastIndex = 0; // reset global regex
@@ -596,9 +600,11 @@ function redactResponse(rules, text) {
 				const re = new RegExp(p, "gi");
 				if (re.test(text)) {
 					const matched = text.match(re)?.[0] || null;
-					auditEvent(rule, "redacted-response", `Pattern replaced: ${re.source}`, matched, text, "response");
+					const beforeText = text;
 					re.lastIndex = 0;
-					text = text.replace(re, replacement);
+					const afterText = text.replace(re, replacement);
+					auditEvent(rule, "redacted-response", `Pattern replaced: ${re.source}`, matched, beforeText, "response", afterText);
+					text = afterText;
 				}
 			} catch {}
 		}
@@ -1758,16 +1764,20 @@ const loaders = {
     const data = await fetch(BASE+"/v1/audit").then(r=>r.json());
     let h = '<h2>Audit Log</h2>';
     if(!data.entries?.length){h+='<div class="empty">No audit events yet. Events appear when rules match requests or responses.</div>';}
-    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Detail</th><th>Matched</th><th>Full message</th></tr>';
+    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Detail</th><th>Matched</th><th>Message (before)</th><th>Message (after redaction)</th></tr>';
     for(const e of data.entries){
       const fullMsg = e.full_message
         ? '<details><summary>view ('+e.full_message.length+' chars)</summary><pre style="white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:8px;margin-top:6px">'+esc(e.full_message)+'</pre></details>'
+        : '--';
+      const redactedMsg = e.redacted_message
+        ? '<details><summary>view ('+e.redacted_message.length+' chars)</summary><pre style="white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:8px;margin-top:6px">'+esc(e.redacted_message)+'</pre></details>'
         : '--';
       h+='<tr><td>'+ago(e.timestamp)+'</td><td>'+esc(e.rule)+'</td>';
       h+='<td><span class="badge '+esc(e.type)+'">'+esc(e.type)+'</span></td>';
       h+='<td>'+esc(e.action)+'</td><td>'+esc(e.source||'--')+'</td><td>'+esc(e.detail)+'</td>';
       h+='<td>'+(e.matched_text?esc(e.matched_text):'--')+'</td>';
-      h+='<td>'+fullMsg+'</td></tr>';
+      h+='<td>'+fullMsg+'</td>';
+      h+='<td>'+redactedMsg+'</td></tr>';
     }h+='</table>';}
     document.getElementById("audit").innerHTML = h;
   },
