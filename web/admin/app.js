@@ -60,6 +60,51 @@ function ProviderSelect({ value, onChange, names, allowPools, allowChains, place
   `;
 }
 
+/** Drag-and-drop sortable list. items=array, onReorder=callback, renderItem(item,index)=JSX */
+function SortableList({ items, onReorder, renderItem }) {
+  const [dragIdx, setDragIdx] = useState(null);
+  const [overIdx, setOverIdx] = useState(null);
+
+  function onDragStart(e, i) { setDragIdx(i); e.dataTransfer.effectAllowed = "move"; }
+  function onDragOver(e, i) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setOverIdx(i); }
+  function onDragLeave() { setOverIdx(null); }
+  function onDrop(e, i) {
+    e.preventDefault();
+    if (dragIdx == null || dragIdx === i) { setDragIdx(null); setOverIdx(null); return; }
+    const arr = [...items];
+    const [moved] = arr.splice(dragIdx, 1);
+    arr.splice(i, 0, moved);
+    onReorder(arr);
+    setDragIdx(null);
+    setOverIdx(null);
+  }
+  function onDragEnd() { setDragIdx(null); setOverIdx(null); }
+
+  return html`<div>
+    ${items.map((item, i) => html`
+      <div key=${i}
+        draggable="true"
+        onDragStart=${(e) => onDragStart(e, i)}
+        onDragOver=${(e) => onDragOver(e, i)}
+        onDragLeave=${onDragLeave}
+        onDrop=${(e) => onDrop(e, i)}
+        onDragEnd=${onDragEnd}
+        style=${{
+          display: "flex", gap: "6px", marginBottom: "4px", alignItems: "center",
+          padding: "4px 6px", borderRadius: "6px", cursor: "grab",
+          background: overIdx === i ? "#1e1e22" : dragIdx === i ? "#111113" : "transparent",
+          border: overIdx === i ? "1px dashed #f59e0b" : "1px solid transparent",
+          opacity: dragIdx === i ? 0.5 : 1,
+          transition: "background .1s, border .1s",
+        }}
+      >
+        <span style=${{ color: "#3f3f46", fontSize: "14px", cursor: "grab", userSelect: "none" }}>&#x2630;</span>
+        ${renderItem(item, i)}
+      </div>
+    `)}
+  </div>`;
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ════════════════════════════════════════════════════════════════════════════════
@@ -354,12 +399,14 @@ function PoolEditor({ pools, names, onSave }) {
           <div><label>Strategy</label><select value=${draft.strategy} onChange=${(e) => setDraft({ ...draft, strategy: e.target.value })}>${STRATEGIES.map((s) => html`<option key=${s} value=${s}>${s}</option>`)}</select></div>
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
           <div className="full">
-            <label>Members</label>
-            <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
-              ${draft.members.map((m, i) => html`<span key=${i} className="badge on" style=${{ cursor: "pointer" }} onClick=${() => removeMember(i)}>${m} x</span>`)}
-              ${draft.members.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>No members yet</span>` : null}
-            </div>
-            <div style=${{ display: "flex", gap: "6px" }}>
+            <label>Members (drag to reorder priority)</label>
+            ${draft.members.length > 0 ? html`
+              <${SortableList} items=${draft.members} onReorder=${(arr) => setDraft({ ...draft, members: arr })} renderItem=${(m, i) => html`
+                <span style=${{ flex: 1, fontSize: "13px", color: "#e4e4e7" }}>${m}</span>
+                <button className="btn danger" onClick=${() => removeMember(i)} style=${{ padding: "2px 8px", fontSize: "11px" }}>x</button>
+              `} />
+            ` : html`<div style=${{ color: "#52525b", fontSize: "12px", padding: "6px 0" }}>No members yet</div>`}
+            <div style=${{ display: "flex", gap: "6px", marginTop: "4px" }}>
               <select onChange=${(e) => { addMember(e.target.value); e.target.value = ""; }} style=${{ flex: 1 }}>
                 <option value="">+ Add member...</option>
                 ${eligible.filter((n) => !draft.members.includes(n)).map((n) => html`<option key=${n} value=${n}>${n}</option>`)}
@@ -406,7 +453,7 @@ function ChainEditor({ chains, names, onSave }) {
   async function del(name) { if (confirm(`Delete chain "${name}"?`)) { await api(`/v1/config/chains/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
   function updateStep(i, field, value) { const steps = [...draft.steps]; steps[i] = { ...steps[i], [field]: value }; setDraft({ ...draft, steps }); }
-  function addStep() { setDraft({ ...draft, steps: [...draft.steps, { provider: "", model: "", enabled: true }] }); }
+  function addStep() { setDraft({ ...draft, steps: [...draft.steps, { provider: "", enabled: true }] }); }
   function removeStep(i) { setDraft({ ...draft, steps: draft.steps.filter((_, idx) => idx !== i) }); }
 
   function renderForm(isNew) {
@@ -417,16 +464,12 @@ function ChainEditor({ chains, names, onSave }) {
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
         </div>
         <div style=${{ marginTop: "10px" }}>
-          <label>Steps (failover order)</label>
-          ${draft.steps.map((s, i) => html`
-            <div key=${i} style=${{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
-              <span style=${{ color: "#52525b", fontSize: "11px", width: "20px" }}>${i + 1}.</span>
-              <${ProviderSelect} value=${s.provider} onChange=${(v) => updateStep(i, "provider", v)} names=${names} allowPools=${true} placeholder="provider or pool" />
-              <input value=${s.model || ""} onInput=${(e) => updateStep(i, "model", e.target.value)} placeholder="model (optional)" style=${{ flex: 1 }} />
-              <button className="btn danger" onClick=${() => removeStep(i)} style=${{ padding: "4px 8px" }}>x</button>
-            </div>
-          `)}
-          <button className="btn" onClick=${addStep}>+ Add step</button>
+          <label>Steps (drag to reorder)</label>
+          <${SortableList} items=${draft.steps} onReorder=${(arr) => setDraft({ ...draft, steps: arr })} renderItem=${(s, i) => html`
+            <${ProviderSelect} value=${s.provider} onChange=${(v) => updateStep(i, "provider", v)} names=${names} allowPools=${true} placeholder="provider or pool" />
+            <button className="btn danger" onClick=${() => removeStep(i)} style=${{ padding: "4px 8px" }}>x</button>
+          `} />
+          <button className="btn" onClick=${addStep} style=${{ marginTop: "4px" }}>+ Add step</button>
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
       </div>
@@ -441,7 +484,7 @@ function ChainEditor({ chains, names, onSave }) {
           <div><span className="name">${c.name}</span><span className=${`badge ${c.enabled !== false ? "on" : "off"}`}>${c.enabled !== false ? "on" : "off"}</span><span className="badge neutral">${(c.steps || []).length} steps</span></div>
           <div className="actions"><button className="btn" onClick=${() => startEdit(c)}>Edit</button><button className="btn danger" onClick=${() => del(c.name)}>Del</button></div>
         </div>
-        <div className="meta">${(c.steps || []).map((s) => `${s.provider}${s.model ? "/" + s.model : ""}`).join(" -> ") || "no steps"}</div>
+        <div className="meta">${(c.steps || []).map((s) => s.provider).join(" -> ") || "no steps"}</div>
       </div>
     `)}
     ${editing === "__new__" ? renderForm(true) : null}
@@ -465,7 +508,7 @@ function PresetEditor({ presets, names, onSave }) {
   async function del(name) { if (confirm(`Delete preset "${name}"?`)) { await api(`/v1/config/presets/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
   function updateEntry(i, field, value) { const entries = [...draft.entries]; entries[i] = { ...entries[i], [field]: field === "enabled" ? value === "true" : value }; setDraft({ ...draft, entries }); }
-  function addEntry() { setDraft({ ...draft, entries: [...draft.entries, { provider: "", model: "", enabled: true }] }); }
+  function addEntry() { setDraft({ ...draft, entries: [...draft.entries, { provider: "", enabled: true }] }); }
   function removeEntry(i) { setDraft({ ...draft, entries: draft.entries.filter((_, idx) => idx !== i) }); }
 
   function renderForm(isNew) {
@@ -476,17 +519,13 @@ function PresetEditor({ presets, names, onSave }) {
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
         </div>
         <div style=${{ marginTop: "10px" }}>
-          <label>Entries (failover order)</label>
-          ${draft.entries.map((e, i) => html`
-            <div key=${i} style=${{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
-              <span style=${{ color: "#52525b", fontSize: "11px", width: "20px" }}>${i + 1}.</span>
-              <${ProviderSelect} value=${e.provider} onChange=${(v) => updateEntry(i, "provider", v)} names=${names} allowPools=${true} allowChains=${true} placeholder="provider, pool, or chain" />
-              <input value=${e.model || ""} onInput=${(ev) => updateEntry(i, "model", ev.target.value)} placeholder="model" style=${{ flex: 1 }} />
-              <select value=${String(e.enabled !== false)} onChange=${(ev) => updateEntry(i, "enabled", ev.target.value)} style=${{ width: "70px" }}><option value="true">On</option><option value="false">Off</option></select>
-              <button className="btn danger" onClick=${() => removeEntry(i)} style=${{ padding: "4px 8px" }}>x</button>
-            </div>
-          `)}
-          <button className="btn" onClick=${addEntry}>+ Add entry</button>
+          <label>Entries (drag to reorder)</label>
+          <${SortableList} items=${draft.entries} onReorder=${(arr) => setDraft({ ...draft, entries: arr })} renderItem=${(e, i) => html`
+            <${ProviderSelect} value=${e.provider} onChange=${(v) => updateEntry(i, "provider", v)} names=${names} allowPools=${true} allowChains=${true} placeholder="provider, pool, or chain" />
+            <select value=${String(e.enabled !== false)} onChange=${(ev) => updateEntry(i, "enabled", ev.target.value)} style=${{ width: "60px", fontSize: "12px" }}><option value="true">On</option><option value="false">Off</option></select>
+            <button className="btn danger" onClick=${() => removeEntry(i)} style=${{ padding: "4px 8px" }}>x</button>
+          `} />
+          <button className="btn" onClick=${addEntry} style=${{ marginTop: "4px" }}>+ Add entry</button>
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
       </div>
@@ -501,7 +540,7 @@ function PresetEditor({ presets, names, onSave }) {
           <div><span className="name">${p.name}</span><span className=${`badge ${p.enabled !== false ? "on" : "off"}`}>${p.enabled !== false ? "on" : "off"}</span><span className="badge neutral">${(p.entries || []).length} entries</span></div>
           <div className="actions"><button className="btn" onClick=${() => startEdit(p)}>Edit</button><button className="btn danger" onClick=${() => del(p.name)}>Del</button></div>
         </div>
-        <div className="meta">${(p.entries || []).filter((e) => e.enabled !== false).map((e) => `${e.provider}/${e.model}`).join(" -> ") || "no entries"}</div>
+        <div className="meta">${(p.entries || []).filter((e) => e.enabled !== false).map((e) => e.provider).join(" -> ") || "no entries"}</div>
       </div>
     `)}
     ${editing === "__new__" ? renderForm(true) : null}
