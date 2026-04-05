@@ -359,6 +359,10 @@ npx pi-multi-pass
 # Or with a custom port
 npx pi-multi-pass --port 8080
 
+# Local dev mode with auto-restart on leeloo/web changes
+# (run from repo root)
+yarn web-dev
+
 # Then point your tools at it
 export OPENAI_BASE_URL=http://localhost:4000/v1
 ```

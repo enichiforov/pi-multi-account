@@ -388,7 +388,15 @@ const usageLog = [];       // Recent requests (ring buffer)
 const USAGE_LOG_MAX = 500;
 const providerStats = {};  // { provider: { requests, tokens_in, tokens_out, errors, last_used } }
 
-function trackRequest(provider, modelId, usage, durationMs, error) {
+function clipText(value, maxLen = 4000) {
+	if (typeof value !== "string") return null;
+	const text = value.trim();
+	if (!text) return null;
+	if (text.length <= maxLen) return text;
+	return text.slice(0, maxLen) + "\n...[truncated]";
+}
+
+function trackRequest(provider, modelId, usage, durationMs, error, requestText, responseText) {
 	const entry = {
 		timestamp: new Date().toISOString(),
 		provider,
@@ -397,6 +405,8 @@ function trackRequest(provider, modelId, usage, durationMs, error) {
 		tokens_out: usage?.output || 0,
 		duration_ms: durationMs,
 		error: error || null,
+		request_text: clipText(requestText),
+		response_text: clipText(responseText),
 	};
 	usageLog.push(entry);
 	if (usageLog.length > USAGE_LOG_MAX) usageLog.shift();
@@ -1132,7 +1142,7 @@ function formatUsage(u) {
 
 // ─── Streaming handler ────────────────────────────────────────────────────────
 
-async function handleStreaming(res, model, context, opts, requestModelId, actualProvider) {
+async function handleStreaming(res, model, context, opts, requestModelId, actualProvider, requestText) {
 	const t0 = Date.now();
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
@@ -1145,6 +1155,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 	let sentRole = false;
 	const toolCalls = new Map(); // contentIndex -> { index, id, name, args }
 	let toolCallIdx = 0;
+	let collectedResponseText = "";
 
 	const write = (data) => {
 		if (!res.destroyed) res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1163,6 +1174,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 			}
 
 			case "text_delta": {
+				collectedResponseText += event.delta || "";
 				if (!sentRole) {
 					write(chunk(id, requestModelId, { role: "assistant", content: event.delta }, null));
 					sentRole = true;
@@ -1196,6 +1208,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 				tc.id = event.toolCall.id;
 				tc.name = event.toolCall.name;
 				tc.args = JSON.stringify(event.toolCall.arguments);
+				collectedResponseText += `\n[Tool call: ${tc.name}]\n`;
 
 				if (!sentRole) {
 					write(chunk(id, requestModelId, {
@@ -1225,7 +1238,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 			case "done": {
 				const finish = toolCalls.size > 0 ? "tool_calls" : mapFinishReason(event.reason);
 				const usage = formatUsage(event.message?.usage);
-				trackRequest(actualProvider, model.id, event.message?.usage, Date.now() - t0, null);
+				trackRequest(actualProvider, model.id, event.message?.usage, Date.now() - t0, null, requestText, collectedResponseText);
 				const finalChunk = chunk(id, requestModelId, {}, finish, usage);
 				finalChunk.x_provider = actualProvider;
 				finalChunk.x_model = model.id;
@@ -1237,7 +1250,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
-				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg);
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, collectedResponseText);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
 				if (!sentRole) {
 					write(chunk(id, requestModelId, { role: "assistant", content: `[Error: ${errMsg}]` }, null));
@@ -1256,7 +1269,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 
 // ─── Non-streaming handler ────────────────────────────────────────────────────
 
-async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider) {
+async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider, requestText) {
 	const t0 = Date.now();
 	const eventStream = stream(model, context, opts);
 	let fullText = "";
@@ -1282,11 +1295,10 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 			case "done":
 				usage = event.message?.usage;
 				finishReason = event.reason;
-				trackRequest(actualProvider, model.id, usage, Date.now() - t0, null);
 				break;
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
-				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg);
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, fullText);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
 				throw new Error(errMsg);
 			}
@@ -1298,12 +1310,15 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 	if (respRules.length > 0 && fullText) {
 		const respBlock = checkResponseBlock(respRules, fullText);
 		if (respBlock.blocked) {
+			trackRequest(actualProvider, model.id, usage, Date.now() - t0, respBlock.message, requestText, fullText);
 			res.writeHead(403, json());
 			res.end(JSON.stringify({ error: { message: respBlock.message } }));
 			return;
 		}
 		fullText = redactResponse(respRules, fullText);
 	}
+
+	trackRequest(actualProvider, model.id, usage, Date.now() - t0, null, requestText, fullText);
 
 	const message = { role: "assistant" };
 	if (toolCalls.length > 0) {
@@ -1392,6 +1407,7 @@ async function handleChatCompletions(req, res) {
 		return;
 	}
 
+	const requestText = extractText(requestMessages);
 	const context = toContext(requestMessages, tools);
 	const maxAttempts = Math.min(candidates.length, 5);
 	let lastError = null;
@@ -1417,9 +1433,9 @@ async function handleChatCompletions(req, res) {
 			log(`[${candidate.provider}] ${candidate.modelId} (attempt ${attempt + 1}/${maxAttempts})`);
 
 			if (doStream) {
-				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider);
+				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText);
 			} else {
-				await handleNonStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider);
+				await handleNonStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText);
 			}
 			return;
 

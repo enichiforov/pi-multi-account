@@ -1,9 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18.3.1";
+import React, { useEffect, useRef, useState } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import htm from "https://esm.sh/htm@3.1.1";
 
 const html = htm.bind(React.createElement);
 const BASE = location.origin;
+const ROUTE_STORAGE_KEY = "leeloo.selectedRoute";
 
 function routeLabel(id) {
   return id.replace("pool:", "").replace("provider:", "").replace("/", " / ");
@@ -93,7 +94,7 @@ function Composer({ input, setInput, onSend, disabled }) {
 
 function App() {
   const [groups, setGroups] = useState([]);
-  const [selectedRoute, setSelectedRoute] = useState("");
+  const [selectedRoute, setSelectedRoute] = useState(() => localStorage.getItem(ROUTE_STORAGE_KEY) || "");
   const [health, setHealth] = useState(null);
   const [quota, setQuota] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -107,7 +108,13 @@ function App() {
   useEffect(() => {
     loadRouting();
     loadInfo();
+    const timer = setInterval(() => loadInfo(true), 15000);
+    return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (selectedRoute) localStorage.setItem(ROUTE_STORAGE_KEY, selectedRoute);
+  }, [selectedRoute]);
 
   useEffect(() => {
     const el = chatRef.current;
@@ -119,24 +126,29 @@ function App() {
       const data = await fetch(`${BASE}/v1/routing`).then((r) => r.json());
       const gs = data?.groups || [];
       setGroups(gs);
-      const first = gs.flatMap((g) => g.items || [])[0]?.id || "";
-      setSelectedRoute((prev) => prev || first);
-      setStatus({ kind: "", text: `${gs.flatMap((g) => g.items || []).length} routes` });
+      const flat = gs.flatMap((g) => g.items || []);
+      const first = flat[0]?.id || "";
+      const available = new Set(flat.map((x) => x.id));
+      setSelectedRoute((prev) => (prev && available.has(prev) ? prev : first));
+      setStatus({ kind: "", text: `${flat.length} routes` });
     } catch (e) {
       setStatus({ kind: "error", text: `routing failed: ${e.message}` });
     }
   }
 
-  async function loadInfo() {
+  async function loadInfo(silent = false) {
     try {
-      const [h, q] = await Promise.all([
+      const [healthRes, quotaRes] = await Promise.allSettled([
         fetch(`${BASE}/health`).then((r) => r.json()),
         fetch(`${BASE}/v1/quota`).then((r) => r.json()),
       ]);
-      setHealth(h);
-      setQuota(q);
+      if (healthRes.status === "fulfilled") setHealth(healthRes.value);
+      if (quotaRes.status === "fulfilled") setQuota(quotaRes.value);
+      if (!silent && healthRes.status === "rejected" && quotaRes.status === "rejected") {
+        setStatus({ kind: "error", text: "health/quota unavailable" });
+      }
     } catch {
-      // best-effort
+      if (!silent) setStatus({ kind: "error", text: "health/quota unavailable" });
     }
   }
 
@@ -169,6 +181,18 @@ function App() {
     let xProvider = "";
     let xModel = "";
     let xLabel = "";
+    let flushScheduled = false;
+
+    const flushAssistant = () => {
+      if (flushScheduled) return;
+      flushScheduled = true;
+      requestAnimationFrame(() => {
+        flushScheduled = false;
+        setMessages((prev) => prev.map((m) =>
+          m.id === aid ? { ...m, content: full, thinking: false } : m
+        ));
+      });
+    };
 
     try {
       const resp = await fetch(`${BASE}/v1/chat/completions`, {
@@ -210,18 +234,14 @@ function App() {
           const d = j.choices?.[0]?.delta;
           if (d?.content) {
             full += d.content;
-            setMessages((prev) => prev.map((m) =>
-              m.id === aid ? { ...m, content: full, thinking: false } : m
-            ));
+            flushAssistant();
           }
 
           if (d?.tool_calls?.length) {
             const tc = d.tool_calls[0];
             const textPart = `\n[Tool call: ${tc?.function?.name || "?"}]\n`;
             full += textPart;
-            setMessages((prev) => prev.map((m) =>
-              m.id === aid ? { ...m, content: full, thinking: false } : m
-            ));
+            flushAssistant();
           }
 
           if (j.usage) usage = j.usage;

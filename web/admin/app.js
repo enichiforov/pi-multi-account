@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "https://esm.sh/react@18.3.1";
+import React, { useEffect, useState } from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import htm from "https://esm.sh/htm@3.1.1";
 
@@ -79,13 +79,16 @@ function DashboardPanel({ data }) {
         </table>
       </div>
 
-      <h2 style=${{ marginTop: "14px" }}>Recent requests</h2>
+      <h2 style=${{ marginTop: "14px" }}>Recent chats</h2>
       <div className="table-wrap">
         <table>
           <thead>
-            <tr><th>Time</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th></tr>
+            <tr><th>Time</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th><th>Request</th><th>Response</th></tr>
           </thead>
           <tbody>
+            ${recent.length === 0 ? html`
+              <tr><td colSpan="8" style=${{ color: "#666", fontStyle: "italic" }}>No chat requests yet.</td></tr>
+            ` : null}
             ${recent.slice(0, 30).map((r, idx) => html`
               <tr key=${idx}>
                 <td>${ago(r.timestamp)}</td>
@@ -94,6 +97,16 @@ function DashboardPanel({ data }) {
                 <td>${r.tokens_in} / ${r.tokens_out}</td>
                 <td>${r.duration_ms}ms</td>
                 <td>${r.error || "--"}</td>
+                <td>
+                  ${r.request_text
+                    ? html`<details><summary>view (${r.request_text.length})</summary><pre>${r.request_text}</pre></details>`
+                    : "--"}
+                </td>
+                <td>
+                  ${r.response_text
+                    ? html`<details><summary>view (${r.response_text.length})</summary><pre>${r.response_text}</pre></details>`
+                    : "--"}
+                </td>
               </tr>
             `)}
           </tbody>
@@ -399,16 +412,34 @@ function App() {
     refreshTab(active);
   }, [active]);
 
-  async function refreshTab(tab = active) {
-    setError("");
+  useEffect(() => {
+    const intervalMs = active === "dashboard" ? 3000 : active === "audit" ? 5000 : 0;
+    if (!intervalMs) return;
+    const timer = setInterval(() => {
+      refreshTab(active, true);
+    }, intervalMs);
+    return () => clearInterval(timer);
+  }, [active]);
+
+  async function refreshTab(tab = active, silent = false) {
+    if (!silent) setError("");
     try {
       if (tab === "dashboard") {
-        const [stats, quota, healthData] = await Promise.all([
+        const [statsRes, quotaRes, healthRes] = await Promise.allSettled([
           fetchJson("/v1/stats"),
           fetchJson("/v1/quota"),
           fetchJson("/health"),
         ]);
-        setDashboard({ stats, quota, health: healthData });
+
+        setDashboard((prev) => ({
+          stats: statsRes.status === "fulfilled" ? statsRes.value : prev.stats,
+          quota: quotaRes.status === "fulfilled" ? quotaRes.value : prev.quota,
+          health: healthRes.status === "fulfilled" ? healthRes.value : prev.health,
+        }));
+
+        if (statsRes.status !== "fulfilled" && quotaRes.status !== "fulfilled" && healthRes.status !== "fulfilled") {
+          throw new Error("Dashboard data unavailable");
+        }
       } else if (tab === "rules") {
         const data = await fetchJson("/v1/rules");
         setRules(data.rules || []);
@@ -420,7 +451,7 @@ function App() {
         setHealth(h);
       }
     } catch (e) {
-      setError(e.message);
+      if (!silent) setError(e.message);
     }
   }
 

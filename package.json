@@ -5,6 +5,10 @@
   "bin": {
     "leeloo": "./leeloo.js"
   },
+  "scripts": {
+    "start": "node leeloo.js",
+    "web-dev": "node --watch --watch-path=leeloo.js --watch-path=web --watch-preserve-output leeloo.js --port 4000"
+  },
   "dependencies": {
     "@mariozechner/pi-coding-agent": ">=0.58.0",
     "@mariozechner/pi-ai": ">=0.58.0"
