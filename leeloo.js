@@ -32,7 +32,8 @@
 
 import { createServer } from "node:http";
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, extname, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel, getModels, stream } from "@mariozechner/pi-ai";
 
@@ -47,6 +48,8 @@ for (let i = 0; i < args.length; i++) {
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const AGENT_DIR = getAgentDir();
+const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
+const WEB_DIR = join(ROOT_DIR, "web");
 const CONFIG_PATH = join(AGENT_DIR, "multi-pass.json");
 
 function loadConfig() {
@@ -690,6 +693,41 @@ function handleAuditLog(req, res) {
 	res.end(JSON.stringify({ entries: auditLog.slice(-limit).reverse() }));
 }
 
+const MIME_TYPES = {
+	".html": "text/html; charset=utf-8",
+	".js": "text/javascript; charset=utf-8",
+	".css": "text/css; charset=utf-8",
+	".json": "application/json; charset=utf-8",
+	".svg": "image/svg+xml",
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".ico": "image/x-icon",
+};
+
+function serveStaticFile(res, absPath) {
+	if (!existsSync(absPath)) {
+		res.writeHead(404, json());
+		res.end(JSON.stringify({ error: { message: "Not found" } }));
+		return;
+	}
+	const ext = extname(absPath).toLowerCase();
+	const contentType = MIME_TYPES[ext] || "application/octet-stream";
+	res.writeHead(200, { "Content-Type": contentType, "Cache-Control": "no-cache" });
+	res.end(readFileSync(absPath));
+}
+
+function handleWebAsset(req, res, path) {
+	const rel = path.replace(/^\/web\//, "");
+	if (!rel || rel.includes("..")) {
+		res.writeHead(403, json());
+		res.end(JSON.stringify({ error: { message: "Forbidden" } }));
+		return;
+	}
+	const absPath = join(WEB_DIR, rel);
+	serveStaticFile(res, absPath);
+}
+
 /** Sort providers by quota (best first). Providers with unknown quota go last. */
 async function sortByQuota(providers) {
 	const results = await Promise.all(
@@ -1300,7 +1338,7 @@ async function handleChatCompletions(req, res) {
 
 	const {
 		model: requestModelId,
-		messages,
+		messages: incomingMessages,
 		tools,
 		tool_choice,
 		stream: doStream,
@@ -1311,8 +1349,9 @@ async function handleChatCompletions(req, res) {
 		stop,
 		reasoning_effort,
 	} = parsed;
+	let requestMessages = incomingMessages;
 
-	if (!requestModelId || !messages) {
+	if (!requestModelId || !requestMessages) {
 		res.writeHead(400, json());
 		res.end(JSON.stringify({ error: { message: "model and messages are required" } }));
 		return;
@@ -1336,13 +1375,14 @@ async function handleChatCompletions(req, res) {
 			return;
 		}
 		// Content: block/redact/warn on request
-		const contentCheck = evaluateContentRules(rules, parsed.messages, "request");
+		const contentCheck = evaluateContentRules(rules, requestMessages, "request");
 		if (contentCheck.blocked) {
 			res.writeHead(403, json());
 			res.end(JSON.stringify({ error: { message: contentCheck.message } }));
 			return;
 		}
-		parsed.messages = contentCheck.messages; // may be redacted
+		requestMessages = contentCheck.messages; // may be redacted
+		parsed.messages = requestMessages;
 	}
 
 	const candidates = await resolveCandidates(requestModelId);
@@ -1352,7 +1392,7 @@ async function handleChatCompletions(req, res) {
 		return;
 	}
 
-	const context = toContext(messages, tools);
+	const context = toContext(requestMessages, tools);
 	const maxAttempts = Math.min(candidates.length, 5);
 	let lastError = null;
 
@@ -1617,630 +1657,13 @@ function log(...a) { console.log(`[${new Date().toISOString().slice(11, 19)}]`, 
 // ─── Chat UI ──────────────────────────────────────────────────────────────────
 
 function handleAdmin(req, res) {
-	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-	res.end(ADMIN_UI_HTML);
+	serveStaticFile(res, join(WEB_DIR, "admin", "index.html"));
 }
 
-const ADMIN_UI_HTML = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Leeloo Admin</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:16px}
-header h1{font-size:15px;color:#f90;font-weight:700}
-header a{color:#666;text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid #333;border-radius:5px}
-header a:hover{color:#aaa;border-color:#666}
-.tabs{display:flex;gap:0;border-bottom:1px solid #222;background:#111}
-.tab{padding:10px 20px;font-size:13px;color:#888;cursor:pointer;border-bottom:2px solid transparent}
-.tab:hover{color:#ccc}
-.tab.active{color:#f90;border-color:#f90}
-.panel{flex:1;overflow-y:auto;padding:20px;display:none}
-.panel.active{display:block}
-h2{font-size:14px;color:#999;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px}
-.card{background:#111;border:1px solid #222;border-radius:8px;padding:14px;margin-bottom:10px}
-.card .name{font-weight:600;color:#eee;font-size:14px}
-.card .meta{font-size:11px;color:#666;margin-top:4px}
-.card .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600}
-.badge.on{background:#1a3a1a;color:#4a4;border:1px solid #2a4a2a}
-.badge.off{background:#3a1a1a;color:#a44;border:1px solid #4a2a2a}
-.badge.block{background:#3a1a1a;color:#f66}
-.badge.redact{background:#3a2a1a;color:#fa0}
-.badge.warn{background:#1a2a3a;color:#6af}
-.badge.model{background:#2a1a3a;color:#a6f}
-.badge.limit{background:#1a1a2a;color:#66f}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #1a1a1a}
-th{color:#888;font-weight:600;font-size:11px;text-transform:uppercase}
-td{color:#ccc}
-.bar{display:inline-block;width:50px;height:8px;background:#222;border-radius:4px;overflow:hidden;vertical-align:middle}
-.bar-fill{height:100%;border-radius:4px}
-.btn{background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:5px;padding:5px 12px;font-size:12px;cursor:pointer}
-.btn:hover{border-color:#666;color:#fff}
-.btn.danger{border-color:#4a2a2a;color:#f66}
-.btn.danger:hover{background:#3a1a1a}
-.btn.primary{background:#f90;color:#000;border-color:#f90;font-weight:600}
-.form{display:flex;flex-direction:column;gap:8px;max-width:500px}
-.form label{font-size:12px;color:#888}
-.form input,.form select,.form textarea{background:#1a1a1a;color:#eee;border:1px solid #333;border-radius:5px;padding:6px 10px;font-size:13px;font-family:inherit}
-.form input:focus,.form select:focus,.form textarea:focus{border-color:#f90;outline:none}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px}
-.stat-card{background:#111;border:1px solid #222;border-radius:8px;padding:14px;text-align:center}
-.stat-card .num{font-size:24px;font-weight:700;color:#f90}
-.stat-card .label{font-size:11px;color:#666;margin-top:4px}
-.empty{color:#555;font-style:italic;padding:20px;text-align:center}
-</style>
-</head><body>
-<header>
-  <h1>Leeloo Admin</h1>
-  <a href="/ui">Chat UI</a>
-  <a href="/health">Health API</a>
-</header>
-<div class="tabs">
-  <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
-  <div class="tab" onclick="showTab('rules')">Rules</div>
-  <div class="tab" onclick="showTab('audit')">Audit Log</div>
-  <div class="tab" onclick="showTab('config')">Config</div>
-</div>
-
-<div id="dashboard" class="panel active"></div>
-<div id="rules" class="panel"></div>
-<div id="audit" class="panel"></div>
-<div id="config" class="panel"></div>
-
-<script>
-const BASE = location.origin;
-function esc(s){return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"\x26lt;").replace(/>/g,"\x26gt;")}
-function showTab(id){document.querySelectorAll(".tab").forEach((t,i)=>{t.classList.toggle("active",t.textContent.toLowerCase().replace(" ","")===id)});document.querySelectorAll(".panel").forEach(p=>{p.classList.toggle("active",p.id===id)});loaders[id]?.()}
-function qc(pct){return pct==null?"#555":pct>50?"#4a4":pct>20?"#ca0":"#e44"}
-function bar(pct){if(pct==null)return"--";return'<span class="bar"><span class="bar-fill" style="width:'+pct+"%;background:"+qc(pct)+'"></span></span> '+pct+"%"}
-function ago(ts){if(!ts)return"--";const d=Date.now()-new Date(ts).getTime();if(d<60000)return Math.round(d/1000)+"s ago";if(d<3600000)return Math.round(d/60000)+"m ago";return Math.round(d/3600000)+"h ago"}
-
-const loaders = {
-  async dashboard() {
-    const [stats,quota,health] = await Promise.all([
-      fetch(BASE+"/v1/stats").then(r=>r.json()),
-      fetch(BASE+"/v1/quota").then(r=>r.json()),
-      fetch(BASE+"/health").then(r=>r.json()),
-    ]);
-    const s = stats.session||{};
-    let h = '<h2>Session Overview</h2><div class="stat-grid">';
-    h += '<div class="stat-card"><div class="num">'+s.total_requests+'</div><div class="label">Requests</div></div>';
-    h += '<div class="stat-card"><div class="num">'+s.total_tokens_in+'</div><div class="label">Tokens In</div></div>';
-    h += '<div class="stat-card"><div class="num">'+s.total_tokens_out+'</div><div class="label">Tokens Out</div></div>';
-    h += '<div class="stat-card"><div class="num">'+s.total_errors+'</div><div class="label">Errors</div></div>';
-    h += '</div>';
-
-    h += '<h2>Provider Health</h2><table><tr><th>Provider</th><th>Quota</th><th>Status</th><th>Requests</th><th>Tokens</th><th>Last Used</th></tr>';
-    for(const p of quota.providers||[]){
-      const ps = (stats.providers||[]).find(x=>x.provider===p.provider)||{};
-      const exh = (health.exhausted||[]).includes(p.provider);
-      h+='<tr><td>'+esc(p.label||p.provider)+'</td><td>'+bar(p.score)+'</td>';
-      h+='<td>'+(exh?'<span class="badge off">exhausted</span>':'<span class="badge on">'+esc(p.status)+'</span>')+'</td>';
-      h+='<td>'+(ps.requests||0)+'</td><td>'+(ps.tokens_in||0)+' / '+(ps.tokens_out||0)+'</td>';
-      h+='<td>'+ago(ps.last_used)+'</td></tr>';
-    }
-    h+='</table>';
-
-    h+='<h2>Recent Requests</h2><table><tr><th>Time</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th></tr>';
-    for(const r of (stats.recent||[]).slice(0,20)){
-      h+='<tr><td>'+ago(r.timestamp)+'</td><td>'+esc(r.provider)+'</td><td>'+esc(r.model)+'</td>';
-      h+='<td>'+r.tokens_in+' / '+r.tokens_out+'</td><td>'+r.duration_ms+'ms</td>';
-      h+='<td>'+(r.error?'<span class="badge off">'+esc(r.error).slice(0,40)+'</span>':'--')+'</td></tr>';
-    }
-    h+='</table>';
-    document.getElementById("dashboard").innerHTML = h;
-  },
-
-  async rules() {
-    const data = await fetch(BASE+"/v1/rules").then(r=>r.json());
-    let h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><h2 style="margin:0">Policy Rules</h2><button class="btn primary" onclick="showRuleForm()">+ Add Rule</button></div>';
-    h += '<div id="rule-form-area"></div>';
-    if(!data.rules||data.rules.length===0){h+='<div class="empty">No rules configured. Add rules to enforce DLP policies, model restrictions, or rate limits.</div>';}
-    else{for(const r of data.rules){
-      h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div>';
-      h+='<span class="name">'+esc(r.name)+'</span> ';
-      h+='<span class="badge '+esc(r.type)+'">'+esc(r.type)+'</span> ';
-      h+='<span class="badge '+(r.enabled?"on":"off")+'">'+(r.enabled?"enabled":"disabled")+'</span>';
-      h+='</div><div>';
-      h+='<button class="btn" data-action="toggle" data-rule="'+esc(r.name)+'" data-val="'+(!r.enabled)+'">'+(r.enabled?"Disable":"Enable")+'</button> ';
-      h+='<button class="btn danger" data-action="delete" data-rule="'+esc(r.name)+'">Delete</button>';
-      h+='</div></div>';
-      h+='<div class="meta">';
-      if(r.scope)h+='scope: '+esc(r.scope)+' | ';
-      if(r.patterns?.length)h+='patterns: '+r.patterns.map(p=>esc(p)).join(", ")+' | ';
-      if(r.allow?.length)h+='allow: '+r.allow.join(", ")+' | ';
-      if(r.deny?.length)h+='deny: '+r.deny.join(", ")+' | ';
-      if(r.maxRequests)h+=r.maxRequests+' req/'+r.windowSeconds+'s | ';
-      if(r.replacement)h+='replacement: '+esc(r.replacement)+' | ';
-      if(r.message)h+='message: '+esc(r.message);
-      h+='</div></div>';
-    }}
-    document.getElementById("rules").innerHTML = h;
-  },
-
-  async audit() {
-    const data = await fetch(BASE+"/v1/audit").then(r=>r.json());
-    let h = '<h2>Audit Log</h2>';
-    if(!data.entries?.length){h+='<div class="empty">No audit events yet. Events appear when rules match requests or responses.</div>';}
-    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Detail</th><th>Matched</th><th>Message (before)</th><th>Message (after redaction)</th></tr>';
-    for(const e of data.entries){
-      const fullMsg = e.full_message
-        ? '<details><summary>view ('+e.full_message.length+' chars)</summary><pre style="white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:8px;margin-top:6px">'+esc(e.full_message)+'</pre></details>'
-        : '--';
-      const redactedMsg = e.redacted_message
-        ? '<details><summary>view ('+e.redacted_message.length+' chars)</summary><pre style="white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:8px;margin-top:6px">'+esc(e.redacted_message)+'</pre></details>'
-        : '--';
-      h+='<tr><td>'+ago(e.timestamp)+'</td><td>'+esc(e.rule)+'</td>';
-      h+='<td><span class="badge '+esc(e.type)+'">'+esc(e.type)+'</span></td>';
-      h+='<td>'+esc(e.action)+'</td><td>'+esc(e.source||'--')+'</td><td>'+esc(e.detail)+'</td>';
-      h+='<td>'+(e.matched_text?esc(e.matched_text):'--')+'</td>';
-      h+='<td>'+fullMsg+'</td>';
-      h+='<td>'+redactedMsg+'</td></tr>';
-    }h+='</table>';}
-    document.getElementById("audit").innerHTML = h;
-  },
-
-  async config() {
-    const [health,routing] = await Promise.all([
-      fetch(BASE+"/health").then(r=>r.json()),
-      fetch(BASE+"/v1/routing").then(r=>r.json()),
-    ]);
-    let h = '<h2>Active Configuration</h2>';
-    h+='<h2 style="font-size:12px;margin-top:16px">Pools</h2>';
-    for(const p of health.pools||[]){
-      h+='<div class="card"><span class="name">'+esc(p.name)+'</span> <span class="badge on">'+esc(p.strategy)+'</span>';
-      h+='<div class="meta">Members: '+p.members.map(m=>esc(m)).join(", ")+'</div></div>';
-    }
-    h+='<h2 style="font-size:12px;margin-top:16px">Chains</h2>';
-    if(!health.chains?.length)h+='<div class="empty">No chains</div>';
-    else for(const c of health.chains){h+='<div class="card"><span class="name">'+esc(c)+'</span></div>';}
-    h+='<h2 style="font-size:12px;margin-top:16px">Presets</h2>';
-    for(const p of health.presets||[]){
-      h+='<div class="card"><span class="name">'+esc(p.name)+'</span>';
-      h+='<div class="meta">'+p.entries.map(e=>esc(e)).join(" -> ")+'</div></div>';
-    }
-    h+='<h2 style="font-size:12px;margin-top:16px">Providers</h2>';
-    for(const p of health.providers||[]){
-      const exh=(health.exhausted||[]).includes(p);
-      h+='<div class="card"><span class="name">'+esc(p)+'</span> <span class="badge '+(exh?"off":"on")+'">'+(exh?"exhausted":"ok")+'</span></div>';
-    }
-    document.getElementById("config").innerHTML = h;
-  }
-};
-
-async function toggleRule(name,enabled){
-  await fetch(BASE+"/v1/rules/"+encodeURIComponent(name),{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled})});
-  loaders.rules();
-}
-async function deleteRule(name){
-  if(!confirm("Delete rule "+name+"?"))return;
-  await fetch(BASE+"/v1/rules/"+encodeURIComponent(name),{method:"DELETE"});
-  loaders.rules();
-}
-function showRuleForm(){
-  const area=document.getElementById("rule-form-area");
-  if(area.innerHTML){area.innerHTML="";return;}
-  area.innerHTML='<div class="card"><div class="form">'
-    +'<label>Name</label><input id="rf-name" placeholder="e.g. block-secrets">'
-    +'<label>Type</label><select id="rf-type"><option value="block">block</option><option value="redact">redact</option><option value="warn">warn</option><option value="model">model (allow/deny)</option><option value="limit">rate limit</option></select>'
-    +'<label>Scope</label><select id="rf-scope"><option value="request">request</option><option value="response">response</option><option value="both">both</option></select>'
-    +'<label>Patterns (one per line, regex)</label><textarea id="rf-patterns" rows="3" placeholder="AKIA[0-9A-Z]{16}\\nsk-[a-zA-Z0-9]{48}"></textarea>'
-    +'<label>Replacement (for redact)</label><input id="rf-replacement" placeholder="[REDACTED]">'
-    +'<label>Message (shown when blocked)</label><input id="rf-message" placeholder="Request blocked: contains secrets">'
-    +'<label>Model allow list (comma-separated, for model type)</label><input id="rf-allow" placeholder="claude-*, gpt-5*">'
-    +'<label>Model deny list</label><input id="rf-deny" placeholder="gpt-4o*">'
-    +'<label>Max requests (for limit type)</label><input id="rf-max" type="number" placeholder="60">'
-    +'<label>Window seconds</label><input id="rf-window" type="number" placeholder="60">'
-    +'<div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary" data-action="create-rule">Create Rule</button><button class="btn" data-action="cancel-form">Cancel</button></div>'
-    +'</div></div>';
-}
-async function createRule(){
-  const type=document.getElementById("rf-type").value;
-  const rule={
-    name:document.getElementById("rf-name").value||"rule-"+Date.now(),
-    type,
-    enabled:true,
-    scope:document.getElementById("rf-scope").value,
-    patterns:document.getElementById("rf-patterns").value.split("\\n").filter(Boolean),
-    replacement:document.getElementById("rf-replacement").value||undefined,
-    message:document.getElementById("rf-message").value||undefined,
-  };
-  if(type==="model"){
-    const allow=document.getElementById("rf-allow").value;
-    const deny=document.getElementById("rf-deny").value;
-    if(allow)rule.allow=allow.split(",").map(s=>s.trim()).filter(Boolean);
-    if(deny)rule.deny=deny.split(",").map(s=>s.trim()).filter(Boolean);
-  }
-  if(type==="limit"){
-    rule.maxRequests=parseInt(document.getElementById("rf-max").value)||60;
-    rule.windowSeconds=parseInt(document.getElementById("rf-window").value)||60;
-  }
-  await fetch(BASE+"/v1/rules",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rule)});
-  document.getElementById("rule-form-area").innerHTML="";
-  loaders.rules();
-}
-
-// Event delegation for dynamic buttons
-document.addEventListener("click", async (e) => {
-  const btn = e.target.closest("[data-action]");
-  if (!btn) return;
-  const action = btn.dataset.action;
-  if (action === "toggle") { await toggleRule(btn.dataset.rule, btn.dataset.val === "true"); }
-  else if (action === "delete") { await deleteRule(btn.dataset.rule); }
-  else if (action === "create-rule") { await createRule(); }
-  else if (action === "cancel-form") { document.getElementById("rule-form-area").innerHTML = ""; }
-});
-
-loaders.dashboard();
-</script>
-</body></html>`;
 
 function handleUI(req, res) {
-	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-	res.end(CHAT_UI_HTML);
+	serveStaticFile(res, join(WEB_DIR, "ui", "index.html"));
 }
-
-const CHAT_UI_HTML = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Leeloo on multi-pass</title>
-
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-
-/* ── Top bar ── */
-#topbar{background:#111;border-bottom:1px solid #222;flex-shrink:0}
-#bar-main{padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-#bar-main h1{font-size:14px;color:#f90;font-weight:700;letter-spacing:.5px;white-space:nowrap}
-#bar-main select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:6px 10px;font-size:13px;min-width:240px;cursor:pointer}
-#bar-main select:focus{border-color:#f90;outline:none}
-#bar-main select optgroup{color:#888;font-style:normal;font-weight:600;font-size:11px}
-.bar-actions{display:flex;gap:6px;margin-left:auto;align-items:center}
-.bar-btn{background:none;border:1px solid #333;color:#888;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer}
-.bar-btn:hover{border-color:#666;color:#ccc}
-.dot{width:7px;height:7px;border-radius:50%;background:#444;display:inline-block}
-.dot.ok{background:#4a4}.dot.busy{background:#f90;animation:blink 1s infinite}
-@keyframes blink{50%{opacity:.4}}
-#status-text{font-size:11px;color:#555}
-
-/* ── Info strip ── */
-#info-strip{padding:5px 20px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;font-size:11px;color:#555;overflow-x:auto;white-space:nowrap;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-#info-strip .section{display:flex;gap:4px;align-items:center;margin-right:8px}
-#info-strip .section-label{color:#444;font-weight:700;text-transform:uppercase;font-size:9px;letter-spacing:.5px;margin-right:2px}
-#info-strip .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;border:1px solid #222;background:#111}
-#info-strip .tag b{color:#999;font-weight:600}
-#info-strip .tag .val{color:#777}
-#info-strip .tag .bar{display:inline-block;width:40px;height:6px;background:#222;border-radius:3px;overflow:hidden;vertical-align:middle}
-#info-strip .tag .bar-fill{height:100%;border-radius:3px;transition:width .3s}
-#info-strip .tag.pool{border-color:#2a2a3a}
-#info-strip .tag.preset{border-color:#3a2a1a}
-#info-strip .tag.provider{border-color:#1a2a1a}
-#info-strip .tag.exhausted{border-color:#4a1a1a;opacity:.5}
-#info-strip .sep{color:#222;margin:0 2px}
-
-/* ── Chat ── */
-#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
-.msg{max-width:82%;border-radius:14px;line-height:1.6;font-size:14px;word-wrap:break-word;overflow:hidden}
-.msg.user{align-self:flex-end;background:#1a3a5c;color:#cde;border-bottom-right-radius:4px;padding:12px 16px;white-space:pre-wrap}
-.msg.assistant{align-self:flex-start;background:#151515;border:1px solid #222;border-bottom-left-radius:4px;padding:0}
-.msg .md-body{padding:12px 16px}
-.msg .meta{font-size:11px;color:#555;padding:6px 16px;border-top:1px solid #222;background:#0d0d0d;display:flex;gap:12px;flex-wrap:wrap;border-radius:0 0 0 14px}
-.msg .meta .provider-tag{color:#f90}
-.welcome{text-align:center;color:#444;padding:60px 20px;font-size:14px;line-height:2}
-.welcome h2{color:#f90;font-size:18px;margin-bottom:8px;font-weight:600}
-
-/* ── Thinking indicator ── */
-.thinking{padding:12px 16px;display:flex;align-items:center;gap:8px;color:#888;font-size:13px}
-.thinking .dots{display:flex;gap:4px}
-.thinking .dots span{width:6px;height:6px;border-radius:50%;background:#f90;animation:pulse 1.4s infinite}
-.thinking .dots span:nth-child(2){animation-delay:.2s}
-.thinking .dots span:nth-child(3){animation-delay:.4s}
-@keyframes pulse{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
-
-/* ── Markdown styles ── */
-.md-body p{margin:0 0 8px}
-.md-body p:last-child{margin:0}
-.md-body code{background:#0d0d0d;padding:1px 5px;border-radius:3px;font-size:13px;font-family:"SF Mono",Menlo,monospace}
-.md-body pre{background:#0d0d0d;padding:12px;border-radius:8px;overflow-x:auto;margin:8px 0;border:1px solid #222}
-.md-body pre code{background:none;padding:0;font-size:13px}
-.md-body ul,.md-body ol{margin:4px 0 4px 20px}
-.md-body blockquote{border-left:3px solid #333;padding-left:12px;margin:4px 0;color:#999}
-.md-body h1,.md-body h2,.md-body h3{margin:8px 0 4px;color:#ddd}
-.md-body h1{font-size:18px} .md-body h2{font-size:16px} .md-body h3{font-size:14px}
-.md-body table{border-collapse:collapse;margin:8px 0}
-.md-body td,.md-body th{border:1px solid #333;padding:4px 8px;font-size:13px}
-.md-body th{background:#1a1a1a}
-.md-body a{color:#6af}
-.md-body strong{color:#eee}
-
-/* ── Input ── */
-#input-area{border-top:1px solid #222;padding:10px 20px;display:flex;gap:10px;flex-shrink:0;background:#111}
-#input-area textarea{flex:1;background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:10px;padding:10px 14px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:140px;line-height:1.5}
-#input-area textarea:focus{outline:none;border-color:#f90}
-#input-area textarea:disabled{opacity:.5}
-#input-area button{background:#f90;color:#000;border:none;border-radius:10px;padding:0 22px;font-weight:700;cursor:pointer;font-size:14px;transition:background .15s}
-#input-area button:hover{background:#fa0}
-#input-area button:disabled{opacity:.3;cursor:default}
-</style>
-</head><body>
-
-<div id="topbar">
-  <div id="bar-main">
-    <h1>Leeloo on multi-pass</h1>
-    <select id="model-select"><option>Loading...</option></select>
-    <div class="bar-actions">
-      <button class="bar-btn" onclick="clearChat()">Clear</button>
-      <span class="dot" id="dot"></span>
-      <span id="status-text">loading...</span>
-    </div>
-  </div>
-  <div id="info-strip"></div>
-</div>
-
-<div id="chat">
-  <div class="welcome">
-    <h2>Leeloo on multi-pass</h2>
-    Select a preset or model above and start chatting.<br>
-    Requests route through your multi-pass pools with automatic failover.
-  </div>
-</div>
-
-<div id="input-area">
-  <textarea id="input" rows="1" placeholder="Type a message... (Enter to send)" autofocus></textarea>
-  <button id="send" onclick="sendMessage()">Send</button>
-</div>
-
-<script type="module">
-let smd = null;
-try { smd = await import("https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js"); } catch {}
-const BASE = location.origin;
-const chat = document.getElementById("chat");
-const input = document.getElementById("input");
-const sel = document.getElementById("model-select");
-const sendBtn = document.getElementById("send");
-const statusEl = document.getElementById("status-text");
-const dotEl = document.getElementById("dot");
-const infoStrip = document.getElementById("info-strip");
-let messages = [];
-let streaming = false;
-
-input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
-input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-
-function setStatus(state, text) {
-  statusEl.textContent = text;
-  dotEl.className = "dot " + (state === "ready" ? "ok" : state === "busy" ? "busy" : "");
-}
-
-// ── Load config + quota info strip ──
-function quotaColor(pct) {
-  if (pct === null || pct === undefined) return "#555";
-  if (pct > 50) return "#4a4";
-  if (pct > 20) return "#ca0";
-  return "#e44";
-}
-function quotaBar(pct) {
-  if (pct === null || pct === undefined) return '<span class="val">--</span>';
-  return '<span class="bar"><span class="bar-fill" style="width:' + pct + '%;background:' + quotaColor(pct) + '"></span></span> <span class="val">' + pct + '%</span>';
-}
-
-async function loadInfo() {
-  try {
-    const [h, q] = await Promise.all([
-      fetch(BASE + "/health").then(r => r.json()),
-      fetch(BASE + "/v1/quota").then(r => r.json()).catch(() => ({ providers: [] })),
-    ]);
-    const quotaMap = {};
-    for (const p of (q.providers || [])) quotaMap[p.provider] = p;
-
-    let html = "";
-
-    // Pools
-    if (h.pools?.length) {
-      html += '<span class="section"><span class="section-label">pools</span>';
-      for (const p of h.pools) {
-        html += '<span class="tag pool"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.strategy) + '</span></span>';
-      }
-      html += '</span><span class="sep">|</span>';
-    }
-
-    // Presets
-    if (h.presets?.length) {
-      html += '<span class="section"><span class="section-label">presets</span>';
-      for (const p of h.presets) {
-        html += '<span class="tag preset" title="' + esc(p.entries.join(" > ")) + '"><b>' + esc(p.name) + '</b></span>';
-      }
-      html += '</span><span class="sep">|</span>';
-    }
-
-    // Providers with quota bars
-    html += '<span class="section"><span class="section-label">providers</span>';
-    for (const prov of (h.providers || [])) {
-      const qi = quotaMap[prov] || {};
-      const exh = (h.exhausted || []).includes(prov) || qi.exhausted;
-      const cls = "tag provider" + (exh ? " exhausted" : "");
-      html += '<span class="' + cls + '"><b>' + esc(prov) + '</b> ' + quotaBar(qi.quota) + '</span>';
-    }
-    html += '</span>';
-
-    infoStrip.innerHTML = html;
-  } catch {}
-}
-
-// ── Load routing ──
-async function loadRouting() {
-  try {
-    const data = await (await fetch(BASE + "/v1/routing")).json();
-    sel.innerHTML = "";
-    let count = 0;
-    for (const group of (data.groups || [])) {
-      const og = document.createElement("optgroup");
-      og.label = group.label;
-      for (const item of group.items) {
-        const o = document.createElement("option");
-        o.value = item.id;
-        o.textContent = item.name;
-        if (item.detail) o.title = item.detail;
-        og.appendChild(o);
-        count++;
-      }
-      sel.appendChild(og);
-    }
-    setStatus("ready", count + " routes");
-  } catch (e) { setStatus("error", e.message); }
-}
-
-function clearChat() {
-  messages = [];
-  chat.innerHTML = '<div class="welcome"><h2>Leeloo on multi-pass</h2>Chat cleared.</div>';
-}
-
-function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"\x26lt;").replace(/>/g,"\x26gt;"); }
-
-async function sendMessage() {
-  const text = input.value.trim();
-  if (!text || streaming) return;
-  input.value = ""; input.style.height = "auto";
-  messages.push({ role: "user", content: text });
-
-  // Remove welcome
-  const w = chat.querySelector(".welcome"); if (w) w.remove();
-
-  // User bubble
-  const userDiv = document.createElement("div");
-  userDiv.className = "msg user";
-  userDiv.textContent = text;
-  chat.appendChild(userDiv);
-
-  // Assistant bubble with thinking indicator
-  const msgDiv = document.createElement("div");
-  msgDiv.className = "msg assistant";
-  msgDiv.innerHTML = '<div class="thinking"><div class="dots"><span></span><span></span><span></span></div>Thinking...</div>';
-  chat.appendChild(msgDiv);
-  chat.scrollTop = chat.scrollHeight;
-
-  streaming = true; sendBtn.disabled = true; input.disabled = true;
-  setStatus("busy", "connecting...");
-
-  let full = "";
-  let gotFirstToken = false;
-  let smdParser = null;
-  let mdBody = null;
-  const t0 = Date.now();
-  const rawSelection = sel.value;
-  // Clean display: "pool:codex-pool/gpt-5.1" -> "codex-pool / gpt-5.1"
-  const selectedModel = rawSelection.includes("/") ? rawSelection.split("/").pop() : rawSelection;
-  const selectedRoute = rawSelection.replace("pool:", "").replace("provider:", "").replace("/", " / ");
-
-  try {
-    const resp = await fetch(BASE + "/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: rawSelection, messages, stream: true }),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err?.error?.message || "HTTP " + resp.status);
-    }
-
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "", usage = null, xProvider = "", xModel = "", xLabel = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\\n");
-      buf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const p = line.slice(6).trim();
-        if (p === "[DONE]") continue;
-        try {
-          const j = JSON.parse(p);
-          const d = j.choices?.[0]?.delta;
-
-          if (d?.content) {
-            if (!gotFirstToken) {
-              gotFirstToken = true;
-              mdBody = document.createElement("div");
-              mdBody.className = "md-body";
-              msgDiv.innerHTML = "";
-              msgDiv.appendChild(mdBody);
-              if (smd) smdParser = smd.parser(smd.default_renderer(mdBody));
-              setStatus("busy", "receiving...");
-            }
-            full += d.content;
-            if (smdParser) smd.parser_write(smdParser, d.content);
-            else mdBody.textContent = full;
-            chat.scrollTop = chat.scrollHeight;
-          }
-
-          if (d?.tool_calls) {
-            if (!gotFirstToken) {
-              gotFirstToken = true;
-              mdBody = document.createElement("div");
-              mdBody.className = "md-body";
-              msgDiv.innerHTML = "";
-              msgDiv.appendChild(mdBody);
-              if (smd) smdParser = smd.parser(smd.default_renderer(mdBody));
-            }
-            const tc = d.tool_calls[0];
-            const tcText = "\\n**Tool call:** \`" + (tc?.function?.name || "?") + "\`\\n";
-            full += tcText;
-            if (smdParser) smd.parser_write(smdParser, tcText);
-            else mdBody.textContent = full;
-          }
-
-          if (j.usage) usage = j.usage;
-          if (j.x_provider) xProvider = j.x_provider;
-          if (j.x_model) xModel = j.x_model;
-          if (j.x_label) xLabel = j.x_label;
-
-          if (j.choices?.[0]?.finish_reason) {
-            if (smdParser && smd) smd.parser_end(smdParser);
-            const ms = Date.now() - t0;
-            const meta = document.createElement("div");
-            meta.className = "meta";
-            const parts = [];
-            parts.push('<span class="provider-tag">' + esc(selectedRoute) + '</span>');
-            if (xLabel || xProvider) {
-              parts.push('<span style="color:#8af">' + esc(xLabel || xProvider) + '</span> / <span style="color:#aaa">' + esc(xModel) + '</span>');
-            }
-            if (usage) parts.push(usage.prompt_tokens + " in / " + usage.completion_tokens + " out");
-            parts.push((ms / 1000).toFixed(1) + "s");
-            meta.innerHTML = parts.join(' <span style="color:#333">|</span> ');
-            msgDiv.appendChild(meta);
-          }
-        } catch {}
-      }
-    }
-    messages.push({ role: "assistant", content: full });
-  } catch (e) {
-    // If request failed (e.g. blocked by policy), remove the just-added user turn
-    // from request history so future messages are not repeatedly blocked.
-    const last = messages[messages.length - 1];
-    if (last && last.role === "user" && last.content === text) {
-      messages.pop();
-    }
-    msgDiv.innerHTML = '<div class="md-body" style="color:#f44;padding:12px 16px">[Error: ' + esc(e.message) + ']</div>';
-  }
-
-  streaming = false; sendBtn.disabled = false; input.disabled = false;
-  input.focus();
-  setStatus("ready", "done");
-  loadInfo(); // refresh quota + exhausted state
-}
-
-loadRouting();
-loadInfo();
-</script>
-</body></html>`;
 
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -2264,6 +1687,7 @@ const server = createServer(async (req, res) => {
 		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
 		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
+		else if (path.startsWith("/web/") && req.method === "GET") handleWebAsset(req, res, path);
 		else if (path === "/admin") handleAdmin(req, res);
 		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
