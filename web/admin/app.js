@@ -5,15 +5,15 @@ import htm from "https://esm.sh/htm@3.1.1";
 const html = htm.bind(React.createElement);
 const BASE = location.origin;
 const STRATEGIES = ["round-robin", "quota-first", "scheduled", "custom"];
-const PROVIDERS = ["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
+const BASE_PROVIDERS = ["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
 
 async function api(path, init) {
   const r = await fetch(`${BASE}${path}`, init);
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e?.error?.message || `HTTP ${r.status}`); }
   return r.json();
 }
-function jpost(data) { return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }; }
-function jput(data) { return { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }; }
+function jpost(d) { return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(d) }; }
+function jput(d) { return { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(d) }; }
 
 function ago(ts) {
   if (!ts) return "--";
@@ -24,6 +24,41 @@ function ago(ts) {
 }
 function qColor(s) { return s == null ? "#3f3f46" : s > 50 ? "#22c55e" : s > 20 ? "#eab308" : "#ef4444"; }
 function QuotaBar({ score }) { return html`<span className="q-bar"><span className="q-fill" style=${{ width: `${score ?? 0}%`, background: qColor(score) }} /></span>`; }
+
+/** Shared hook: load known provider/pool/chain names for dropdowns */
+function useNames() {
+  const [names, setNames] = useState({ providers: [], pools: [], chains: [] });
+  const load = useCallback(async () => {
+    try { setNames(await api("/v1/auth/names")); } catch {}
+  }, []);
+  useEffect(() => { load(); }, []);
+  return { names, reloadNames: load };
+}
+
+/** Dropdown for selecting a provider/subscription */
+function ProviderSelect({ value, onChange, names, allowPools, allowChains, placeholder }) {
+  const provs = names?.providers || [];
+  const pools = names?.pools || [];
+  const chains = names?.chains || [];
+  return html`
+    <select value=${value || ""} onChange=${(e) => onChange(e.target.value)}>
+      <option value="">${placeholder || "-- select --"}</option>
+      <optgroup label="Providers">
+        ${provs.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}${p.authenticated ? "" : " (no auth)"}</option>`)}
+      </optgroup>
+      ${allowPools && pools.length ? html`
+        <optgroup label="Pools">
+          ${pools.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}</option>`)}
+        </optgroup>
+      ` : null}
+      ${allowChains && chains.length ? html`
+        <optgroup label="Chains">
+          ${chains.map((c) => html`<option key=${c.id} value=${c.id}>${c.label}</option>`)}
+        </optgroup>
+      ` : null}
+    </select>
+  `;
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
@@ -64,25 +99,122 @@ function DashboardPanel({ data }) {
 // CONFIG EDITOR
 // ════════════════════════════════════════════════════════════════════════════════
 
-function InlineEdit({ value, onChange, placeholder, mono }) {
-  return html`<input className=${mono ? "mono" : ""} value=${value || ""} onInput=${(e) => onChange(e.target.value)} placeholder=${placeholder} />`;
-}
+// ── Auth / OAuth ──
 
-function TagList({ items, onChange, placeholder }) {
-  const [draft, setDraft] = useState("");
-  function add() { if (draft.trim()) { onChange([...items, draft.trim()]); setDraft(""); } }
-  function remove(i) { onChange(items.filter((_, idx) => idx !== i)); }
-  return html`
-    <div>
-      <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
-        ${items.map((item, i) => html`<span key=${i} className="badge neutral" style=${{ cursor: "pointer" }} onClick=${() => remove(i)}>${item} x</span>`)}
-      </div>
-      <div style=${{ display: "flex", gap: "6px" }}>
-        <input value=${draft} onInput=${(e) => setDraft(e.target.value)} placeholder=${placeholder} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} style=${{ flex: 1 }} />
-        <button className="btn" onClick=${add}>+</button>
-      </div>
+function AuthPanel({ onRefresh, reloadNames }) {
+  const [providers, setProviders] = useState([]);
+  const [busy, setBusy] = useState({});
+  const [showAdd, setShowAdd] = useState(false);
+  const [newBase, setNewBase] = useState(BASE_PROVIDERS[0]);
+  const [newName, setNewName] = useState("");
+
+  async function loadProviders() {
+    try { const d = await api("/v1/auth/providers"); setProviders(d.providers || []); } catch {}
+  }
+  useEffect(() => { loadProviders(); }, []);
+
+  async function startLogin(providerId) {
+    setBusy((b) => ({ ...b, [providerId]: "connecting..." }));
+    try {
+      const res = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`, { method: "POST" });
+      if (res.authUrl) {
+        window.open(res.authUrl, "_blank");
+        setBusy((b) => ({ ...b, [providerId]: "waiting for browser..." }));
+        pollLogin(providerId);
+      }
+    } catch (e) {
+      setBusy((b) => ({ ...b, [providerId]: `error: ${e.message}` }));
+      setTimeout(() => setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; }), 3000);
+    }
+  }
+
+  async function pollLogin(providerId) {
+    for (let i = 0; i < 120; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const s = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`);
+        if (s.status === "authenticated" || s.hasAuth) {
+          setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; });
+          await loadProviders();
+          if (reloadNames) reloadNames();
+          if (onRefresh) onRefresh();
+          return;
+        }
+      } catch {}
+    }
+    setBusy((b) => ({ ...b, [providerId]: "timed out" }));
+  }
+
+  async function logout(providerId) {
+    if (!confirm(`Logout from ${providerId}?`)) return;
+    try {
+      await api(`/v1/auth/logout/${encodeURIComponent(providerId)}`, { method: "POST" });
+      await loadProviders();
+      if (reloadNames) reloadNames();
+      if (onRefresh) onRefresh();
+    } catch {}
+  }
+
+  async function addAccount() {
+    const name = newName.trim() || `${newBase}-${Date.now()}`;
+    setBusy((b) => ({ ...b, __new__: "creating..." }));
+    try {
+      // 1. Create subscription entry
+      await api("/v1/config/subscriptions", jpost({ name, provider: newBase, enabled: true, alias: name }));
+      // 2. Start OAuth login for the new subscription name
+      setShowAdd(false);
+      setNewName("");
+      if (onRefresh) onRefresh();
+      if (reloadNames) reloadNames();
+      await loadProviders();
+      // 3. Auto-start login for the new account (use base provider OAuth since it shares the flow)
+      startLogin(newBase);
+    } catch (e) {
+      setBusy((b) => ({ ...b, __new__: `error: ${e.message}` }));
+    }
+    setBusy((b) => { const n = { ...b }; delete n.__new__; return n; });
+  }
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "10px" }}>
+      <h2 style=${{ margin: 0 }}>OAuth accounts</h2>
+      <button className="btn primary" onClick=${() => setShowAdd((v) => !v)}>${showAdd ? "Cancel" : "+ Add account"}</button>
     </div>
-  `;
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Login to providers to enable routing. Add extra accounts for the same provider to enable pool rotation.</div>
+
+    ${showAdd ? html`
+      <div className="card" style=${{ marginBottom: "12px" }}>
+        <div className="form-grid">
+          <div><label>Base provider</label><select value=${newBase} onChange=${(e) => setNewBase(e.target.value)}>${BASE_PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
+          <div><label>Account name</label><input value=${newName} onInput=${(e) => setNewName(e.target.value)} placeholder=${`e.g. ${newBase}-2`} /></div>
+        </div>
+        <div className="actions" style=${{ marginTop: "10px" }}>
+          <button className="btn primary" onClick=${addAccount} disabled=${!!busy.__new__}>${busy.__new__ || "Create & Login"}</button>
+        </div>
+      </div>
+    ` : null}
+
+    ${providers.map((p) => html`
+      <div className="card" key=${p.id}>
+        <div className="card-row">
+          <div>
+            <span className="name">${p.name}</span>
+            <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${p.id}</span>
+            <span className=${`badge ${p.authenticated ? "on" : "off"}`}>${p.authenticated ? "logged in" : "not logged in"}</span>
+          </div>
+          <div className="actions">
+            ${busy[p.id]
+              ? html`<span style=${{ fontSize: "12px", color: "#f59e0b" }}>${busy[p.id]}</span>`
+              : html`
+                <button className="btn primary" onClick=${() => startLogin(p.isBuiltin ? p.id : p.baseProvider)}>${p.authenticated ? "Re-login" : "Login"}</button>
+                ${p.authenticated ? html`<button className="btn danger" onClick=${() => logout(p.id)}>Logout</button>` : null}
+              `}
+          </div>
+        </div>
+      </div>
+    `)}
+    ${providers.length === 0 ? html`<div className="empty">Loading providers...</div>` : null}
+  </div>`;
 }
 
 // ── Subscriptions ──
@@ -92,32 +224,32 @@ function SubEditor({ subs, onSave }) {
   const [draft, setDraft] = useState({});
 
   function startEdit(s) { setEditing(s.name); setDraft({ ...s }); }
-  function startNew() { setEditing("__new__"); setDraft({ name: "", provider: PROVIDERS[0], enabled: true, alias: "" }); }
+  function startNew() { setEditing("__new__"); setDraft({ name: "", provider: BASE_PROVIDERS[0], enabled: true, alias: "" }); }
   function cancel() { setEditing(null); }
   async function save() {
-    if (editing === "__new__") {
-      await api("/v1/config/subscriptions", jpost(draft));
-    } else {
-      await api(`/v1/config/subscriptions/${encodeURIComponent(editing)}`, jput(draft));
-    }
-    setEditing(null);
-    onSave();
+    if (editing === "__new__") { await api("/v1/config/subscriptions", jpost(draft)); }
+    else { await api(`/v1/config/subscriptions/${encodeURIComponent(editing)}`, jput(draft)); }
+    setEditing(null); onSave();
   }
   async function del(name) { if (confirm(`Delete subscription "${name}"?`)) { await api(`/v1/config/subscriptions/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
-  return html`<div>
-    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Subscriptions</h2><button className="btn primary" onClick=${startNew}>+ Add</button></div>
-    ${subs.map((s) => editing === s.name ? html`
-      <div className="card" key=${s.name}>
+  function renderForm(isNew) {
+    return html`
+      <div className="card">
         <div className="form-grid">
-          <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} /></div>
-          <div><label>Provider</label><select value=${draft.provider} onChange=${(e) => setDraft({ ...draft, provider: e.target.value })}>${PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
+          <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. openai-codex-2" /></div>
+          <div><label>Base provider</label><select value=${draft.provider} onChange=${(e) => setDraft({ ...draft, provider: e.target.value })}>${BASE_PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
           <div><label>Alias</label><input value=${draft.alias || ""} onInput=${(e) => setDraft({ ...draft, alias: e.target.value })} /></div>
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
         </div>
-        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>Save</button><button className="btn" onClick=${cancel}>Cancel</button></div>
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
       </div>
-    ` : html`
+    `;
+  }
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Subscriptions</h2><button className="btn primary" onClick=${startNew}>+ Add</button></div>
+    ${subs.map((s) => editing === s.name ? renderForm(false) : html`
       <div className="card" key=${s.name}>
         <div className="card-row">
           <div><span className="name">${s.name}</span><span className="badge neutral">${s.provider}</span><span className=${`badge ${s.enabled !== false ? "on" : "off"}`}>${s.enabled !== false ? "on" : "off"}</span>${s.alias ? html`<span className="badge neutral">${s.alias}</span>` : null}</div>
@@ -125,28 +257,19 @@ function SubEditor({ subs, onSave }) {
         </div>
       </div>
     `)}
-    ${editing === "__new__" ? html`
-      <div className="card">
-        <div className="form-grid">
-          <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. openai-codex-2" /></div>
-          <div><label>Provider</label><select value=${draft.provider} onChange=${(e) => setDraft({ ...draft, provider: e.target.value })}>${PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
-          <div><label>Alias</label><input value=${draft.alias} onInput=${(e) => setDraft({ ...draft, alias: e.target.value })} /></div>
-          <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
-        </div>
-        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>Create</button><button className="btn" onClick=${cancel}>Cancel</button></div>
-      </div>
-    ` : null}
+    ${editing === "__new__" ? renderForm(true) : null}
   </div>`;
 }
 
 // ── Pools ──
 
-function PoolEditor({ pools, onSave }) {
+function PoolEditor({ pools, names, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
+  const providerNames = (names?.providers || []).map((p) => p.id);
 
   function startEdit(p) { setEditing(p.name); setDraft({ ...p, members: [...(p.members || [])] }); }
-  function startNew() { setEditing("__new__"); setDraft({ name: "", enabled: true, baseProvider: PROVIDERS[0], members: [], strategy: "round-robin" }); }
+  function startNew() { setEditing("__new__"); setDraft({ name: "", enabled: true, baseProvider: BASE_PROVIDERS[0], members: [], strategy: "round-robin" }); }
   function cancel() { setEditing(null); }
   async function save() {
     if (editing === "__new__") { await api("/v1/config/pools", jpost(draft)); }
@@ -155,15 +278,32 @@ function PoolEditor({ pools, onSave }) {
   }
   async function del(name) { if (confirm(`Delete pool "${name}"?`)) { await api(`/v1/config/pools/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
+  function addMember(val) { if (val && !draft.members.includes(val)) setDraft({ ...draft, members: [...draft.members, val] }); }
+  function removeMember(i) { setDraft({ ...draft, members: draft.members.filter((_, idx) => idx !== i) }); }
+
   function renderForm(isNew) {
+    // Filter providers to those matching the base provider
+    const eligible = providerNames.filter((n) => n === draft.baseProvider || n.startsWith(draft.baseProvider + "-"));
     return html`
       <div className="card">
         <div className="form-grid">
           <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. codex-pool" /></div>
-          <div><label>Base Provider</label><select value=${draft.baseProvider} onChange=${(e) => setDraft({ ...draft, baseProvider: e.target.value })}>${PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
+          <div><label>Base provider</label><select value=${draft.baseProvider} onChange=${(e) => setDraft({ ...draft, baseProvider: e.target.value })}>${BASE_PROVIDERS.map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
           <div><label>Strategy</label><select value=${draft.strategy} onChange=${(e) => setDraft({ ...draft, strategy: e.target.value })}>${STRATEGIES.map((s) => html`<option key=${s} value=${s}>${s}</option>`)}</select></div>
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
-          <div className="full"><label>Members</label><${TagList} items=${draft.members} onChange=${(m) => setDraft({ ...draft, members: m })} placeholder="Add member name..." /></div>
+          <div className="full">
+            <label>Members</label>
+            <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
+              ${draft.members.map((m, i) => html`<span key=${i} className="badge on" style=${{ cursor: "pointer" }} onClick=${() => removeMember(i)}>${m} x</span>`)}
+              ${draft.members.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>No members yet</span>` : null}
+            </div>
+            <div style=${{ display: "flex", gap: "6px" }}>
+              <select onChange=${(e) => { addMember(e.target.value); e.target.value = ""; }} style=${{ flex: 1 }}>
+                <option value="">+ Add member...</option>
+                ${eligible.filter((n) => !draft.members.includes(n)).map((n) => html`<option key=${n} value=${n}>${n}</option>`)}
+              </select>
+            </div>
+          </div>
           ${draft.strategy === "scheduled" ? html`<div className="full"><label>Schedule (JSON)</label><textarea value=${JSON.stringify(draft.memberSchedule || {}, null, 2)} onInput=${(e) => { try { setDraft({ ...draft, memberSchedule: JSON.parse(e.target.value) }); } catch {} }} rows="4" /></div>` : null}
           ${draft.strategy === "custom" ? html`<div className="full"><label>Selector Script Path</label><input value=${draft.selectorScript || ""} onInput=${(e) => setDraft({ ...draft, selectorScript: e.target.value })} placeholder="./my-selector.js" /></div>` : null}
         </div>
@@ -189,7 +329,7 @@ function PoolEditor({ pools, onSave }) {
 
 // ── Chains ──
 
-function ChainEditor({ chains, onSave }) {
+function ChainEditor({ chains, names, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
 
@@ -203,11 +343,7 @@ function ChainEditor({ chains, onSave }) {
   }
   async function del(name) { if (confirm(`Delete chain "${name}"?`)) { await api(`/v1/config/chains/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
-  function updateStep(i, field, value) {
-    const steps = [...draft.steps];
-    steps[i] = { ...steps[i], [field]: value };
-    setDraft({ ...draft, steps });
-  }
+  function updateStep(i, field, value) { const steps = [...draft.steps]; steps[i] = { ...steps[i], [field]: value }; setDraft({ ...draft, steps }); }
   function addStep() { setDraft({ ...draft, steps: [...draft.steps, { provider: "", model: "", enabled: true }] }); }
   function removeStep(i) { setDraft({ ...draft, steps: draft.steps.filter((_, idx) => idx !== i) }); }
 
@@ -219,11 +355,11 @@ function ChainEditor({ chains, onSave }) {
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
         </div>
         <div style=${{ marginTop: "10px" }}>
-          <label>Steps (in order)</label>
+          <label>Steps (failover order)</label>
           ${draft.steps.map((s, i) => html`
             <div key=${i} style=${{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
               <span style=${{ color: "#52525b", fontSize: "11px", width: "20px" }}>${i + 1}.</span>
-              <input value=${s.provider || ""} onInput=${(e) => updateStep(i, "provider", e.target.value)} placeholder="provider or pool:name" style=${{ flex: 1 }} />
+              <${ProviderSelect} value=${s.provider} onChange=${(v) => updateStep(i, "provider", v)} names=${names} allowPools=${true} placeholder="provider or pool" />
               <input value=${s.model || ""} onInput=${(e) => updateStep(i, "model", e.target.value)} placeholder="model (optional)" style=${{ flex: 1 }} />
               <button className="btn danger" onClick=${() => removeStep(i)} style=${{ padding: "4px 8px" }}>x</button>
             </div>
@@ -252,7 +388,7 @@ function ChainEditor({ chains, onSave }) {
 
 // ── Presets ──
 
-function PresetEditor({ presets, onSave }) {
+function PresetEditor({ presets, names, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
 
@@ -266,11 +402,7 @@ function PresetEditor({ presets, onSave }) {
   }
   async function del(name) { if (confirm(`Delete preset "${name}"?`)) { await api(`/v1/config/presets/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
-  function updateEntry(i, field, value) {
-    const entries = [...draft.entries];
-    entries[i] = { ...entries[i], [field]: field === "enabled" ? value === "true" : value };
-    setDraft({ ...draft, entries });
-  }
+  function updateEntry(i, field, value) { const entries = [...draft.entries]; entries[i] = { ...entries[i], [field]: field === "enabled" ? value === "true" : value }; setDraft({ ...draft, entries }); }
   function addEntry() { setDraft({ ...draft, entries: [...draft.entries, { provider: "", model: "", enabled: true }] }); }
   function removeEntry(i) { setDraft({ ...draft, entries: draft.entries.filter((_, idx) => idx !== i) }); }
 
@@ -286,7 +418,7 @@ function PresetEditor({ presets, onSave }) {
           ${draft.entries.map((e, i) => html`
             <div key=${i} style=${{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
               <span style=${{ color: "#52525b", fontSize: "11px", width: "20px" }}>${i + 1}.</span>
-              <input value=${e.provider || ""} onInput=${(ev) => updateEntry(i, "provider", ev.target.value)} placeholder="provider or pool:name" style=${{ flex: 1 }} />
+              <${ProviderSelect} value=${e.provider} onChange=${(v) => updateEntry(i, "provider", v)} names=${names} allowPools=${true} allowChains=${true} placeholder="provider, pool, or chain" />
               <input value=${e.model || ""} onInput=${(ev) => updateEntry(i, "model", ev.target.value)} placeholder="model" style=${{ flex: 1 }} />
               <select value=${String(e.enabled !== false)} onChange=${(ev) => updateEntry(i, "enabled", ev.target.value)} style=${{ width: "70px" }}><option value="true">On</option><option value="false">Off</option></select>
               <button className="btn danger" onClick=${() => removeEntry(i)} style=${{ padding: "4px 8px" }}>x</button>
@@ -314,111 +446,32 @@ function PresetEditor({ presets, onSave }) {
   </div>`;
 }
 
-// ── Auth / OAuth ──
-
-function AuthPanel({ onRefresh }) {
-  const [providers, setProviders] = useState([]);
-  const [busy, setBusy] = useState({});
-  const [polling, setPolling] = useState({});
-
-  async function loadProviders() {
-    try { const d = await api("/v1/auth/providers"); setProviders(d.providers || []); } catch {}
-  }
-  useEffect(() => { loadProviders(); }, []);
-
-  async function startLogin(providerId) {
-    setBusy((b) => ({ ...b, [providerId]: "connecting..." }));
-    try {
-      const res = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`, { method: "POST" });
-      if (res.authUrl) {
-        window.open(res.authUrl, "_blank");
-        setBusy((b) => ({ ...b, [providerId]: "waiting for browser..." }));
-        // Poll for completion
-        setPolling((p) => ({ ...p, [providerId]: true }));
-        pollLogin(providerId);
-      }
-    } catch (e) {
-      setBusy((b) => ({ ...b, [providerId]: `error: ${e.message}` }));
-      setTimeout(() => setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; }), 3000);
-    }
-  }
-
-  async function pollLogin(providerId) {
-    for (let i = 0; i < 120; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      try {
-        const s = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`);
-        if (s.status === "authenticated" || s.hasAuth) {
-          setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; });
-          setPolling((p) => { const n = { ...p }; delete n[providerId]; return n; });
-          await loadProviders();
-          if (onRefresh) onRefresh();
-          return;
-        }
-      } catch {}
-    }
-    setBusy((b) => ({ ...b, [providerId]: "timed out" }));
-    setPolling((p) => { const n = { ...p }; delete n[providerId]; return n; });
-  }
-
-  async function logout(providerId) {
-    if (!confirm(`Logout from ${providerId}?`)) return;
-    try {
-      await api(`/v1/auth/logout/${encodeURIComponent(providerId)}`, { method: "POST" });
-      await loadProviders();
-      if (onRefresh) onRefresh();
-    } catch {}
-  }
-
-  return html`<div>
-    <h2>OAuth accounts</h2>
-    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Login to providers to enable routing. OAuth tokens stored in ~/.pi/agent/auth.json</div>
-    ${providers.map((p) => html`
-      <div className="card" key=${p.id}>
-        <div className="card-row">
-          <div>
-            <span className="name">${p.name}</span>
-            <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${p.id}</span>
-            <span className=${`badge ${p.authenticated ? "on" : "off"}`}>${p.authenticated ? "logged in" : "not logged in"}</span>
-          </div>
-          <div className="actions">
-            ${busy[p.id]
-              ? html`<span style=${{ fontSize: "12px", color: "#f59e0b" }}>${busy[p.id]}</span>`
-              : html`
-                ${!p.authenticated ? html`<button className="btn primary" onClick=${() => startLogin(p.id)}>Login</button>` : null}
-                ${p.authenticated ? html`<button className="btn danger" onClick=${() => logout(p.id)}>Logout</button>` : null}
-              `}
-          </div>
-        </div>
-      </div>
-    `)}
-    ${providers.length === 0 ? html`<div className="empty">Loading providers...</div>` : null}
-  </div>`;
-}
+// ── ConfigPanel (combines all) ──
 
 function ConfigPanel({ onRefresh }) {
   const [config, setConfig] = useState(null);
   const [err, setErr] = useState("");
+  const { names, reloadNames } = useNames();
 
   async function load() { setErr(""); try { setConfig(await api("/v1/config")); } catch (e) { setErr(e.message); } }
   useEffect(() => { load(); }, []);
 
-  async function refresh() { await load(); if (onRefresh) onRefresh(); }
+  async function refresh() { await load(); reloadNames(); if (onRefresh) onRefresh(); }
 
   if (!config) return html`<div className="empty">${err || "Loading..."}</div>`;
 
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
-    <${AuthPanel} onRefresh=${refresh} />
+    <${AuthPanel} onRefresh=${refresh} reloadNames=${reloadNames} />
     <div style=${{ marginTop: "24px" }} />
     <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ~/.pi/agent/multi-pass.json</div>
     <${SubEditor} subs=${config.subscriptions || []} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
-    <${PoolEditor} pools=${config.pools || []} onSave=${refresh} />
+    <${PoolEditor} pools=${config.pools || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
-    <${ChainEditor} chains=${config.chains || []} onSave=${refresh} />
+    <${ChainEditor} chains=${config.chains || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
-    <${PresetEditor} presets=${config.presets || []} onSave=${refresh} />
+    <${PresetEditor} presets=${config.presets || []} names=${names} onSave=${refresh} />
   </div>`;
 }
 
@@ -485,12 +538,7 @@ function RulesPanel({ rules, onRefresh }) {
           <div className="actions"><button className="btn" disabled=${busy} onClick=${() => toggle(r, !r.enabled)}>${r.enabled ? "Disable" : "Enable"}</button><button className="btn danger" disabled=${busy} onClick=${() => del(r)}>Delete</button></div>
         </div>
         <div className="meta">
-          ${r.patterns?.length ? `patterns: ${r.patterns.join(", ")}` : ""}
-          ${r.allow?.length ? ` | allow: ${r.allow.join(", ")}` : ""}
-          ${r.deny?.length ? ` | deny: ${r.deny.join(", ")}` : ""}
-          ${r.maxRequests ? ` | ${r.maxRequests} req/${r.windowSeconds}s` : ""}
-          ${r.replacement ? ` | replace: ${r.replacement}` : ""}
-          ${r.message ? ` | msg: ${r.message}` : ""}
+          ${r.patterns?.length ? `patterns: ${r.patterns.join(", ")}` : ""}${r.allow?.length ? ` | allow: ${r.allow.join(", ")}` : ""}${r.deny?.length ? ` | deny: ${r.deny.join(", ")}` : ""}${r.maxRequests ? ` | ${r.maxRequests} req/${r.windowSeconds}s` : ""}${r.replacement ? ` | replace: ${r.replacement}` : ""}${r.message ? ` | msg: ${r.message}` : ""}
         </div>
       </div>
     `)}
@@ -518,12 +566,7 @@ function AuditPanel({ entries, onRefresh }) {
       <div className="table-wrap"><table>
         <thead><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Matched</th><th>Before</th><th>After</th></tr></thead>
         <tbody>${filtered.map((e, i) => html`
-          <tr key=${i}>
-            <td>${ago(e.timestamp)}</td><td style=${{ fontWeight: 600 }}>${e.rule}</td><td><span className=${`badge ${e.type}`}>${e.type}</span></td><td>${e.action}</td><td>${e.source || "--"}</td>
-            <td style=${{ color: "#ef4444", fontFamily: "monospace", fontSize: "11px" }}>${e.matched_text || "--"}</td>
-            <td>${e.full_message ? html`<details><summary>view</summary><pre>${e.full_message}</pre></details>` : "--"}</td>
-            <td>${e.redacted_message ? html`<details><summary>view</summary><pre>${e.redacted_message}</pre></details>` : "--"}</td>
-          </tr>
+          <tr key=${i}><td>${ago(e.timestamp)}</td><td style=${{ fontWeight: 600 }}>${e.rule}</td><td><span className=${`badge ${e.type}`}>${e.type}</span></td><td>${e.action}</td><td>${e.source || "--"}</td><td style=${{ color: "#ef4444", fontFamily: "monospace", fontSize: "11px" }}>${e.matched_text || "--"}</td><td>${e.full_message ? html`<details><summary>view</summary><pre>${e.full_message}</pre></details>` : "--"}</td><td>${e.redacted_message ? html`<details><summary>view</summary><pre>${e.redacted_message}</pre></details>` : "--"}</td></tr>
         `)}</tbody>
       </table></div>
     `}

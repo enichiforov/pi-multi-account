@@ -954,14 +954,64 @@ const pendingLogins = new Map(); // provider -> { resolve, reject, authUrl, stat
 
 function handleAuthProviders(req, res) {
 	const provs = authStorage.getOAuthProviders();
-	const authed = getAllProviders();
-	const result = provs.map((p) => ({
-		id: p.id,
-		name: p.name,
-		authenticated: authed.includes(p.id) && authStorage.hasAuth(p.id),
-	}));
+	const config = loadConfig();
+	const result = [];
+
+	// Built-in providers
+	for (const p of provs) {
+		result.push({
+			id: p.id,
+			name: p.name,
+			baseProvider: p.id,
+			authenticated: authStorage.hasAuth(p.id),
+			isBuiltin: true,
+		});
+	}
+
+	// Extra subscription accounts
+	for (const sub of config.subscriptions) {
+		const subId = `${sub.provider}-${sub.index || sub.name}`;
+		if (result.some((r) => r.id === subId)) continue;
+		const baseProv = provs.find((p) => p.id === sub.provider);
+		result.push({
+			id: subId,
+			name: `${baseProv?.name || sub.provider} #${sub.index || sub.name}`,
+			baseProvider: sub.provider,
+			authenticated: authStorage.hasAuth(subId),
+			isBuiltin: false,
+			subscription: sub.name,
+		});
+	}
+
 	res.writeHead(200, json());
 	res.end(JSON.stringify({ providers: result }));
+}
+
+/** Returns all known provider/subscription names for use in dropdowns. */
+function handleKnownNames(req, res) {
+	const config = loadConfig();
+	const provs = authStorage.getOAuthProviders();
+
+	// All provider IDs that exist (authenticated or not)
+	const allNames = [];
+	for (const p of provs) {
+		allNames.push({ id: p.id, label: p.name, type: "provider", authenticated: authStorage.hasAuth(p.id) });
+	}
+	for (const sub of config.subscriptions) {
+		const subId = `${sub.provider}-${sub.index || sub.name}`;
+		if (allNames.some((n) => n.id === subId)) continue;
+		const baseProv = provs.find((p) => p.id === sub.provider);
+		allNames.push({ id: subId, label: `${baseProv?.name || sub.provider} #${sub.index || sub.name}`, type: "subscription", authenticated: authStorage.hasAuth(subId) });
+	}
+
+	// Pool names
+	const poolNames = config.pools.filter((p) => p.enabled).map((p) => ({ id: `pool:${p.name}`, label: p.name, type: "pool" }));
+
+	// Chain names
+	const chainNames = config.chains.filter((c) => c.enabled).map((c) => ({ id: `chain:${c.name}`, label: c.name, type: "chain" }));
+
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ providers: allNames, pools: poolNames, chains: chainNames }));
 }
 
 function handleAuthStatus(req, res) {
@@ -2069,6 +2119,7 @@ const server = createServer(async (req, res) => {
 		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
 		else if (path === "/v1/auth/providers" && req.method === "GET") handleAuthProviders(req, res);
 		else if (path === "/v1/auth/status" && req.method === "GET") handleAuthStatus(req, res);
+		else if (path === "/v1/auth/names" && req.method === "GET") handleKnownNames(req, res);
 		else if (path.startsWith("/v1/auth/login/") && req.method === "POST") await handleAuthLogin(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
 		else if (path.startsWith("/v1/auth/login/") && req.method === "GET") handleAuthLoginStatus(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
 		else if (path.startsWith("/v1/auth/logout/") && req.method === "POST") await handleAuthLogout(req, res, decodeURIComponent(path.split("/v1/auth/logout/")[1]));
