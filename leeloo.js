@@ -1012,6 +1012,17 @@ function handleRouting(req, res) {
 	res.end(JSON.stringify({ groups }));
 }
 
+/** Returns live quota scores for all providers that support it. */
+async function handleQuota(req, res) {
+	const providers = getAllProviders();
+	const results = await Promise.all(providers.map(async (prov) => {
+		const score = await checkQuota(prov);
+		return { provider: prov, quota: score, exhausted: isExhausted(prov) };
+	}));
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ providers: results }));
+}
+
 function handleHealth(req, res) {
 	const config = loadConfig();
 	const providers = getAllProviders();
@@ -1079,14 +1090,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 #status-text{font-size:11px;color:#555}
 
 /* ── Info strip ── */
-#info-strip{display:none;padding:6px 20px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;font-size:11px;color:#555;overflow-x:auto;white-space:nowrap}
-#info-strip .tag{display:inline-block;padding:2px 8px;margin-right:6px;border-radius:4px;border:1px solid #222;background:#111}
-#info-strip .tag b{color:#888;font-weight:600}
-#info-strip .tag .val{color:#aaa}
+#info-strip{padding:5px 20px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;font-size:11px;color:#555;overflow-x:auto;white-space:nowrap;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+#info-strip .section{display:flex;gap:4px;align-items:center;margin-right:8px}
+#info-strip .section-label{color:#444;font-weight:700;text-transform:uppercase;font-size:9px;letter-spacing:.5px;margin-right:2px}
+#info-strip .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;border:1px solid #222;background:#111}
+#info-strip .tag b{color:#999;font-weight:600}
+#info-strip .tag .val{color:#777}
+#info-strip .tag .bar{display:inline-block;width:40px;height:6px;background:#222;border-radius:3px;overflow:hidden;vertical-align:middle}
+#info-strip .tag .bar-fill{height:100%;border-radius:3px;transition:width .3s}
 #info-strip .tag.pool{border-color:#2a2a3a}
 #info-strip .tag.preset{border-color:#3a2a1a}
 #info-strip .tag.provider{border-color:#1a2a1a}
-#info-strip .tag.exhausted{border-color:#4a1a1a;color:#a66}
+#info-strip .tag.exhausted{border-color:#4a1a1a;opacity:.5}
+#info-strip .sep{color:#222;margin:0 2px}
 
 /* ── Chat ── */
 #chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
@@ -1140,7 +1156,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <select id="model-select"><option>Loading...</option></select>
     <div class="bar-actions">
       <button class="bar-btn" onclick="clearChat()">Clear</button>
-      <button class="bar-btn" onclick="toggleInfo()">Config</button>
       <span class="dot" id="dot"></span>
       <span id="status-text">loading...</span>
     </div>
@@ -1173,7 +1188,6 @@ const dotEl = document.getElementById("dot");
 const infoStrip = document.getElementById("info-strip");
 let messages = [];
 let streaming = false;
-let infoVisible = false;
 
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
@@ -1183,29 +1197,59 @@ function setStatus(state, text) {
   dotEl.className = "dot " + (state === "ready" ? "ok" : state === "busy" ? "busy" : "");
 }
 
-// ── Load config info ──
-async function loadInfo() {
-  try {
-    const h = await (await fetch(BASE + "/health")).json();
-    const tags = [];
-    for (const p of (h.pools || [])) {
-      tags.push('<span class="tag pool"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.strategy) + ' (' + p.members.length + ')</span></span>');
-    }
-    for (const p of (h.presets || [])) {
-      tags.push('<span class="tag preset"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.entries.join(" > ")) + '</span></span>');
-    }
-    for (const p of (h.providers || [])) {
-      const exh = (h.exhausted || []).includes(p);
-      tags.push('<span class="tag provider' + (exh ? " exhausted" : "") + '"><b>' + esc(p) + '</b>' + (exh ? ' <span class="val">exhausted</span>' : ' <span class="val">ok</span>') + '</span>');
-    }
-    infoStrip.innerHTML = tags.join("");
-  } catch {}
+// ── Load config + quota info strip ──
+function quotaColor(pct) {
+  if (pct === null || pct === undefined) return "#555";
+  if (pct > 50) return "#4a4";
+  if (pct > 20) return "#ca0";
+  return "#e44";
+}
+function quotaBar(pct) {
+  if (pct === null || pct === undefined) return '<span class="val">--</span>';
+  return '<span class="bar"><span class="bar-fill" style="width:' + pct + '%;background:' + quotaColor(pct) + '"></span></span> <span class="val">' + pct + '%</span>';
 }
 
-function toggleInfo() {
-  infoVisible = !infoVisible;
-  infoStrip.style.display = infoVisible ? "block" : "none";
-  if (infoVisible) loadInfo();
+async function loadInfo() {
+  try {
+    const [h, q] = await Promise.all([
+      fetch(BASE + "/health").then(r => r.json()),
+      fetch(BASE + "/v1/quota").then(r => r.json()).catch(() => ({ providers: [] })),
+    ]);
+    const quotaMap = {};
+    for (const p of (q.providers || [])) quotaMap[p.provider] = p;
+
+    let html = "";
+
+    // Pools
+    if (h.pools?.length) {
+      html += '<span class="section"><span class="section-label">pools</span>';
+      for (const p of h.pools) {
+        html += '<span class="tag pool"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.strategy) + '</span></span>';
+      }
+      html += '</span><span class="sep">|</span>';
+    }
+
+    // Presets
+    if (h.presets?.length) {
+      html += '<span class="section"><span class="section-label">presets</span>';
+      for (const p of h.presets) {
+        html += '<span class="tag preset" title="' + esc(p.entries.join(" > ")) + '"><b>' + esc(p.name) + '</b></span>';
+      }
+      html += '</span><span class="sep">|</span>';
+    }
+
+    // Providers with quota bars
+    html += '<span class="section"><span class="section-label">providers</span>';
+    for (const prov of (h.providers || [])) {
+      const qi = quotaMap[prov] || {};
+      const exh = (h.exhausted || []).includes(prov) || qi.exhausted;
+      const cls = "tag provider" + (exh ? " exhausted" : "");
+      html += '<span class="' + cls + '"><b>' + esc(prov) + '</b> ' + quotaBar(qi.quota) + '</span>';
+    }
+    html += '</span>';
+
+    infoStrip.innerHTML = html;
+  } catch {}
 }
 
 // ── Load routing ──
@@ -1360,10 +1404,11 @@ async function sendMessage() {
   streaming = false; sendBtn.disabled = false; input.disabled = false;
   input.focus();
   setStatus("ready", "done");
-  if (infoVisible) loadInfo(); // refresh exhausted state
+  loadInfo(); // refresh quota + exhausted state
 }
 
 loadRouting();
+loadInfo();
 </script>
 </body></html>`;
 
@@ -1381,6 +1426,7 @@ const server = createServer(async (req, res) => {
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
 		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
+		else if (path === "/v1/quota" && req.method === "GET") await handleQuota(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
 		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
