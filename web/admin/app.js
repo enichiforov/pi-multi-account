@@ -7,9 +7,14 @@ const html = htm.bind(React.createElement);
 const BASE = location.origin;
 const STRATEGIES = ["round-robin", "quota-first", "scheduled", "custom"];
 const BASE_PROVIDERS = ["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
+const TOKEN_KEY = "leeloo.token";
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ""; }
 
 async function api(path, init) {
-  const r = await fetch(`${BASE}${path}`, init);
+  const headers = { ...(init?.headers || {}), Authorization: `Bearer ${getToken()}` };
+  const r = await fetch(`${BASE}${path}`, { ...init, headers });
+  if (r.status === 401) { localStorage.removeItem(TOKEN_KEY); location.reload(); throw new Error("Session expired"); }
   if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e?.error?.message || `HTTP ${r.status}`); }
   return r.json();
 }
@@ -142,10 +147,19 @@ function DashboardPanel({ data }) {
         return html`<tr key=${p.provider}><td style=${{ color: "#fafafa", fontWeight: 500 }}>${p.label || p.provider}</td><td><${QuotaBar} score=${p.score} /> <span style=${{ color: qColor(p.score) }}>${p.score == null ? "?" : `${p.score}%`}</span></td><td>${statusBadge}</td><td>${ps.requests || 0}</td><td>${ps.tokens_in || 0} / ${ps.tokens_out || 0}</td><td>${ago(ps.last_used)}</td></tr>`;
       })}</tbody>
     </table></div>
+    ${(data?.stats?.users || []).length > 0 ? html`
+      <h2 className="mt">Per-user usage</h2>
+      <div className="table-wrap"><table>
+        <thead><tr><th>User</th><th>Requests</th><th>Tokens in</th><th>Tokens out</th><th>Errors</th><th>Last used</th></tr></thead>
+        <tbody>${(data.stats.users || []).map((u) => html`
+          <tr key=${u.username}><td style=${{ fontWeight: 500, color: "#fafafa" }}>${u.username}</td><td>${u.requests}</td><td>${u.tokens_in}</td><td>${u.tokens_out}</td><td>${u.errors}</td><td>${ago(u.last_used)}</td></tr>
+        `)}</tbody>
+      </table></div>
+    ` : null}
     <h2 className="mt">Recent chats</h2>
     <div className="table-wrap"><table>
-      <thead><tr><th>Time</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th><th>Request</th><th>Response</th></tr></thead>
-      <tbody>${recent.length === 0 ? html`<tr><td colSpan="8" className="empty">No requests yet.</td></tr>` : recent.slice(0, 50).map((r, i) => html`<tr key=${i}><td>${ago(r.timestamp)}</td><td>${r.provider}</td><td style=${{ fontFamily: "monospace", fontSize: "11px" }}>${r.model}</td><td>${r.tokens_in} / ${r.tokens_out}</td><td>${r.duration_ms}ms</td><td>${r.error ? html`<span style=${{ color: "#ef4444" }}>${r.error}</span>` : "--"}</td><td>${r.request_text ? html`<details><summary>${r.request_text.slice(0, 40)}...</summary><pre>${r.request_text}</pre></details>` : "--"}</td><td>${r.response_text ? html`<details><summary>${r.response_text.slice(0, 40)}...</summary><pre>${r.response_text}</pre></details>` : "--"}</td></tr>`)}</tbody>
+      <thead><tr><th>Time</th><th>User</th><th>Provider</th><th>Model</th><th>Tokens</th><th>Duration</th><th>Error</th><th>Request</th><th>Response</th></tr></thead>
+      <tbody>${recent.length === 0 ? html`<tr><td colSpan="9" className="empty">No requests yet.</td></tr>` : recent.slice(0, 50).map((r, i) => html`<tr key=${i}><td>${ago(r.timestamp)}</td><td>${r.user || "--"}</td><td>${r.provider}</td><td style=${{ fontFamily: "monospace", fontSize: "11px" }}>${r.model}</td><td>${r.tokens_in} / ${r.tokens_out}</td><td>${r.duration_ms}ms</td><td>${r.error ? html`<span style=${{ color: "#ef4444" }}>${r.error}</span>` : "--"}</td><td>${r.request_text ? html`<details><summary>${r.request_text.slice(0, 40)}...</summary><pre>${r.request_text}</pre></details>` : "--"}</td><td>${r.response_text ? html`<details><summary>${r.response_text.slice(0, 40)}...</summary><pre>${r.response_text}</pre></details>` : "--"}</td></tr>`)}</tbody>
     </table></div>
   </div>`;
 }
@@ -712,7 +726,101 @@ function AuditPanel({ entries, onRefresh }) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// APP
+// ════════════════════════════════════════════════════════════════════════════════
+// USERS
+// ════════════════════════════════════════════════════════════════════════════════
+
+function UsersPanel() {
+  const [users, setUsers] = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [revealedKeys, setRevealedKeys] = useState({});
+  const { names } = useNames();
+
+  // Form state
+  const [draftName, setDraftName] = useState("");
+  const [draftPresets, setDraftPresets] = useState([]);
+  const [draftPools, setDraftPools] = useState([]);
+
+  async function load() { try { setUsers((await api("/v1/users")).users || []); } catch {} }
+  useEffect(() => { load(); }, []);
+
+  async function create() {
+    setBusy(true);
+    try {
+      const res = await api("/v1/users", jpost({
+        username: draftName || `user-${Date.now()}`,
+        allowedPresets: draftPresets,
+        allowedPools: draftPools,
+      }));
+      setRevealedKeys((k) => ({ ...k, [res.user.username]: res.user.key }));
+      setShowForm(false); setDraftName(""); setDraftPresets([]); setDraftPools([]);
+      await load();
+    } finally { setBusy(false); }
+  }
+
+  async function toggleUser(u, enabled) { setBusy(true); try { await api(`/v1/users/${encodeURIComponent(u.username)}`, jput({ enabled })); await load(); } finally { setBusy(false); } }
+  async function del(u) { if (!confirm(`Delete user "${u.username}"?`)) return; setBusy(true); try { await api(`/v1/users/${encodeURIComponent(u.username)}`, { method: "DELETE" }); await load(); } finally { setBusy(false); } }
+  async function revealKey(username) {
+    try {
+      const d = await api(`/v1/users/${encodeURIComponent(username)}/key`);
+      setRevealedKeys((k) => ({ ...k, [username]: d.key }));
+    } catch {}
+  }
+
+  function copyKey(key) { navigator.clipboard.writeText(key); }
+
+  const presetNames = (names?.providers || []).concat(names?.pools || []).concat(names?.chains || []);
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "12px" }}>
+      <h2 style=${{ margin: 0 }}>Users</h2>
+      <div className="actions"><button className="btn" onClick=${load}>Refresh</button><button className="btn primary" onClick=${() => setShowForm((v) => !v)}>${showForm ? "Close" : "+ Add user"}</button></div>
+    </div>
+    <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Stored in: ~/.pi/agent/multi-pass-users.json. Each user gets an API key for /ui and /v1 access.</div>
+
+    ${showForm ? html`
+      <div className="card" style=${{ marginBottom: "12px" }}>
+        <div className="form-grid">
+          <div><label>Username</label><input value=${draftName} onInput=${(e) => setDraftName(e.target.value)} placeholder="e.g. alice" /></div>
+          <div><label>Allowed presets (empty = all)</label><input value=${draftPresets.join(", ")} onInput=${(e) => setDraftPresets(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="coding-premium, fastest" /></div>
+          <div><label>Allowed pools (empty = all)</label><input value=${draftPools.join(", ")} onInput=${(e) => setDraftPools(e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="codex-pool" /></div>
+        </div>
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${create} disabled=${busy}>Create</button><button className="btn" onClick=${() => setShowForm(false)}>Cancel</button></div>
+      </div>
+    ` : null}
+
+    ${users.length === 0 ? html`<div className="empty">No users. Admin token has full access. Create users to share access with restricted permissions.</div>` : null}
+
+    ${users.map((u) => {
+      const key = revealedKeys[u.username];
+      return html`
+        <div className="card" key=${u.username}>
+          <div className="card-row">
+            <div>
+              <span className="name">${u.username}</span>
+              <span className=${`badge ${u.enabled !== false ? "on" : "off"}`}>${u.enabled !== false ? "active" : "disabled"}</span>
+              ${u.allowedPresets?.length ? html`<span className="badge neutral">presets: ${u.allowedPresets.join(", ")}</span>` : null}
+              ${u.allowedPools?.length ? html`<span className="badge neutral">pools: ${u.allowedPools.join(", ")}</span>` : null}
+              ${!u.allowedPresets?.length && !u.allowedPools?.length ? html`<span className="badge neutral">all access</span>` : null}
+            </div>
+            <div className="actions">
+              ${key
+                ? html`<span style=${{ fontFamily: "monospace", fontSize: "11px", color: "#f59e0b", cursor: "pointer", padding: "4px 8px", border: "1px solid #3f3f46", borderRadius: "6px" }} onClick=${() => copyKey(key)} title="Click to copy">${key.slice(0, 12)}... (click to copy)</span>`
+                : html`<button className="btn" onClick=${() => revealKey(u.username)}>Show key</button>`
+              }
+              <button className="btn" disabled=${busy} onClick=${() => toggleUser(u, !(u.enabled !== false))}>${u.enabled !== false ? "Disable" : "Enable"}</button>
+              <button className="btn danger" disabled=${busy} onClick=${() => del(u)}>Delete</button>
+            </div>
+          </div>
+        </div>
+      `;
+    })}
+  </div>`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// APP + LOGIN
 // ════════════════════════════════════════════════════════════════════════════════
 
 function App() {
@@ -741,16 +849,25 @@ function App() {
     } catch (e) { if (!silent) setError(e.message); }
   }
 
-  const tabs = ["dashboard", "config", "rules", "audit"];
+  function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
+
+  const tabs = ["dashboard", "config", "users", "rules", "audit"];
 
   return html`
     <div className="app">
-      <div className="header"><div className="logo">Leeloo Admin</div><a className="nav-link" href="/ui">Chat UI</a><a className="nav-link" href="/health">Health</a></div>
+      <div className="header">
+        <div className="logo">Leeloo Admin</div>
+        <a className="nav-link" href="/ui">Chat UI</a>
+        <a className="nav-link" href="/health">Health</a>
+        <div style=${{ flex: 1 }} />
+        <button className="btn" onClick=${logout} style=${{ fontSize: "11px" }}>Logout</button>
+      </div>
       <div className="tabs">${tabs.map((t) => html`<button key=${t} className=${`tab ${tab === t ? "active" : ""}`} onClick=${() => setTab(t)}>${t}</button>`)}</div>
       <div className="panel"><div className="panel-inner">
         ${error ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${error}</div>` : null}
         ${tab === "dashboard" ? html`<${DashboardPanel} data=${dash} />` : null}
         ${tab === "config" ? html`<${ConfigPanel} onRefresh=${() => load("dashboard", true)} />` : null}
+        ${tab === "users" ? html`<${UsersPanel} />` : null}
         ${tab === "rules" ? html`<${RulesPanel} rules=${rules} onRefresh=${() => load("rules")} />` : null}
         ${tab === "audit" ? html`<${AuditPanel} entries=${audit} onRefresh=${() => load("audit")} />` : null}
       </div></div>
@@ -758,4 +875,54 @@ function App() {
   `;
 }
 
-createRoot(document.getElementById("app")).render(html`<${App} />`);
+function LoginScreen({ onLogin }) {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!token.trim()) return;
+    setBusy(true); setError("");
+    try {
+      const r = await fetch(`${BASE}/v1/auth/verify`, { method: "POST", headers: { Authorization: `Bearer ${token.trim()}` } });
+      const d = await r.json();
+      if (d.valid && d.role === "admin") { localStorage.setItem(TOKEN_KEY, token.trim()); onLogin(); }
+      else if (d.valid) setError("Admin token required for admin panel");
+      else setError("Invalid token");
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  }
+
+  return html`
+    <div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b" }}>
+      <div style=${{ width: "340px", padding: "32px", background: "#18181b", border: "1px solid #27272a", borderRadius: "16px" }}>
+        <h2 style=${{ color: "#f59e0b", fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>Leeloo Admin</h2>
+        <p style=${{ color: "#52525b", fontSize: "13px", marginBottom: "20px" }}>Enter the admin token to continue.</p>
+        <input type="password" value=${token} onInput=${(e) => setToken(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") submit(); }} placeholder="Admin token..." style=${{ width: "100%", marginBottom: "10px" }} autoFocus />
+        ${error ? html`<div style=${{ color: "#ef4444", fontSize: "12px", marginBottom: "8px" }}>${error}</div>` : null}
+        <button className="btn primary" onClick=${submit} disabled=${busy} style=${{ width: "100%" }}>${busy ? "Verifying..." : "Login"}</button>
+      </div>
+    </div>
+  `;
+}
+
+function AuthGate() {
+  const [authed, setAuthed] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    const t = getToken();
+    if (!t) { setChecking(false); return; }
+    fetch(`${BASE}/v1/auth/verify`, { method: "POST", headers: { Authorization: `Bearer ${t}` } })
+      .then((r) => r.json())
+      .then((d) => { if (d.valid && d.role === "admin") setAuthed(true); })
+      .catch(() => {})
+      .finally(() => setChecking(false));
+  }, []);
+
+  if (checking) return html`<div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b", color: "#52525b" }}>Loading...</div>`;
+  if (!authed) return html`<${LoginScreen} onLogin=${() => setAuthed(true)} />`;
+  return html`<${App} />`;
+}
+
+createRoot(document.getElementById("app")).render(html`<${AuthGate} />`);

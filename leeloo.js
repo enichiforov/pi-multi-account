@@ -35,6 +35,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, cre
 import { join, extname, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { randomBytes } from "node:crypto";
 import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel, getModels, stream } from "@mariozechner/pi-ai";
 
@@ -46,6 +47,10 @@ for (let i = 0; i < args.length; i++) {
 	if (args[i] === "--port" && args[i + 1]) PORT = parseInt(args[i + 1], 10);
 }
 
+// ─── Admin token ──────────────────────────────────────────────────────────────
+
+const ADMIN_TOKEN = process.env.LEELOO_KEY || randomBytes(24).toString("hex");
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const AGENT_DIR = getAgentDir();
@@ -53,8 +58,11 @@ const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(ROOT_DIR, "web");
 const CONFIG_PATH = join(AGENT_DIR, "multi-pass.json");
 const RULES_PATH = join(AGENT_DIR, "multi-pass-rules.json");
+const USERS_PATH = join(AGENT_DIR, "multi-pass-users.json");
 const AUDIT_PATH = join(AGENT_DIR, "leeloo-audit.jsonl");
-const AUDIT_MAX_LINES = 5000; // max lines in JSONL file before rotation
+const USAGE_LOG_PATH = join(AGENT_DIR, "leeloo-usage.jsonl");
+const AUDIT_MAX_LINES = 5000;
+const USAGE_LOG_MAX_LINES = 10000;
 
 function ensureDir() {
 	if (!existsSync(AGENT_DIR)) mkdirSync(AGENT_DIR, { recursive: true });
@@ -111,6 +119,96 @@ function loadRules() {
 function saveRules(rules) {
 	ensureDir();
 	writeFileSync(RULES_PATH, JSON.stringify({ rules }, null, 2), "utf-8");
+}
+
+// ─── User management ────────────────────────────────────────────────────────
+// Users file: { users: [{ username, key, allowedPresets?, allowedPools?, enabled }] }
+
+function loadUsers() {
+	if (!existsSync(USERS_PATH)) return [];
+	try {
+		const raw = JSON.parse(readFileSync(USERS_PATH, "utf-8"));
+		return Array.isArray(raw.users) ? raw.users : [];
+	} catch { return []; }
+}
+
+function saveUsers(users) {
+	ensureDir();
+	writeFileSync(USERS_PATH, JSON.stringify({ users }, null, 2), "utf-8");
+}
+
+/**
+ * Authenticate a request. Returns { valid, role, user } where:
+ *  - role "admin" for admin token
+ *  - role "user" for user token with user object
+ *  - valid=false if token missing/invalid
+ */
+function authenticateRequest(req) {
+	const authHeader = req.headers.authorization;
+	const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+	if (!token) return { valid: false, role: null, user: null };
+
+	// Admin token
+	if (token === ADMIN_TOKEN) return { valid: true, role: "admin", user: { username: "admin" } };
+
+	// User token
+	const users = loadUsers();
+	const user = users.find((u) => u.key === token && u.enabled !== false);
+	if (user) return { valid: true, role: "user", user };
+
+	return { valid: false, role: null, user: null };
+}
+
+/**
+ * Check if a user is allowed to use a specific model/preset/pool.
+ * Admin can do everything. Users with no restrictions can do everything.
+ * Users with allowedPresets/allowedPools are limited to those.
+ */
+function isModelAllowedForUser(user, role, modelId) {
+	if (role === "admin") return true;
+	if (!user) return false;
+
+	const hasRestrictions = (user.allowedPresets?.length > 0) || (user.allowedPools?.length > 0);
+	if (!hasRestrictions) return true;
+
+	const allowed = [...(user.allowedPresets || []), ...(user.allowedPools || []).map((p) => `pool:${p}`)];
+	// Check exact match or prefix match for pool:name/model
+	return allowed.some((a) => modelId === a || modelId.startsWith(a + "/"));
+}
+
+// ─── Persistent usage log (JSONL, per-user) ─────────────────────────────────
+
+function appendUsageLine(entry) {
+	try {
+		ensureDir();
+		appendFileSync(USAGE_LOG_PATH, JSON.stringify(entry) + "\n", "utf-8");
+	} catch {}
+}
+
+function rotateUsageLog() {
+	if (!existsSync(USAGE_LOG_PATH)) return;
+	try {
+		const content = readFileSync(USAGE_LOG_PATH, "utf-8");
+		const lines = content.split("\n").filter(Boolean);
+		if (lines.length <= USAGE_LOG_MAX_LINES) return;
+		const keep = lines.slice(-Math.floor(USAGE_LOG_MAX_LINES * 0.8));
+		writeFileSync(USAGE_LOG_PATH, keep.join("\n") + "\n", "utf-8");
+		log(`[usage] rotated: ${lines.length} -> ${keep.length} lines`);
+	} catch {}
+}
+
+async function loadUsageFromDisk(maxLines = 500) {
+	if (!existsSync(USAGE_LOG_PATH)) return [];
+	const entries = [];
+	try {
+		const rl = createInterface({ input: createReadStream(USAGE_LOG_PATH, "utf-8"), crlfDelay: Infinity });
+		for await (const line of rl) {
+			if (!line.trim()) continue;
+			try { entries.push(JSON.parse(line)); } catch {}
+		}
+	} catch {}
+	return entries.slice(-maxLines);
 }
 
 // ─── Persistent audit log (JSONL) ───────────────────────────────────────────
@@ -508,7 +606,9 @@ function clipText(value, maxLen = 4000) {
 	return text.slice(0, maxLen) + "\n...[truncated]";
 }
 
-function trackRequest(provider, modelId, usage, durationMs, error, requestText, responseText) {
+const userStats = {}; // { username: { requests, tokens_in, tokens_out, errors, last_used } }
+
+function trackRequest(provider, modelId, usage, durationMs, error, requestText, responseText, username) {
 	const entry = {
 		timestamp: new Date().toISOString(),
 		provider,
@@ -519,9 +619,11 @@ function trackRequest(provider, modelId, usage, durationMs, error, requestText, 
 		error: error || null,
 		request_text: clipText(requestText),
 		response_text: clipText(responseText),
+		user: username || null,
 	};
 	usageLog.push(entry);
 	if (usageLog.length > USAGE_LOG_MAX) usageLog.shift();
+	appendUsageLine(entry);
 
 	if (!providerStats[provider]) {
 		providerStats[provider] = { requests: 0, tokens_in: 0, tokens_out: 0, errors: 0, last_used: null };
@@ -532,6 +634,18 @@ function trackRequest(provider, modelId, usage, durationMs, error, requestText, 
 	s.tokens_out += entry.tokens_out;
 	if (error) s.errors++;
 	s.last_used = entry.timestamp;
+
+	if (username) {
+		if (!userStats[username]) {
+			userStats[username] = { requests: 0, tokens_in: 0, tokens_out: 0, errors: 0, last_used: null };
+		}
+		const u = userStats[username];
+		u.requests++;
+		u.tokens_in += entry.tokens_in;
+		u.tokens_out += entry.tokens_out;
+		if (error) u.errors++;
+		u.last_used = entry.timestamp;
+	}
 }
 
 // ─── Rule engine (DLP / policy enforcement) ─────────────────────────────────
@@ -1212,6 +1326,60 @@ async function handleAuthLogout(req, res, providerId) {
 	}
 }
 
+// ─── User CRUD API ────────────────────────────────────────────────────────────
+
+function handleUsersList(req, res) {
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ users: loadUsers().map((u) => ({ ...u, key: u.key?.slice(0, 8) + "..." })) }));
+}
+
+async function handleUserCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const users = loadUsers();
+	const user = {
+		username: body.username || `user-${Date.now()}`,
+		key: body.key || randomBytes(24).toString("hex"),
+		enabled: body.enabled !== false,
+		allowedPresets: body.allowedPresets || [],
+		allowedPools: body.allowedPools || [],
+	};
+	if (users.some((u) => u.username === user.username)) {
+		res.writeHead(409, json());
+		res.end(JSON.stringify({ error: { message: `User "${user.username}" already exists` } }));
+		return;
+	}
+	users.push(user);
+	saveUsers(users);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ user })); // Return full key on create
+}
+
+async function handleUserUpdate(req, res, username) {
+	const body = JSON.parse(await readBody(req));
+	const users = loadUsers();
+	const idx = users.findIndex((u) => u.username === username);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "User not found" } })); return; }
+	users[idx] = { ...users[idx], ...body };
+	saveUsers(users);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ user: { ...users[idx], key: users[idx].key?.slice(0, 8) + "..." } }));
+}
+
+function handleUserDelete(req, res, username) {
+	const users = loadUsers().filter((u) => u.username !== username);
+	saveUsers(users);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: username }));
+}
+
+function handleUserRevealKey(req, res, username) {
+	const users = loadUsers();
+	const user = users.find((u) => u.username === username);
+	if (!user) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "User not found" } })); return; }
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ username: user.username, key: user.key }));
+}
+
 function handleAuditLog(req, res) {
 	const url = new URL(req.url, `http://localhost:${PORT}`);
 	const limit = parseInt(url.searchParams.get("limit") || "100", 10);
@@ -1659,7 +1827,7 @@ function formatUsage(u) {
 
 // ─── Streaming handler ────────────────────────────────────────────────────────
 
-async function handleStreaming(res, model, context, opts, requestModelId, actualProvider, requestText) {
+async function handleStreaming(res, model, context, opts, requestModelId, actualProvider, requestText, username) {
 	const t0 = Date.now();
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
@@ -1755,7 +1923,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 			case "done": {
 				const finish = toolCalls.size > 0 ? "tool_calls" : mapFinishReason(event.reason);
 				const usage = formatUsage(event.message?.usage);
-				trackRequest(actualProvider, model.id, event.message?.usage, Date.now() - t0, null, requestText, collectedResponseText);
+				trackRequest(actualProvider, model.id, event.message?.usage, Date.now() - t0, null, requestText, collectedResponseText, username);
 				const finalChunk = chunk(id, requestModelId, {}, finish, usage);
 				finalChunk.x_provider = actualProvider;
 				finalChunk.x_model = model.id;
@@ -1767,7 +1935,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
-				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, collectedResponseText);
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, collectedResponseText, username);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
 				if (!sentRole) {
 					write(chunk(id, requestModelId, { role: "assistant", content: `[Error: ${errMsg}]` }, null));
@@ -1786,7 +1954,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 
 // ─── Non-streaming handler ────────────────────────────────────────────────────
 
-async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider, requestText) {
+async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider, requestText, username) {
 	const t0 = Date.now();
 	const eventStream = stream(model, context, opts);
 	let fullText = "";
@@ -1815,7 +1983,7 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 				break;
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
-				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, fullText);
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg, requestText, fullText, username);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
 				throw new Error(errMsg);
 			}
@@ -1827,7 +1995,7 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 	if (respRules.length > 0 && fullText) {
 		const respBlock = checkResponseBlock(respRules, fullText);
 		if (respBlock.blocked) {
-			trackRequest(actualProvider, model.id, usage, Date.now() - t0, respBlock.message, requestText, fullText);
+			trackRequest(actualProvider, model.id, usage, Date.now() - t0, respBlock.message, requestText, fullText, username);
 			res.writeHead(403, json());
 			res.end(JSON.stringify({ error: { message: respBlock.message } }));
 			return;
@@ -1835,7 +2003,7 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 		fullText = redactResponse(respRules, fullText);
 	}
 
-	trackRequest(actualProvider, model.id, usage, Date.now() - t0, null, requestText, fullText);
+	trackRequest(actualProvider, model.id, usage, Date.now() - t0, null, requestText, fullText, username);
 
 	const message = { role: "assistant" };
 	if (toolCalls.length > 0) {
@@ -1859,6 +2027,15 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 // ─── Main request handler ─────────────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
+	// Auth
+	const auth = authenticateRequest(req);
+	if (!auth.valid) {
+		res.writeHead(401, json());
+		res.end(JSON.stringify({ error: { message: "Unauthorized. Provide Bearer token in Authorization header." } }));
+		return;
+	}
+	const username = auth.user?.username || null;
+
 	const body = await readBody(req);
 	let parsed;
 	try { parsed = JSON.parse(body); }
@@ -1886,6 +2063,13 @@ async function handleChatCompletions(req, res) {
 	if (!requestModelId || !requestMessages) {
 		res.writeHead(400, json());
 		res.end(JSON.stringify({ error: { message: "model and messages are required" } }));
+		return;
+	}
+
+	// ── User access check ──
+	if (!isModelAllowedForUser(auth.user, auth.role, requestModelId)) {
+		res.writeHead(403, json());
+		res.end(JSON.stringify({ error: { message: `Model "${requestModelId}" is not allowed for user "${username}". Allowed: ${[...(auth.user.allowedPresets || []), ...(auth.user.allowedPools || []).map((p) => "pool:" + p)].join(", ") || "none"}` } }));
 		return;
 	}
 
@@ -1950,9 +2134,9 @@ async function handleChatCompletions(req, res) {
 			log(`[${candidate.provider}] ${candidate.modelId} (attempt ${attempt + 1}/${maxAttempts})`);
 
 			if (doStream) {
-				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText);
+				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText, username);
 			} else {
-				await handleNonStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText);
+				await handleNonStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText, username);
 			}
 			return;
 
@@ -2148,6 +2332,7 @@ function handleStats(req, res) {
 			label: getProviderLabel(prov),
 			...s,
 		})),
+		users: Object.entries(userStats).map(([user, s]) => ({ username: user, ...s })),
 		recent: usageLog.slice(-limit).reverse(),
 	}));
 }
@@ -2209,41 +2394,73 @@ const server = createServer(async (req, res) => {
 
 	const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
 	try {
+		// ── Public routes (no auth) ──
+		if (path === "/health" && req.method === "GET") { handleHealth(req, res); return; }
+		if (path.startsWith("/web/") && req.method === "GET") { handleWebAsset(req, res, path); return; }
+		if (path === "/admin" || path === "/ui" || path === "/") { (path === "/admin" ? handleAdmin : handleUI)(req, res); return; }
+
+		// ── Token verify endpoint (for login screens) ──
+		if (path === "/v1/auth/verify" && req.method === "POST") {
+			const auth = authenticateRequest(req);
+			if (!auth.valid) { res.writeHead(401, json()); res.end(JSON.stringify({ valid: false })); }
+			else { res.writeHead(200, json()); res.end(JSON.stringify({ valid: true, role: auth.role, username: auth.user?.username, allowedPresets: auth.user?.allowedPresets, allowedPools: auth.user?.allowedPools })); }
+			return;
+		}
+
+		// ── Auth required for all /v1/* endpoints ──
+		const auth = authenticateRequest(req);
+		if (!auth.valid) {
+			res.writeHead(401, json());
+			res.end(JSON.stringify({ error: { message: "Unauthorized. Provide Bearer token in Authorization header." } }));
+			return;
+		}
+
+		// ── Admin-only routes ──
+		const isAdmin = auth.role === "admin";
+		const adminOnly = () => {
+			if (!isAdmin) { res.writeHead(403, json()); res.end(JSON.stringify({ error: { message: "Admin access required" } })); return true; }
+			return false;
+		};
+
+		// ── API routes ──
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
 		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
-		else if (path === "/v1/quota" && req.method === "GET") await handleQuota(req, res);
-		else if (path === "/v1/stats" && req.method === "GET") handleStats(req, res);
-		else if (path === "/v1/rules" && req.method === "GET") handleRulesList(req, res);
-		else if (path === "/v1/rules" && req.method === "POST") await handleRulesCreate(req, res);
-		else if (path.startsWith("/v1/rules/") && req.method === "PUT") await handleRulesUpdate(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
-		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
-		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
-		else if (path === "/v1/auth/providers" && req.method === "GET") handleAuthProviders(req, res);
-		else if (path === "/v1/auth/status" && req.method === "GET") handleAuthStatus(req, res);
-		else if (path === "/v1/auth/names" && req.method === "GET") handleKnownNames(req, res);
-		else if (path.startsWith("/v1/auth/login/") && req.method === "POST") await handleAuthLogin(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
-		else if (path.startsWith("/v1/auth/login/") && req.method === "GET") handleAuthLoginStatus(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
-		else if (path.startsWith("/v1/auth/logout/") && req.method === "POST") await handleAuthLogout(req, res, decodeURIComponent(path.split("/v1/auth/logout/")[1]));
-		else if (path === "/v1/config" && req.method === "GET") handleConfigGet(req, res);
-		else if (path === "/v1/config" && req.method === "PUT") await handleConfigPut(req, res);
-		else if (path === "/v1/config/pools" && req.method === "GET") await handlePoolsGet(req, res);
-		else if (path === "/v1/config/pools" && req.method === "POST") await handlePoolCreate(req, res);
-		else if (path.startsWith("/v1/config/pools/") && req.method === "PUT") await handlePoolUpdate(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1]));
-		else if (path.startsWith("/v1/config/pools/") && req.method === "DELETE") handlePoolDelete(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1]));
-		else if (path === "/v1/config/chains" && req.method === "POST") await handleChainCreate(req, res);
-		else if (path.startsWith("/v1/config/chains/") && req.method === "PUT") await handleChainUpdate(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1]));
-		else if (path.startsWith("/v1/config/chains/") && req.method === "DELETE") handleChainDelete(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1]));
-		else if (path === "/v1/config/presets" && req.method === "POST") await handlePresetCreate(req, res);
-		else if (path.startsWith("/v1/config/presets/") && req.method === "PUT") await handlePresetUpdate(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1]));
-		else if (path.startsWith("/v1/config/presets/") && req.method === "DELETE") handlePresetDelete(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1]));
-		else if (path === "/v1/config/subscriptions" && req.method === "POST") await handleSubCreate(req, res);
-		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "PUT") await handleSubUpdate(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1]));
-		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "DELETE") handleSubDelete(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1]));
-		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
-		else if (path.startsWith("/web/") && req.method === "GET") handleWebAsset(req, res, path);
-		else if (path === "/admin") handleAdmin(req, res);
-		else if (path === "/ui" || path === "/") handleUI(req, res);
+		// Admin-only endpoints
+		else if (path === "/v1/quota" && req.method === "GET") { if (!adminOnly()) await handleQuota(req, res); }
+		else if (path === "/v1/stats" && req.method === "GET") { if (!adminOnly()) handleStats(req, res); }
+		else if (path === "/v1/rules" && req.method === "GET") { if (!adminOnly()) handleRulesList(req, res); }
+		else if (path === "/v1/rules" && req.method === "POST") { if (!adminOnly()) await handleRulesCreate(req, res); }
+		else if (path.startsWith("/v1/rules/") && req.method === "PUT") { if (!adminOnly()) await handleRulesUpdate(req, res, decodeURIComponent(path.split("/v1/rules/")[1])); }
+		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") { if (!adminOnly()) handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1])); }
+		else if (path === "/v1/audit" && req.method === "GET") { if (!adminOnly()) handleAuditLog(req, res); }
+		else if (path === "/v1/auth/providers" && req.method === "GET") { if (!adminOnly()) await handleAuthProviders(req, res); }
+		else if (path === "/v1/auth/status" && req.method === "GET") { if (!adminOnly()) handleAuthStatus(req, res); }
+		else if (path === "/v1/auth/names" && req.method === "GET") { if (!adminOnly()) handleKnownNames(req, res); }
+		else if (path.startsWith("/v1/auth/login/") && req.method === "POST") { if (!adminOnly()) await handleAuthLogin(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1])); }
+		else if (path.startsWith("/v1/auth/login/") && req.method === "GET") { if (!adminOnly()) handleAuthLoginStatus(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1])); }
+		else if (path.startsWith("/v1/auth/logout/") && req.method === "POST") { if (!adminOnly()) await handleAuthLogout(req, res, decodeURIComponent(path.split("/v1/auth/logout/")[1])); }
+		else if (path === "/v1/config" && req.method === "GET") { if (!adminOnly()) handleConfigGet(req, res); }
+		else if (path === "/v1/config" && req.method === "PUT") { if (!adminOnly()) await handleConfigPut(req, res); }
+		else if (path === "/v1/config/pools" && req.method === "GET") { if (!adminOnly()) await handlePoolsGet(req, res); }
+		else if (path === "/v1/config/pools" && req.method === "POST") { if (!adminOnly()) await handlePoolCreate(req, res); }
+		else if (path.startsWith("/v1/config/pools/") && req.method === "PUT") { if (!adminOnly()) await handlePoolUpdate(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1])); }
+		else if (path.startsWith("/v1/config/pools/") && req.method === "DELETE") { if (!adminOnly()) handlePoolDelete(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1])); }
+		else if (path === "/v1/config/chains" && req.method === "POST") { if (!adminOnly()) await handleChainCreate(req, res); }
+		else if (path.startsWith("/v1/config/chains/") && req.method === "PUT") { if (!adminOnly()) await handleChainUpdate(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1])); }
+		else if (path.startsWith("/v1/config/chains/") && req.method === "DELETE") { if (!adminOnly()) handleChainDelete(req, res, decodeURIComponent(path.split("/v1/config/chains/")[1])); }
+		else if (path === "/v1/config/presets" && req.method === "POST") { if (!adminOnly()) await handlePresetCreate(req, res); }
+		else if (path.startsWith("/v1/config/presets/") && req.method === "PUT") { if (!adminOnly()) await handlePresetUpdate(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1])); }
+		else if (path.startsWith("/v1/config/presets/") && req.method === "DELETE") { if (!adminOnly()) handlePresetDelete(req, res, decodeURIComponent(path.split("/v1/config/presets/")[1])); }
+		else if (path === "/v1/config/subscriptions" && req.method === "POST") { if (!adminOnly()) await handleSubCreate(req, res); }
+		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "PUT") { if (!adminOnly()) await handleSubUpdate(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1])); }
+		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "DELETE") { if (!adminOnly()) handleSubDelete(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1])); }
+		// User management (admin only)
+		else if (path === "/v1/users" && req.method === "GET") { if (!adminOnly()) handleUsersList(req, res); }
+		else if (path === "/v1/users" && req.method === "POST") { if (!adminOnly()) await handleUserCreate(req, res); }
+		else if (path.startsWith("/v1/users/") && path.endsWith("/key") && req.method === "GET") { if (!adminOnly()) handleUserRevealKey(req, res, decodeURIComponent(path.split("/v1/users/")[1].replace("/key", ""))); }
+		else if (path.startsWith("/v1/users/") && req.method === "PUT") { if (!adminOnly()) await handleUserUpdate(req, res, decodeURIComponent(path.split("/v1/users/")[1])); }
+		else if (path.startsWith("/v1/users/") && req.method === "DELETE") { if (!adminOnly()) handleUserDelete(req, res, decodeURIComponent(path.split("/v1/users/")[1])); }
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
 	} catch (err) {
 		log("Unhandled:", err?.message || err);
@@ -2283,5 +2500,10 @@ server.listen(PORT, () => {
 
   OPENAI_BASE_URL=http://localhost:${PORT}/v1
   Chat UI: http://localhost:${PORT}/ui
+
+  Admin token: ${ADMIN_TOKEN}
+  ${process.env.LEELOO_KEY ? "(from LEELOO_KEY env)" : "(random, set LEELOO_KEY env to persist)"}
 `);
+
+	rotateUsageLog();
 });

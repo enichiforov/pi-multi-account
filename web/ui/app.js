@@ -41,6 +41,13 @@ marked.setOptions({
 const html = htm.bind(React.createElement);
 const BASE = location.origin;
 const ROUTE_KEY = "leeloo.route";
+const TOKEN_KEY = "leeloo.token";
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Content-Type": "application/json", Authorization: `Bearer ${getToken()}` }; }
+function authFetch(url, opts = {}) {
+  return fetch(url, { ...opts, headers: { ...opts.headers, Authorization: `Bearer ${getToken()}` } });
+}
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
@@ -199,7 +206,7 @@ function App() {
 
   async function loadRouting() {
     try {
-      const { groups: gs = [] } = await fetch(`${BASE}/v1/routing`).then((r) => r.json());
+      const { groups: gs = [] } = await authFetch(`${BASE}/v1/routing`).then((r) => r.json());
       setGroups(gs);
       const flat = gs.flatMap((g) => g.items || []);
       const ids = new Set(flat.map((x) => x.id));
@@ -211,7 +218,7 @@ function App() {
   async function loadInfo(silent) {
     const [h, q] = await Promise.allSettled([
       fetch(`${BASE}/health`).then((r) => r.json()),
-      fetch(`${BASE}/v1/quota`).then((r) => r.json()),
+      authFetch(`${BASE}/v1/quota`).then((r) => r.json()),
     ]);
     if (h.status === "fulfilled") setHealth(h.value);
     if (q.status === "fulfilled") setQuota(q.value);
@@ -236,7 +243,7 @@ function App() {
     const flush = () => { if (raf) return; raf = true; requestAnimationFrame(() => { raf = false; setMessages((p) => p.map((m) => m.id === aid ? { ...m, content: full, thinking: false } : m)); }); };
 
     try {
-      const resp = await fetch(`${BASE}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: route, messages: convoRef.current, stream: true }) });
+      const resp = await authFetch(`${BASE}/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: JSON.stringify({ model: route, messages: convoRef.current, stream: true }) });
       if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e?.error?.message || `HTTP ${resp.status}`); }
 
       const reader = resp.body.getReader();
@@ -297,4 +304,61 @@ function App() {
   `;
 }
 
-createRoot(document.getElementById("app")).render(html`<${App} />`);
+function LoginScreen({ onLogin }) {
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!token.trim()) return;
+    setBusy(true); setError("");
+    try {
+      const r = await fetch(`${BASE}/v1/auth/verify`, { method: "POST", headers: { Authorization: `Bearer ${token.trim()}` } });
+      const d = await r.json();
+      if (d.valid) { localStorage.setItem(TOKEN_KEY, token.trim()); onLogin(d); }
+      else setError("Invalid token");
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  }
+
+  return html`
+    <div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b" }}>
+      <div style=${{ width: "340px", padding: "32px", background: "#18181b", border: "1px solid #27272a", borderRadius: "16px" }}>
+        <h2 style=${{ color: "#f59e0b", fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>Leeloo</h2>
+        <p style=${{ color: "#52525b", fontSize: "13px", marginBottom: "20px" }}>Enter your API token to continue.</p>
+        <input
+          type="password"
+          value=${token}
+          onInput=${(e) => setToken(e.target.value)}
+          onKeyDown=${(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="Token..."
+          style=${{ width: "100%", marginBottom: "10px" }}
+          autoFocus
+        />
+        ${error ? html`<div style=${{ color: "#ef4444", fontSize: "12px", marginBottom: "8px" }}>${error}</div>` : null}
+        <button className="btn send" onClick=${submit} disabled=${busy} style=${{ width: "100%" }}>${busy ? "Verifying..." : "Login"}</button>
+      </div>
+    </div>
+  `;
+}
+
+function AuthGate() {
+  const [authed, setAuthed] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    const t = getToken();
+    if (!t) { setChecking(false); return; }
+    fetch(`${BASE}/v1/auth/verify`, { method: "POST", headers: { Authorization: `Bearer ${t}` } })
+      .then((r) => r.json())
+      .then((d) => { if (d.valid) setAuthed(true); })
+      .catch(() => {})
+      .finally(() => setChecking(false));
+  }, []);
+
+  if (checking) return html`<div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b", color: "#52525b" }}>Loading...</div>`;
+  if (!authed) return html`<${LoginScreen} onLogin=${() => setAuthed(true)} />`;
+  return html`<${App} />`;
+}
+
+createRoot(document.getElementById("app")).render(html`<${AuthGate} />`);
