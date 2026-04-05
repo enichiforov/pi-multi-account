@@ -740,7 +740,7 @@ function UsersPanel() {
   const { names } = useNames();
 
   // Form state (shared for create + edit)
-  const [draft, setDraft] = useState({ username: "", allowedPresets: [], allowedPools: [] });
+  const [draft, setDraft] = useState({ username: "", allowedPresets: [], allowedPools: [], budgets: {} });
 
   async function load() {
     try { setUsers((await api("/v1/users")).users || []); } catch {}
@@ -748,18 +748,25 @@ function UsersPanel() {
   }
   useEffect(() => { load(); }, []);
 
-  function startNew() { setEditing("__new__"); setDraft({ username: "", allowedPresets: [], allowedPools: [] }); setShowForm(true); }
-  function startEdit(u) { setEditing(u.username); setDraft({ username: u.username, allowedPresets: u.allowedPresets || [], allowedPools: u.allowedPools || [] }); setShowForm(true); }
+  function startNew() { setEditing("__new__"); setDraft({ username: "", allowedPresets: [], allowedPools: [], budgets: {} }); setShowForm(true); }
+  function startEdit(u) { setEditing(u.username); setDraft({ username: u.username, allowedPresets: u.allowedPresets || [], allowedPools: u.allowedPools || [], budgets: u.budgets || {} }); setShowForm(true); }
   function cancelForm() { setShowForm(false); setEditing(null); }
 
   async function save() {
     setBusy(true);
     try {
+      const payload = { allowedPresets: draft.allowedPresets, allowedPools: draft.allowedPools };
+      const b = {};
+      if (draft.budgets.daily_tokens) b.daily_tokens = parseInt(draft.budgets.daily_tokens) || 0;
+      if (draft.budgets.monthly_tokens) b.monthly_tokens = parseInt(draft.budgets.monthly_tokens) || 0;
+      if (Object.keys(b).length > 0) payload.budgets = b;
+      else payload.budgets = null;
+
       if (editing === "__new__") {
-        const res = await api("/v1/users", jpost({ username: draft.username || `user-${Date.now()}`, allowedPresets: draft.allowedPresets, allowedPools: draft.allowedPools }));
+        const res = await api("/v1/users", jpost({ username: draft.username || `user-${Date.now()}`, ...payload }));
         setRevealedKeys((k) => ({ ...k, [res.user.username]: res.user.key }));
       } else {
-        await api(`/v1/users/${encodeURIComponent(editing)}`, jput({ allowedPresets: draft.allowedPresets, allowedPools: draft.allowedPools }));
+        await api(`/v1/users/${encodeURIComponent(editing)}`, jput(payload));
       }
       cancelForm();
       await load();
@@ -834,6 +841,14 @@ function UsersPanel() {
             onChange=${(v) => setDraft({ ...draft, allowedPools: v })}
             emptyText="No restrictions -- all pools allowed"
           />
+          <div>
+            <label>Daily token budget (0 = unlimited)</label>
+            <input type="number" value=${draft.budgets?.daily_tokens || ""} onInput=${(e) => setDraft({ ...draft, budgets: { ...draft.budgets, daily_tokens: e.target.value } })} placeholder="e.g. 500000" />
+          </div>
+          <div>
+            <label>Monthly token budget (0 = unlimited)</label>
+            <input type="number" value=${draft.budgets?.monthly_tokens || ""} onInput=${(e) => setDraft({ ...draft, budgets: { ...draft.budgets, monthly_tokens: e.target.value } })} placeholder="e.g. 10000000" />
+          </div>
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save} disabled=${busy}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancelForm}>Cancel</button></div>
       </div>
@@ -879,13 +894,31 @@ function UsersPanel() {
             </div>
           </div>
           ${us ? html`
-            <div className="meta" style=${{ marginTop: "6px", display: "flex", gap: "16px" }}>
+            <div className="meta" style=${{ marginTop: "6px", display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "center" }}>
               <span>${us.requests} requests</span>
               <span>${us.tokens_in} tokens in</span>
               <span>${us.tokens_out} tokens out</span>
               <span>${us.errors} errors</span>
               <span>last: ${ago(us.last_used)}</span>
             </div>
+            ${us.budgets ? html`
+              <div style=${{ marginTop: "6px", display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                ${us.budgets.daily_tokens ? html`
+                  <div style=${{ fontSize: "11px", display: "flex", alignItems: "center", gap: "6px" }}>
+                    <span style=${{ color: "#71717a" }}>daily:</span>
+                    <span className="q-bar" style=${{ width: "60px" }}><span className="q-fill" style=${{ width: `${Math.min(100, Math.round((us.daily_tokens || 0) / us.budgets.daily_tokens * 100))}%`, background: qColor(100 - Math.min(100, Math.round((us.daily_tokens || 0) / us.budgets.daily_tokens * 100))) }} /></span>
+                    <span style=${{ color: (us.daily_tokens || 0) >= us.budgets.daily_tokens ? "#ef4444" : "#a1a1aa" }}>${(us.daily_tokens || 0).toLocaleString()} / ${us.budgets.daily_tokens.toLocaleString()}</span>
+                  </div>
+                ` : null}
+                ${us.budgets.monthly_tokens ? html`
+                  <div style=${{ fontSize: "11px", display: "flex", alignItems: "center", gap: "6px" }}>
+                    <span style=${{ color: "#71717a" }}>monthly:</span>
+                    <span className="q-bar" style=${{ width: "60px" }}><span className="q-fill" style=${{ width: `${Math.min(100, Math.round((us.monthly_tokens || 0) / us.budgets.monthly_tokens * 100))}%`, background: qColor(100 - Math.min(100, Math.round((us.monthly_tokens || 0) / us.budgets.monthly_tokens * 100))) }} /></span>
+                    <span style=${{ color: (us.monthly_tokens || 0) >= us.budgets.monthly_tokens ? "#ef4444" : "#a1a1aa" }}>${(us.monthly_tokens || 0).toLocaleString()} / ${us.budgets.monthly_tokens.toLocaleString()}</span>
+                  </div>
+                ` : null}
+              </div>
+            ` : null}
           ` : null}
         </div>
       `;
@@ -969,10 +1002,10 @@ function LoginScreen({ onLogin }) {
 
   return html`
     <div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b" }}>
-      <div style=${{ width: "340px", padding: "32px", background: "#18181b", border: "1px solid #27272a", borderRadius: "16px" }}>
-        <h2 style=${{ color: "#f59e0b", fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>Leeloo Admin</h2>
-        <p style=${{ color: "#52525b", fontSize: "13px", marginBottom: "20px" }}>Enter the admin token to continue.</p>
-        <input type="password" value=${token} onInput=${(e) => setToken(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") submit(); }} placeholder="Admin token..." style=${{ width: "100%", marginBottom: "10px" }} autoFocus />
+      <div className="login-card">
+        <h2>Leeloo Admin</h2>
+        <p>Enter the admin token to continue.</p>
+        <input type="password" value=${token} onInput=${(e) => setToken(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") submit(); }} placeholder="Admin token..." style=${{ width: "100%", marginBottom: "12px" }} autoFocus />
         ${error ? html`<div style=${{ color: "#ef4444", fontSize: "12px", marginBottom: "8px" }}>${error}</div>` : null}
         <button className="btn primary" onClick=${submit} disabled=${busy} style=${{ width: "100%" }}>${busy ? "Verifying..." : "Login"}</button>
       </div>

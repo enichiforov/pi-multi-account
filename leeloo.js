@@ -39,12 +39,39 @@ import { randomBytes } from "node:crypto";
 import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
 import { getModel, getModels, stream } from "@mariozechner/pi-ai";
 
+// ─── .env file support ───────────────────────────────────────────────────────
+
+function loadEnvFile() {
+	const candidates = [
+		join(dirname(fileURLToPath(import.meta.url)), ".env"),
+		join(process.cwd(), ".env"),
+	];
+	for (const p of candidates) {
+		if (!existsSync(p)) continue;
+		const lines = readFileSync(p, "utf-8").split("\n");
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+			const eq = trimmed.indexOf("=");
+			if (eq < 0) continue;
+			const key = trimmed.slice(0, eq).trim();
+			let val = trimmed.slice(eq + 1).trim();
+			if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+			if (!process.env[key]) process.env[key] = val; // don't override existing env
+		}
+		return p;
+	}
+	return null;
+}
+const envFile = loadEnvFile();
+
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
 let PORT = parseInt(process.env.LEELOO_PORT || "4000", 10);
 for (let i = 0; i < args.length; i++) {
 	if (args[i] === "--port" && args[i + 1]) PORT = parseInt(args[i + 1], 10);
+	if (args[i] === "init") { await runInit(); process.exit(0); }
 }
 
 // ─── Admin token ──────────────────────────────────────────────────────────────
@@ -175,6 +202,42 @@ function isModelAllowedForUser(user, role, modelId) {
 	const allowed = [...(user.allowedPresets || []), ...(user.allowedPools || []).map((p) => `pool:${p}`)];
 	// Check exact match or prefix match for pool:name/model
 	return allowed.some((a) => modelId === a || modelId.startsWith(a + "/"));
+}
+
+/**
+ * Check user budget. Returns { allowed, message, usage }.
+ * Budgets: { daily_tokens, monthly_tokens } on the user object.
+ * Uses userStats (in-memory) for fast checks.
+ */
+function checkUserBudget(user, role) {
+	if (role === "admin") return { allowed: true };
+	if (!user?.budgets) return { allowed: true };
+
+	const username = user.username;
+	const stats = userStats[username];
+	if (!stats) return { allowed: true };
+
+	const totalTokens = (stats.tokens_in || 0) + (stats.tokens_out || 0);
+
+	// Daily check -- uses daily_tokens_today which resets at midnight
+	if (user.budgets.daily_tokens && user.budgets.daily_tokens > 0) {
+		const dailyUsed = stats.daily_tokens || 0;
+		if (dailyUsed >= user.budgets.daily_tokens) {
+			const pct = Math.round((dailyUsed / user.budgets.daily_tokens) * 100);
+			return { allowed: false, message: `Daily token budget exceeded for "${username}": ${dailyUsed.toLocaleString()} / ${user.budgets.daily_tokens.toLocaleString()} (${pct}%)` };
+		}
+	}
+
+	// Monthly check
+	if (user.budgets.monthly_tokens && user.budgets.monthly_tokens > 0) {
+		const monthlyUsed = stats.monthly_tokens || 0;
+		if (monthlyUsed >= user.budgets.monthly_tokens) {
+			const pct = Math.round((monthlyUsed / user.budgets.monthly_tokens) * 100);
+			return { allowed: false, message: `Monthly token budget exceeded for "${username}": ${monthlyUsed.toLocaleString()} / ${user.budgets.monthly_tokens.toLocaleString()} (${pct}%)` };
+		}
+	}
+
+	return { allowed: true };
 }
 
 // ─── Persistent usage log (JSONL, per-user) ─────────────────────────────────
@@ -636,13 +699,26 @@ function trackRequest(provider, modelId, usage, durationMs, error, requestText, 
 	s.last_used = entry.timestamp;
 
 	if (username) {
+		const now = new Date();
+		const today = now.toISOString().slice(0, 10); // YYYY-MM-DD
+		const month = now.toISOString().slice(0, 7);  // YYYY-MM
+
 		if (!userStats[username]) {
-			userStats[username] = { requests: 0, tokens_in: 0, tokens_out: 0, errors: 0, last_used: null };
+			userStats[username] = { requests: 0, tokens_in: 0, tokens_out: 0, errors: 0, last_used: null, daily_tokens: 0, daily_date: today, monthly_tokens: 0, monthly_date: month };
 		}
 		const u = userStats[username];
+
+		// Reset daily counter if date changed
+		if (u.daily_date !== today) { u.daily_tokens = 0; u.daily_date = today; }
+		// Reset monthly counter if month changed
+		if (u.monthly_date !== month) { u.monthly_tokens = 0; u.monthly_date = month; }
+
+		const reqTokens = entry.tokens_in + entry.tokens_out;
 		u.requests++;
 		u.tokens_in += entry.tokens_in;
 		u.tokens_out += entry.tokens_out;
+		u.daily_tokens += reqTokens;
+		u.monthly_tokens += reqTokens;
 		if (error) u.errors++;
 		u.last_used = entry.timestamp;
 	}
@@ -1339,12 +1415,17 @@ function handleUsersList(req, res) {
 async function handleUserCreate(req, res) {
 	const body = JSON.parse(await readBody(req));
 	const users = loadUsers();
+	const budgets = {};
+	if (body.budgets?.daily_tokens) budgets.daily_tokens = body.budgets.daily_tokens;
+	if (body.budgets?.monthly_tokens) budgets.monthly_tokens = body.budgets.monthly_tokens;
+
 	const user = {
 		username: body.username || `user-${Date.now()}`,
 		key: body.key || randomBytes(24).toString("hex"),
 		enabled: body.enabled !== false,
 		allowedPresets: body.allowedPresets || [],
 		allowedPools: body.allowedPools || [],
+		...(Object.keys(budgets).length > 0 ? { budgets } : {}),
 	};
 	if (users.some((u) => u.username === user.username)) {
 		res.writeHead(409, json());
@@ -2069,6 +2150,14 @@ async function handleChatCompletions(req, res) {
 		return;
 	}
 
+	// ── Budget check ──
+	const budgetCheck = checkUserBudget(auth.user, auth.role);
+	if (!budgetCheck.allowed) {
+		res.writeHead(429, json());
+		res.end(JSON.stringify({ error: { message: budgetCheck.message } }));
+		return;
+	}
+
 	// ── User access check ──
 	if (!isModelAllowedForUser(auth.user, auth.role, requestModelId)) {
 		res.writeHead(403, json());
@@ -2335,7 +2424,10 @@ function handleStats(req, res) {
 			label: getProviderLabel(prov),
 			...s,
 		})),
-		users: Object.entries(userStats).map(([user, s]) => ({ username: user, ...s })),
+		users: Object.entries(userStats).map(([uname, s]) => {
+			const userCfg = loadUsers().find((u) => u.username === uname);
+			return { username: uname, ...s, budgets: userCfg?.budgets || null };
+		}),
 		recent: usageLog.slice(-limit).reverse(),
 	}));
 }
@@ -2471,6 +2563,59 @@ const server = createServer(async (req, res) => {
 	}
 });
 
+// ─── Init wizard ──────────────────────────────────────────────────────────────
+
+async function runInit() {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+	console.log("\n  Leeloo init -- quick setup wizard\n");
+
+	// Admin token
+	let key = await ask("  Admin token (leave empty to generate random): ");
+	key = key.trim() || randomBytes(24).toString("hex");
+
+	// Port
+	let port = await ask("  Port [4000]: ");
+	port = port.trim() || "4000";
+
+	// Write .env
+	const envPath = join(dirname(fileURLToPath(import.meta.url)), ".env");
+	const envContent = [
+		"# Leeloo configuration",
+		`LEELOO_KEY=${key}`,
+		`LEELOO_PORT=${port}`,
+		"",
+	].join("\n");
+	writeFileSync(envPath, envContent, "utf-8");
+	console.log(`\n  Created ${envPath}`);
+
+	// Create config if missing
+	const agentDir = getAgentDir();
+	const configPath = join(agentDir, "multi-pass.json");
+	if (!existsSync(configPath)) {
+		if (!existsSync(agentDir)) mkdirSync(agentDir, { recursive: true });
+		writeFileSync(configPath, JSON.stringify({ subscriptions: [], pools: [], chains: [], presets: [] }, null, 2), "utf-8");
+		console.log(`  Created ${configPath}`);
+	} else {
+		console.log(`  Config already exists: ${configPath}`);
+	}
+
+	console.log(`
+  Done! Start Leeloo:
+
+    node leeloo.js
+
+  Then open:
+    Admin:  http://localhost:${port}/admin
+    Chat:   http://localhost:${port}/ui
+    API:    http://localhost:${port}/v1
+
+  Admin token: ${key}
+`);
+	rl.close();
+}
+
 server.listen(PORT, () => {
 	const config = loadConfig();
 	const providers = getAllProviders();
@@ -2505,7 +2650,7 @@ server.listen(PORT, () => {
   Chat UI: http://localhost:${PORT}/ui
 
   Admin token: ${ADMIN_TOKEN}
-  ${process.env.LEELOO_KEY ? "(from LEELOO_KEY env)" : "(random, set LEELOO_KEY env to persist)"}
+  ${process.env.LEELOO_KEY ? "(from LEELOO_KEY" + (envFile ? " via " + envFile : " env") + ")" : "(random -- run 'leeloo init' or set LEELOO_KEY to persist)"}
 `);
 
 	rotateUsageLog();

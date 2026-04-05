@@ -323,16 +323,16 @@ function LoginScreen({ onLogin }) {
 
   return html`
     <div style=${{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#09090b" }}>
-      <div style=${{ width: "340px", padding: "32px", background: "#18181b", border: "1px solid #27272a", borderRadius: "16px" }}>
-        <h2 style=${{ color: "#f59e0b", fontSize: "18px", fontWeight: 700, marginBottom: "4px" }}>Leeloo</h2>
-        <p style=${{ color: "#52525b", fontSize: "13px", marginBottom: "20px" }}>Enter your API token to continue.</p>
+      <div className="login-card">
+        <h2>Leeloo</h2>
+        <p>Enter your API token to continue.</p>
         <input
           type="password"
           value=${token}
           onInput=${(e) => setToken(e.target.value)}
           onKeyDown=${(e) => { if (e.key === "Enter") submit(); }}
           placeholder="Token..."
-          style=${{ width: "100%", marginBottom: "10px" }}
+          style=${{ width: "100%", marginBottom: "12px" }}
           autoFocus
         />
         ${error ? html`<div style=${{ color: "#ef4444", fontSize: "12px", marginBottom: "8px" }}>${error}</div>` : null}
