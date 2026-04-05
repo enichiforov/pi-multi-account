@@ -1,6 +1,10 @@
 {
   "name": "pi-multi-pass",
   "version": "1.3.0",
+  "type": "module",
+  "bin": {
+    "leeloo": "./leeloo.js"
+  },
   "description": "Multi-subscription extension for pi -- use multiple OAuth accounts per provider (Anthropic, Codex, Copilot, Gemini, Antigravity)",
   "keywords": [
     "pi-package",
