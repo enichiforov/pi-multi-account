@@ -33,15 +33,8 @@
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import {
-	AuthStorage,
-	getAgentDir,
-} from "@mariozechner/pi-coding-agent";
-import {
-	getModel,
-	getModels,
-	stream,
-} from "@mariozechner/pi-ai";
+import { AuthStorage, getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getModel, getModels, stream } from "@mariozechner/pi-ai";
 
 // ─── CLI args ─────────────────────────────────────────────────────────────────
 
