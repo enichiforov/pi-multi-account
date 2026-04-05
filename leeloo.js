@@ -959,6 +959,61 @@ function handleModels(req, res) {
 
 // ─── /health ──────────────────────────────────────────────────────────────────
 
+/** Returns only models/presets from multi-pass config -- used by the chat UI. */
+function handleRouting(req, res) {
+	const config = loadConfig();
+	const groups = [];
+
+	// Presets
+	const presets = config.presets.filter((p) => p.enabled);
+	if (presets.length > 0) {
+		groups.push({
+			label: "Presets",
+			items: presets.map((p) => ({
+				id: p.name,
+				name: p.name,
+				detail: p.entries.filter((e) => e.enabled).map((e) => `${e.provider}/${e.model}`).join(" -> "),
+			})),
+		});
+	}
+
+	// Pools -- show models available from each pool's base provider
+	for (const pool of config.pools) {
+		if (!pool.enabled) continue;
+		try {
+			const models = getModels(pool.baseProvider);
+			const available = pool.members.filter((m) => authStorage.hasAuth(m));
+			if (available.length === 0) continue;
+			groups.push({
+				label: `${pool.name} [${pool.strategy || "round-robin"}] (${available.length} members)`,
+				items: models.map((m) => ({
+					id: m.id,
+					name: m.id,
+					detail: `${pool.baseProvider} via ${available.join(", ")}`,
+				})),
+			});
+		} catch { /* skip */ }
+	}
+
+	// Non-pool providers (authenticated but not in any pool)
+	const pooled = new Set(config.pools.flatMap((p) => p.members));
+	const standalone = getAllProviders().filter((p) => !pooled.has(p));
+	for (const prov of standalone) {
+		const base = getBaseProvider(prov);
+		if (!base) continue;
+		try {
+			const models = getModels(base);
+			groups.push({
+				label: prov,
+				items: models.map((m) => ({ id: m.id, name: m.id, detail: prov })),
+			});
+		} catch { /* skip */ }
+	}
+
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ groups }));
+}
+
 function handleHealth(req, res) {
 	const config = loadConfig();
 	const providers = getAllProviders();
@@ -1008,97 +1063,106 @@ const CHAT_UI_HTML = `<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:16px;flex-shrink:0}
-header h1{font-size:16px;color:#f90;font-weight:600;white-space:nowrap}
-header select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:6px 12px;font-size:13px;min-width:200px}
-header .status{margin-left:auto;font-size:12px;color:#666}
-#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:85%;padding:10px 14px;border-radius:12px;line-height:1.5;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
+header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap}
+header h1{font-size:15px;color:#f90;font-weight:700;white-space:nowrap;letter-spacing:.5px}
+header select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:7px 12px;font-size:13px;min-width:260px;cursor:pointer}
+header select:focus{border-color:#f90;outline:none}
+header select optgroup{color:#999;font-style:normal;font-weight:600;font-size:12px}
+header select option{color:#e0e0e0;padding:4px}
+.status{margin-left:auto;font-size:12px;color:#555;display:flex;align-items:center;gap:6px}
+.status .dot{width:7px;height:7px;border-radius:50%;background:#444}
+.status .dot.ok{background:#4a4}
+.status .dot.busy{background:#f90}
+#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
+.msg{max-width:80%;padding:12px 16px;border-radius:14px;line-height:1.6;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
 .msg.user{align-self:flex-end;background:#1a3a5c;color:#cde;border-bottom-right-radius:4px}
-.msg.assistant{align-self:flex-start;background:#1a1a1a;border:1px solid #222;border-bottom-left-radius:4px}
-.msg .meta{font-size:11px;color:#666;margin-top:6px}
-.msg code{background:#0d0d0d;padding:1px 4px;border-radius:3px;font-size:13px}
-.msg pre{background:#0d0d0d;padding:8px;border-radius:6px;overflow-x:auto;margin:6px 0}
-.msg pre code{background:none;padding:0}
+.msg.assistant{align-self:flex-start;background:#151515;border:1px solid #222;border-bottom-left-radius:4px}
+.msg .meta{font-size:11px;color:#555;margin-top:8px;border-top:1px solid #222;padding-top:6px}
+.welcome{text-align:center;color:#444;padding:60px 20px;font-size:14px;line-height:2}
+.welcome h2{color:#f90;font-size:18px;margin-bottom:8px;font-weight:600}
 #input-area{border-top:1px solid #222;padding:12px 20px;display:flex;gap:10px;flex-shrink:0;background:#111}
-#input-area textarea{flex:1;background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:8px;padding:10px 14px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:120px}
+#input-area textarea{flex:1;background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:10px;padding:10px 14px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:140px;line-height:1.5}
 #input-area textarea:focus{outline:none;border-color:#f90}
-#input-area button{background:#f90;color:#000;border:none;border-radius:8px;padding:0 20px;font-weight:600;cursor:pointer;font-size:14px}
+#input-area button{background:#f90;color:#000;border:none;border-radius:10px;padding:0 22px;font-weight:700;cursor:pointer;font-size:14px;transition:background .15s}
 #input-area button:hover{background:#fa0}
-#input-area button:disabled{opacity:.4;cursor:default}
-.typing{color:#888;font-style:italic;font-size:13px;padding:4px 14px}
+#input-area button:disabled{opacity:.3;cursor:default}
+.clear-btn{background:none;border:1px solid #333;color:#666;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;margin-left:4px}
+.clear-btn:hover{border-color:#666;color:#aaa}
 </style>
 </head><body>
 <header>
   <h1>LEELOO DALLAS MULTI PASS</h1>
   <select id="model-select"><option>Loading...</option></select>
-  <span class="status" id="status">connecting...</span>
+  <button class="clear-btn" onclick="clearChat()">Clear</button>
+  <span class="status"><span class="dot" id="dot"></span><span id="status">loading...</span></span>
 </header>
-<div id="chat"></div>
+<div id="chat">
+  <div class="welcome">
+    <h2>LEELOO DALLAS MULTI PASS</h2>
+    Select a preset or model above and start chatting.<br>
+    Requests route through your multi-pass pools with automatic failover.
+  </div>
+</div>
 <div id="input-area">
-  <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
+  <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" autofocus></textarea>
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
 <script>
 const BASE = location.origin;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
-const modelSelect = document.getElementById("model-select");
+const sel = document.getElementById("model-select");
 const sendBtn = document.getElementById("send");
 const statusEl = document.getElementById("status");
+const dot = document.getElementById("dot");
 let messages = [];
 let streaming = false;
 
-// Auto-resize textarea
-input.addEventListener("input", () => {
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 120) + "px";
-});
-input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-});
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
 
-// Load models
-async function loadModels() {
+async function loadRouting() {
   try {
-    const resp = await fetch(BASE + "/v1/models");
+    const resp = await fetch(BASE + "/v1/routing");
     const data = await resp.json();
-    modelSelect.innerHTML = "";
-    const models = data.data || [];
-    // Group: presets first, then by provider
-    const presets = models.filter(m => m.owned_by === "pi-multi-pass");
-    const regular = models.filter(m => m.owned_by !== "pi-multi-pass");
-    if (presets.length > 0) {
+    sel.innerHTML = "";
+    let count = 0;
+    for (const group of (data.groups || [])) {
       const og = document.createElement("optgroup");
-      og.label = "Presets";
-      presets.forEach(m => { const o = document.createElement("option"); o.value = m.id; o.textContent = m.id; og.appendChild(o); });
-      modelSelect.appendChild(og);
+      og.label = group.label;
+      for (const item of group.items) {
+        const o = document.createElement("option");
+        o.value = item.id;
+        o.textContent = item.name;
+        if (item.detail) o.title = item.detail;
+        og.appendChild(o);
+        count++;
+      }
+      sel.appendChild(og);
     }
-    // Group by provider
-    const byProvider = {};
-    regular.forEach(m => { (byProvider[m.owned_by] = byProvider[m.owned_by] || []).push(m); });
-    for (const [prov, pmodels] of Object.entries(byProvider)) {
-      const og = document.createElement("optgroup");
-      og.label = prov;
-      pmodels.forEach(m => { const o = document.createElement("option"); o.value = m.id; o.textContent = m.id; og.appendChild(o); });
-      modelSelect.appendChild(og);
-    }
-    statusEl.textContent = models.length + " models";
-  } catch (e) { statusEl.textContent = "error: " + e.message; }
+    setStatus("ready", count + " routes");
+  } catch (e) { setStatus("error", e.message); }
 }
 
+function setStatus(state, text) {
+  statusEl.textContent = text;
+  dot.className = "dot " + (state === "ready" ? "ok" : state === "busy" ? "busy" : "");
+}
+
+function clearChat() { messages = []; chat.innerHTML = '<div class="welcome"><h2>LEELOO DALLAS MULTI PASS</h2>Chat cleared.</div>'; }
+
 function addMessage(role, content, meta) {
+  // Remove welcome message
+  const w = chat.querySelector(".welcome"); if (w) w.remove();
   const div = document.createElement("div");
   div.className = "msg " + role;
-  div.innerHTML = escapeHtml(content) + (meta ? '<div class="meta">' + escapeHtml(meta) + '</div>' : '');
+  div.innerHTML = esc(content) + (meta ? '<div class="meta">' + esc(meta) + '</div>' : '');
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
 }
 
-function escapeHtml(s) {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
+function esc(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
 async function sendMessage() {
   const text = input.value.trim();
@@ -1107,59 +1171,63 @@ async function sendMessage() {
   messages.push({ role: "user", content: text });
   addMessage("user", text);
   streaming = true; sendBtn.disabled = true;
-  statusEl.textContent = "streaming...";
+  setStatus("busy", "streaming...");
 
-  const assistantDiv = addMessage("assistant", "");
-  let fullText = "";
+  const div = addMessage("assistant", "");
+  let full = "";
+  const t0 = Date.now();
 
   try {
     const resp = await fetch(BASE + "/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: modelSelect.value,
-        messages: messages,
-        stream: true,
-      }),
+      body: JSON.stringify({ model: sel.value, messages, stream: true }),
     });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err?.error?.message || "HTTP " + resp.status);
+    }
+
     const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let usage = null;
+    const dec = new TextDecoder();
+    let buf = "", usage = null;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\\n");
-      buffer = lines.pop() || "";
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\\n");
+      buf = lines.pop() || "";
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
-        const payload = line.slice(6).trim();
-        if (payload === "[DONE]") continue;
+        const p = line.slice(6).trim();
+        if (p === "[DONE]") continue;
         try {
-          const parsed = JSON.parse(payload);
-          const delta = parsed.choices?.[0]?.delta;
-          if (delta?.content) { fullText += delta.content; assistantDiv.innerHTML = escapeHtml(fullText); chat.scrollTop = chat.scrollHeight; }
-          if (delta?.tool_calls) { fullText += "[tool_call: " + (delta.tool_calls[0]?.function?.name || "?") + "]"; assistantDiv.innerHTML = escapeHtml(fullText); }
-          if (parsed.usage) usage = parsed.usage;
-          const fr = parsed.choices?.[0]?.finish_reason;
-          if (fr) {
-            const meta = (usage ? "tokens: " + usage.prompt_tokens + " in / " + usage.completion_tokens + " out" : "") + " | model: " + modelSelect.value;
-            assistantDiv.innerHTML = escapeHtml(fullText) + '<div class="meta">' + escapeHtml(meta) + '</div>';
+          const j = JSON.parse(p);
+          const d = j.choices?.[0]?.delta;
+          if (d?.content) { full += d.content; div.innerHTML = esc(full); chat.scrollTop = chat.scrollHeight; }
+          if (d?.tool_calls) { const tc = d.tool_calls[0]; full += "[tool: " + (tc?.function?.name || "?") + "(" + (tc?.function?.arguments || "") + ")]"; div.innerHTML = esc(full); }
+          if (j.usage) usage = j.usage;
+          if (j.choices?.[0]?.finish_reason) {
+            const ms = Date.now() - t0;
+            const parts = [sel.value];
+            if (usage) parts.push(usage.prompt_tokens + " in / " + usage.completion_tokens + " out");
+            parts.push(ms + "ms");
+            div.innerHTML = esc(full) + '<div class="meta">' + esc(parts.join(" | ")) + '</div>';
           }
         } catch {}
       }
     }
-    messages.push({ role: "assistant", content: fullText });
+    messages.push({ role: "assistant", content: full });
   } catch (e) {
-    assistantDiv.innerHTML = escapeHtml("[Error: " + e.message + "]");
+    div.innerHTML = '<span style="color:#f44">' + esc("[Error: " + e.message + "]") + '</span>';
   }
   streaming = false; sendBtn.disabled = false;
-  statusEl.textContent = "ready";
+  setStatus("ready", "done");
 }
 
-loadModels();
+loadRouting();
 </script>
 </body></html>`;
 
@@ -1175,6 +1243,7 @@ const server = createServer(async (req, res) => {
 	try {
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
+		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
 		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
