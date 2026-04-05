@@ -425,14 +425,20 @@ const auditLog = [];
 const AUDIT_LOG_MAX = 1000;
 const rateLimitCounters = {}; // { ruleName: { count, windowStart } }
 
-function auditEvent(rule, action, detail, content) {
+function auditEvent(rule, action, detail, matchedText, fullMessage, source) {
+	const matched = typeof matchedText === "string" ? matchedText : null;
+	const full = typeof fullMessage === "string" ? fullMessage : null;
+	const base = full || matched;
 	const entry = {
 		timestamp: new Date().toISOString(),
 		rule: rule.name,
 		type: rule.type,
 		action,
 		detail,
-		snippet: content ? content.slice(0, 200) : null,
+		source: source || null,
+		snippet: base ? base.slice(0, 200) : null,
+		matched_text: matched,
+		full_message: full,
 	};
 	auditLog.push(entry);
 	if (auditLog.length > AUDIT_LOG_MAX) auditLog.shift();
@@ -484,12 +490,13 @@ function evaluateContentRules(rules, messages, scope) {
 
 		for (const re of patterns) {
 			if (re.test(text)) {
+				const matched = text.match(re)?.[0] || null;
 				if (rule.type === "block") {
 					blocked = true;
 					blockMessage = rule.message || `Blocked by rule: ${rule.name}`;
-					auditEvent(rule, "blocked", blockMessage, text.match(re)?.[0]);
+					auditEvent(rule, "blocked", blockMessage, matched, text, scope);
 				} else if (rule.type === "warn") {
-					auditEvent(rule, "warned", `Pattern matched: ${re.source}`, text.match(re)?.[0]);
+					auditEvent(rule, "warned", `Pattern matched: ${re.source}`, matched, text, scope);
 				} else if (rule.type === "redact") {
 					const replacement = rule.replacement || "[REDACTED]";
 					// Redact in all message contents
@@ -505,7 +512,7 @@ function evaluateContentRules(rules, messages, scope) {
 						return m;
 					});
 					modified = true;
-					auditEvent(rule, "redacted", `Pattern replaced: ${re.source}`, replacement);
+					auditEvent(rule, "redacted", `Pattern replaced: ${re.source}`, matched, text, scope);
 				}
 			}
 			re.lastIndex = 0; // reset global regex
@@ -528,7 +535,7 @@ function evaluateModelRules(rules, modelId) {
 			for (const pattern of denyList) {
 				const re = new RegExp("^" + pattern.replace(/\*/g, ".*") + "$", "i");
 				if (re.test(modelId)) {
-					auditEvent(rule, "denied", `Model ${modelId} denied by ${pattern}`);
+					auditEvent(rule, "denied", `Model ${modelId} denied by ${pattern}`, modelId, null, "model");
 					return { allowed: false, message: rule.message || `Model "${modelId}" is not allowed by policy "${rule.name}"` };
 				}
 			}
@@ -539,7 +546,7 @@ function evaluateModelRules(rules, modelId) {
 				return re.test(modelId);
 			});
 			if (!matched) {
-				auditEvent(rule, "denied", `Model ${modelId} not in allow list`);
+				auditEvent(rule, "denied", `Model ${modelId} not in allow list`, modelId, null, "model");
 				return { allowed: false, message: rule.message || `Model "${modelId}" is not in the allowed list for policy "${rule.name}"` };
 			}
 		}
@@ -568,7 +575,7 @@ function evaluateRateLimitRules(rules) {
 		counter.count++;
 		if (counter.count > maxRequests) {
 			const retryAfter = Math.ceil((counter.windowStart + windowMs - now) / 1000);
-			auditEvent(rule, "rate-limited", `${counter.count}/${maxRequests} in ${rule.windowSeconds || 60}s window`);
+			auditEvent(rule, "rate-limited", `${counter.count}/${maxRequests} in ${rule.windowSeconds || 60}s window`, `${counter.count}/${maxRequests}`, null, "limit");
 			return { allowed: false, message: rule.message || `Rate limit exceeded: ${maxRequests} requests per ${rule.windowSeconds || 60}s`, retryAfter };
 		}
 	}
@@ -588,7 +595,8 @@ function redactResponse(rules, text) {
 			try {
 				const re = new RegExp(p, "gi");
 				if (re.test(text)) {
-					auditEvent(rule, "redacted-response", `Pattern replaced: ${re.source}`);
+					const matched = text.match(re)?.[0] || null;
+					auditEvent(rule, "redacted-response", `Pattern replaced: ${re.source}`, matched, text, "response");
 					re.lastIndex = 0;
 					text = text.replace(re, replacement);
 				}
@@ -610,7 +618,8 @@ function checkResponseBlock(rules, text) {
 			try {
 				const re = new RegExp(p, "gi");
 				if (re.test(text)) {
-					auditEvent(rule, "blocked-response", `Pattern matched: ${re.source}`, text.match(re)?.[0]);
+					const matched = text.match(re)?.[0] || null;
+					auditEvent(rule, "blocked-response", `Pattern matched: ${re.source}`, matched, text, "response");
 					return { blocked: true, message: rule.message || `Response blocked by rule: ${rule.name}` };
 				}
 			} catch {}
@@ -1749,12 +1758,16 @@ const loaders = {
     const data = await fetch(BASE+"/v1/audit").then(r=>r.json());
     let h = '<h2>Audit Log</h2>';
     if(!data.entries?.length){h+='<div class="empty">No audit events yet. Events appear when rules match requests or responses.</div>';}
-    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Detail</th><th>Snippet</th></tr>';
+    else{h+='<table><tr><th>Time</th><th>Rule</th><th>Type</th><th>Action</th><th>Source</th><th>Detail</th><th>Matched</th><th>Full message</th></tr>';
     for(const e of data.entries){
+      const fullMsg = e.full_message
+        ? '<details><summary>view ('+e.full_message.length+' chars)</summary><pre style="white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:#0a0a0a;border:1px solid #222;border-radius:6px;padding:8px;margin-top:6px">'+esc(e.full_message)+'</pre></details>'
+        : '--';
       h+='<tr><td>'+ago(e.timestamp)+'</td><td>'+esc(e.rule)+'</td>';
       h+='<td><span class="badge '+esc(e.type)+'">'+esc(e.type)+'</span></td>';
-      h+='<td>'+esc(e.action)+'</td><td>'+esc(e.detail)+'</td>';
-      h+='<td>'+(e.snippet?esc(e.snippet):'--')+'</td></tr>';
+      h+='<td>'+esc(e.action)+'</td><td>'+esc(e.source||'--')+'</td><td>'+esc(e.detail)+'</td>';
+      h+='<td>'+(e.matched_text?esc(e.matched_text):'--')+'</td>';
+      h+='<td>'+fullMsg+'</td></tr>';
     }h+='</table>';}
     document.getElementById("audit").innerHTML = h;
   },
