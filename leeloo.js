@@ -657,7 +657,7 @@ function formatUsage(u) {
 
 // ─── Streaming handler ────────────────────────────────────────────────────────
 
-async function handleStreaming(res, model, context, opts, requestModelId) {
+async function handleStreaming(res, model, context, opts, requestModelId, actualProvider) {
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -749,7 +749,10 @@ async function handleStreaming(res, model, context, opts, requestModelId) {
 			case "done": {
 				const finish = toolCalls.size > 0 ? "tool_calls" : mapFinishReason(event.reason);
 				const usage = formatUsage(event.message?.usage);
-				write(chunk(id, requestModelId, {}, finish, usage));
+				const finalChunk = chunk(id, requestModelId, {}, finish, usage);
+				finalChunk.x_provider = actualProvider;
+				finalChunk.x_model = model.id;
+				write(finalChunk);
 				res.write("data: [DONE]\n\n");
 				break;
 			}
@@ -775,7 +778,7 @@ async function handleStreaming(res, model, context, opts, requestModelId) {
 
 // ─── Non-streaming handler ────────────────────────────────────────────────────
 
-async function handleNonStreaming(res, model, context, opts, requestModelId) {
+async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider) {
 	const eventStream = stream(model, context, opts);
 	let fullText = "";
 	const toolCalls = [];
@@ -820,6 +823,8 @@ async function handleNonStreaming(res, model, context, opts, requestModelId) {
 	const id = `chatcmpl-leeloo-${Date.now()}`;
 	const response = completionResponse(id, requestModelId, message, formatUsage(usage));
 	response.choices[0].finish_reason = toolCalls.length > 0 ? "tool_calls" : mapFinishReason(finishReason);
+	response.x_provider = actualProvider;
+	response.x_model = model.id;
 
 	res.writeHead(200, { "Content-Type": "application/json" });
 	res.end(JSON.stringify(response));
@@ -889,9 +894,9 @@ async function handleChatCompletions(req, res) {
 			log(`[${candidate.provider}] ${candidate.modelId} (attempt ${attempt + 1}/${maxAttempts})`);
 
 			if (doStream) {
-				await handleStreaming(res, candidate.model, context, opts, requestModelId);
+				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider);
 			} else {
-				await handleNonStreaming(res, candidate.model, context, opts, requestModelId);
+				await handleNonStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider);
 			}
 			return;
 
@@ -1286,7 +1291,7 @@ async function sendMessage() {
 
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", usage = null, routedProvider = "";
+    let buf = "", usage = null, xProvider = "", xModel = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1333,7 +1338,8 @@ async function sendMessage() {
           }
 
           if (j.usage) usage = j.usage;
-          if (j.model && !routedProvider) routedProvider = j.model;
+          if (j.x_provider) xProvider = j.x_provider;
+          if (j.x_model) xModel = j.x_model;
 
           if (j.choices?.[0]?.finish_reason) {
             if (smdParser) smd.parser_end(smdParser);
@@ -1342,9 +1348,12 @@ async function sendMessage() {
             meta.className = "meta";
             const parts = [];
             parts.push('<span class="provider-tag">' + esc(selectedModel) + '</span>');
+            if (xProvider || xModel) {
+              parts.push('<span style="color:#8af">' + esc(xProvider) + '</span> / <span style="color:#aaa">' + esc(xModel) + '</span>');
+            }
             if (usage) parts.push(usage.prompt_tokens + " in / " + usage.completion_tokens + " out");
             parts.push((ms / 1000).toFixed(1) + "s");
-            meta.innerHTML = parts.join('<span style="color:#333">|</span>');
+            meta.innerHTML = parts.join(' <span style="color:#333">|</span> ');
             msgDiv.appendChild(meta);
           }
         } catch {}
