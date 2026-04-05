@@ -229,16 +229,20 @@ function decodeJwtPayload(token) {
 }
 
 /** Check Codex (ChatGPT) quota. Returns 0-100 remaining percentage or null. */
-async function checkCodexQuota(provider) {
+// ── Detailed quota result format ──
+// { score: 0-100, status: "ready"|"low"|"blocked"|"unknown",
+//   windows: [...], models: [...], plan?: string, email?: string }
+
+async function checkCodexQuotaDetailed(provider) {
 	const cred = authStorage.get(provider);
-	if (!cred || cred.type !== "oauth" || !cred.access) return null;
+	if (!cred || cred.type !== "oauth" || !cred.access) return { score: null, status: "no-auth" };
 
 	const apiKey = await authStorage.getApiKey(provider);
-	if (!apiKey) return null;
+	if (!apiKey) return { score: null, status: "no-auth" };
 
-	// Extract account ID from JWT or stored credential
 	const payload = decodeJwtPayload(apiKey);
 	const authClaim = payload["https://api.openai.com/auth"];
+	const profileClaim = payload["https://api.openai.com/profile"];
 	const accountId = cred.accountId || authClaim?.chatgpt_account_id;
 
 	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
@@ -246,20 +250,41 @@ async function checkCodexQuota(provider) {
 
 	try {
 		const resp = await fetch(`${CODEX_USAGE_URL.replace(/\/+$/, "")}/wham/usage`, { headers });
-		if (!resp.ok) return null;
+		if (!resp.ok) return { score: null, status: "error", error: `HTTP ${resp.status}` };
 		const data = await resp.json();
 		const rl = data?.rate_limit;
-		const windows = [rl?.primary_window, rl?.secondary_window]
-			.filter(Boolean)
-			.map((w) => Math.max(0, 100 - (w.used_percent || 0)));
-		return windows.length > 0 ? Math.min(...windows) : null;
-	} catch { return null; }
+
+		const parseWindow = (w, name) => {
+			if (!w) return null;
+			const used = w.used_percent || 0;
+			const remaining = Math.max(0, 100 - used);
+			const windowSec = w.limit_window_seconds || 0;
+			const resetAt = w.reset_at ? new Date(w.reset_at * 1000).toISOString() : null;
+			return { name, used: Math.round(used), remaining: Math.round(remaining), windowSeconds: windowSec, resetAt };
+		};
+
+		const windows = [
+			parseWindow(rl?.primary_window, "5-hour"),
+			parseWindow(rl?.secondary_window, "7-day"),
+		].filter(Boolean);
+
+		const scores = windows.map((w) => w.remaining);
+		const score = scores.length > 0 ? Math.min(...scores) : null;
+		const status = score === null ? "unknown" : score > 30 ? "ready" : score > 5 ? "low" : "blocked";
+
+		return {
+			score,
+			status,
+			plan: data?.plan_type || authClaim?.chatgpt_plan_type || "unknown",
+			email: profileClaim?.email || data?.email || null,
+			windows,
+		};
+	} catch (e) { return { score: null, status: "error", error: e.message }; }
 }
 
-/** Check Google Gemini CLI quota. Returns 0-100 remaining percentage or null. */
-async function checkGeminiQuota(provider) {
+async function checkGeminiQuotaDetailed(provider) {
 	const apiKey = await authStorage.getApiKey(provider);
-	if (!apiKey) return null;
+	if (!apiKey) return { score: null, status: "no-auth" };
 
 	let token;
 	try { const p = JSON.parse(apiKey); token = p.token; } catch { token = apiKey; }
@@ -275,20 +300,25 @@ async function checkGeminiQuota(provider) {
 			},
 			body: "{}",
 		});
-		if (!resp.ok) return null;
+		if (!resp.ok) return { score: null, status: "error", error: `HTTP ${resp.status}` };
 		const data = await resp.json();
-		const fractions = (data?.buckets || [])
-			.map((b) => b?.remainingFraction)
-			.filter((f) => typeof f === "number")
-			.map((f) => Math.round(f * 100));
-		return fractions.length > 0 ? Math.min(...fractions) : null;
-	} catch { return null; }
+		const models = (data?.buckets || []).map((b) => {
+			const id = b?.modelId || "unknown";
+			const remaining = typeof b?.remainingFraction === "number" ? Math.round(b.remainingFraction * 100) : null;
+			const resetAt = b?.resetTime || null;
+			return { model: id, remaining, resetAt };
+		}).filter((m) => m.remaining !== null);
+
+		const scores = models.map((m) => m.remaining);
+		const score = scores.length > 0 ? Math.min(...scores) : null;
+		const status = score === null ? "unknown" : score > 30 ? "ready" : score > 5 ? "low" : "blocked";
+		return { score, status, models };
+	} catch (e) { return { score: null, status: "error", error: e.message }; }
 }
 
-/** Check Google Antigravity quota. Returns 0-100 remaining percentage or null. */
-async function checkAntigravityQuota(provider) {
+async function checkAntigravityQuotaDetailed(provider) {
 	const apiKey = await authStorage.getApiKey(provider);
-	if (!apiKey) return null;
+	if (!apiKey) return { score: null, status: "no-auth" };
 
 	let token;
 	try { const p = JSON.parse(apiKey); token = p.token; } catch { token = apiKey; }
@@ -307,27 +337,69 @@ async function checkAntigravityQuota(provider) {
 			});
 			if (!resp.ok) continue;
 			const data = await resp.json();
-			const models = data?.models ? Object.values(data.models) : [];
-			const fractions = models
-				.filter((m) => !m.isInternal)
-				.map((m) => m?.quotaInfo?.remainingFraction)
-				.filter((f) => typeof f === "number")
-				.map((f) => Math.round(f * 100));
-			return fractions.length > 0 ? Math.min(...fractions) : null;
+			const entries = data?.models ? Object.entries(data.models) : [];
+			const models = entries
+				.filter(([, v]) => !v.isInternal)
+				.map(([k, v]) => ({
+					model: v.displayName || v.model || k,
+					remaining: typeof v?.quotaInfo?.remainingFraction === "number" ? Math.round(v.quotaInfo.remainingFraction * 100) : null,
+					resetAt: v?.quotaInfo?.resetTime || null,
+				}))
+				.filter((m) => m.remaining !== null);
+
+			const scores = models.map((m) => m.remaining);
+			const score = scores.length > 0 ? Math.min(...scores) : null;
+			const status = score === null ? "unknown" : score > 30 ? "ready" : score > 5 ? "low" : "blocked";
+			return { score, status, models };
 		} catch { continue; }
 	}
-	return null;
+	return { score: null, status: "error", error: "all endpoints failed" };
 }
 
-/** Get remaining quota score (0-100) for a provider. null = unknown. */
-async function checkQuota(provider) {
+async function checkQuotaDetailed(provider) {
 	const base = getBaseProvider(provider);
 	switch (base) {
-		case "openai-codex": return checkCodexQuota(provider);
-		case "google-gemini-cli": return checkGeminiQuota(provider);
-		case "google-antigravity": return checkAntigravityQuota(provider);
-		default: return null;
+		case "openai-codex": return checkCodexQuotaDetailed(provider);
+		case "google-gemini-cli": return checkGeminiQuotaDetailed(provider);
+		case "google-antigravity": return checkAntigravityQuotaDetailed(provider);
+		default: return { score: null, status: "unsupported" };
 	}
+}
+
+/** Simple score-only wrapper (used by sortByQuota). */
+async function checkQuota(provider) {
+	const detail = await checkQuotaDetailed(provider);
+	return detail.score;
+}
+
+// ─── Request usage tracking ──────────────────────────────────────────────────
+
+const usageLog = [];       // Recent requests (ring buffer)
+const USAGE_LOG_MAX = 500;
+const providerStats = {};  // { provider: { requests, tokens_in, tokens_out, errors, last_used } }
+
+function trackRequest(provider, modelId, usage, durationMs, error) {
+	const entry = {
+		timestamp: new Date().toISOString(),
+		provider,
+		model: modelId,
+		tokens_in: usage?.input || 0,
+		tokens_out: usage?.output || 0,
+		duration_ms: durationMs,
+		error: error || null,
+	};
+	usageLog.push(entry);
+	if (usageLog.length > USAGE_LOG_MAX) usageLog.shift();
+
+	if (!providerStats[provider]) {
+		providerStats[provider] = { requests: 0, tokens_in: 0, tokens_out: 0, errors: 0, last_used: null };
+	}
+	const s = providerStats[provider];
+	s.requests++;
+	s.tokens_in += entry.tokens_in;
+	s.tokens_out += entry.tokens_out;
+	if (error) s.errors++;
+	s.last_used = entry.timestamp;
 }
 
 /** Sort providers by quota (best first). Providers with unknown quota go last. */
@@ -722,6 +794,7 @@ function formatUsage(u) {
 // ─── Streaming handler ────────────────────────────────────────────────────────
 
 async function handleStreaming(res, model, context, opts, requestModelId, actualProvider) {
+	const t0 = Date.now();
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream",
 		"Cache-Control": "no-cache",
@@ -813,6 +886,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 			case "done": {
 				const finish = toolCalls.size > 0 ? "tool_calls" : mapFinishReason(event.reason);
 				const usage = formatUsage(event.message?.usage);
+				trackRequest(actualProvider, model.id, event.message?.usage, Date.now() - t0, null);
 				const finalChunk = chunk(id, requestModelId, {}, finish, usage);
 				finalChunk.x_provider = actualProvider;
 				finalChunk.x_model = model.id;
@@ -824,8 +898,8 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
-				// Send error as final text delta + stop
 				if (!sentRole) {
 					write(chunk(id, requestModelId, { role: "assistant", content: `[Error: ${errMsg}]` }, null));
 				} else {
@@ -844,6 +918,7 @@ async function handleStreaming(res, model, context, opts, requestModelId, actual
 // ─── Non-streaming handler ────────────────────────────────────────────────────
 
 async function handleNonStreaming(res, model, context, opts, requestModelId, actualProvider) {
+	const t0 = Date.now();
 	const eventStream = stream(model, context, opts);
 	let fullText = "";
 	const toolCalls = [];
@@ -868,9 +943,11 @@ async function handleNonStreaming(res, model, context, opts, requestModelId, act
 			case "done":
 				usage = event.message?.usage;
 				finishReason = event.reason;
+				trackRequest(actualProvider, model.id, usage, Date.now() - t0, null);
 				break;
 			case "error": {
 				const errMsg = event.error?.errorMessage || "Unknown error";
+				trackRequest(actualProvider, model.id, null, Date.now() - t0, errMsg);
 				if (isRateLimit(errMsg)) throw new Error(errMsg);
 				throw new Error(errMsg);
 			}
@@ -1110,15 +1187,56 @@ function handleRouting(req, res) {
 	res.end(JSON.stringify({ groups }));
 }
 
-/** Returns live quota scores for all providers that support it. */
+/** Detailed quota for all providers: windows, models, reset times. */
 async function handleQuota(req, res) {
 	const providers = getAllProviders();
 	const results = await Promise.all(providers.map(async (prov) => {
-		const score = await checkQuota(prov);
-		return { provider: prov, quota: score, exhausted: isExhausted(prov) };
+		const detail = await checkQuotaDetailed(prov);
+		return {
+			provider: prov,
+			label: getProviderLabel(prov),
+			baseProvider: getBaseProvider(prov),
+			exhausted: isExhausted(prov),
+			...detail,
+		};
 	}));
 	res.writeHead(200, json());
-	res.end(JSON.stringify({ providers: results }));
+	res.end(JSON.stringify({
+		timestamp: new Date().toISOString(),
+		providers: results,
+	}));
+}
+
+/** Usage stats: per-provider aggregates + recent request log. */
+function handleStats(req, res) {
+	const url = new URL(req.url, `http://localhost:${PORT}`);
+	const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+
+	// Compute session totals
+	let totalRequests = 0, totalTokensIn = 0, totalTokensOut = 0, totalErrors = 0;
+	for (const s of Object.values(providerStats)) {
+		totalRequests += s.requests;
+		totalTokensIn += s.tokens_in;
+		totalTokensOut += s.tokens_out;
+		totalErrors += s.errors;
+	}
+
+	res.writeHead(200, json());
+	res.end(JSON.stringify({
+		timestamp: new Date().toISOString(),
+		session: {
+			total_requests: totalRequests,
+			total_tokens_in: totalTokensIn,
+			total_tokens_out: totalTokensOut,
+			total_errors: totalErrors,
+		},
+		providers: Object.entries(providerStats).map(([prov, s]) => ({
+			provider: prov,
+			label: getProviderLabel(prov),
+			...s,
+		})),
+		recent: usageLog.slice(-limit).reverse(),
+	}));
 }
 
 function handleHealth(req, res) {
@@ -1532,6 +1650,7 @@ const server = createServer(async (req, res) => {
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
 		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
 		else if (path === "/v1/quota" && req.method === "GET") await handleQuota(req, res);
+		else if (path === "/v1/stats" && req.method === "GET") handleStats(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
 		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
@@ -1563,6 +1682,8 @@ server.listen(PORT, () => {
 
   POST /v1/chat/completions   (streaming, tools, images, failover)
   GET  /v1/models             (all models + preset names)
+  GET  /v1/quota              (detailed quota per provider)
+  GET  /v1/stats              (usage stats + request log)
   GET  /health
   GET  /ui                    Chat UI
 
