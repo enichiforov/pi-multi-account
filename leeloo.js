@@ -1060,42 +1060,96 @@ const CHAT_UI_HTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Leeloo Dallas Multi Pass</title>
+<script src="https://cdn.jsdelivr.net/npm/streaming-markdown@latest/smd.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap}
-header h1{font-size:15px;color:#f90;font-weight:700;white-space:nowrap;letter-spacing:.5px}
-header select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:7px 12px;font-size:13px;min-width:260px;cursor:pointer}
-header select:focus{border-color:#f90;outline:none}
-header select optgroup{color:#999;font-style:normal;font-weight:600;font-size:12px}
-header select option{color:#e0e0e0;padding:4px}
-.status{margin-left:auto;font-size:12px;color:#555;display:flex;align-items:center;gap:6px}
-.status .dot{width:7px;height:7px;border-radius:50%;background:#444}
-.status .dot.ok{background:#4a4}
-.status .dot.busy{background:#f90}
+
+/* ── Top bar ── */
+#topbar{background:#111;border-bottom:1px solid #222;flex-shrink:0}
+#bar-main{padding:10px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+#bar-main h1{font-size:14px;color:#f90;font-weight:700;letter-spacing:.5px;white-space:nowrap}
+#bar-main select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:6px 10px;font-size:13px;min-width:240px;cursor:pointer}
+#bar-main select:focus{border-color:#f90;outline:none}
+#bar-main select optgroup{color:#888;font-style:normal;font-weight:600;font-size:11px}
+.bar-actions{display:flex;gap:6px;margin-left:auto;align-items:center}
+.bar-btn{background:none;border:1px solid #333;color:#888;border-radius:5px;padding:3px 9px;font-size:11px;cursor:pointer}
+.bar-btn:hover{border-color:#666;color:#ccc}
+.dot{width:7px;height:7px;border-radius:50%;background:#444;display:inline-block}
+.dot.ok{background:#4a4}.dot.busy{background:#f90;animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.4}}
+#status-text{font-size:11px;color:#555}
+
+/* ── Info strip ── */
+#info-strip{display:none;padding:6px 20px;background:#0d0d0d;border-bottom:1px solid #1a1a1a;font-size:11px;color:#555;overflow-x:auto;white-space:nowrap}
+#info-strip .tag{display:inline-block;padding:2px 8px;margin-right:6px;border-radius:4px;border:1px solid #222;background:#111}
+#info-strip .tag b{color:#888;font-weight:600}
+#info-strip .tag .val{color:#aaa}
+#info-strip .tag.pool{border-color:#2a2a3a}
+#info-strip .tag.preset{border-color:#3a2a1a}
+#info-strip .tag.provider{border-color:#1a2a1a}
+#info-strip .tag.exhausted{border-color:#4a1a1a;color:#a66}
+
+/* ── Chat ── */
 #chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
-.msg{max-width:80%;padding:12px 16px;border-radius:14px;line-height:1.6;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
-.msg.user{align-self:flex-end;background:#1a3a5c;color:#cde;border-bottom-right-radius:4px}
-.msg.assistant{align-self:flex-start;background:#151515;border:1px solid #222;border-bottom-left-radius:4px}
-.msg .meta{font-size:11px;color:#555;margin-top:8px;border-top:1px solid #222;padding-top:6px}
+.msg{max-width:82%;border-radius:14px;line-height:1.6;font-size:14px;word-wrap:break-word;overflow:hidden}
+.msg.user{align-self:flex-end;background:#1a3a5c;color:#cde;border-bottom-right-radius:4px;padding:12px 16px;white-space:pre-wrap}
+.msg.assistant{align-self:flex-start;background:#151515;border:1px solid #222;border-bottom-left-radius:4px;padding:0}
+.msg .md-body{padding:12px 16px}
+.msg .meta{font-size:11px;color:#555;padding:6px 16px;border-top:1px solid #222;background:#0d0d0d;display:flex;gap:12px;flex-wrap:wrap;border-radius:0 0 0 14px}
+.msg .meta .provider-tag{color:#f90}
 .welcome{text-align:center;color:#444;padding:60px 20px;font-size:14px;line-height:2}
 .welcome h2{color:#f90;font-size:18px;margin-bottom:8px;font-weight:600}
-#input-area{border-top:1px solid #222;padding:12px 20px;display:flex;gap:10px;flex-shrink:0;background:#111}
+
+/* ── Thinking indicator ── */
+.thinking{padding:12px 16px;display:flex;align-items:center;gap:8px;color:#888;font-size:13px}
+.thinking .dots{display:flex;gap:4px}
+.thinking .dots span{width:6px;height:6px;border-radius:50%;background:#f90;animation:pulse 1.4s infinite}
+.thinking .dots span:nth-child(2){animation-delay:.2s}
+.thinking .dots span:nth-child(3){animation-delay:.4s}
+@keyframes pulse{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
+
+/* ── Markdown styles ── */
+.md-body p{margin:0 0 8px}
+.md-body p:last-child{margin:0}
+.md-body code{background:#0d0d0d;padding:1px 5px;border-radius:3px;font-size:13px;font-family:"SF Mono",Menlo,monospace}
+.md-body pre{background:#0d0d0d;padding:12px;border-radius:8px;overflow-x:auto;margin:8px 0;border:1px solid #222}
+.md-body pre code{background:none;padding:0;font-size:13px}
+.md-body ul,.md-body ol{margin:4px 0 4px 20px}
+.md-body blockquote{border-left:3px solid #333;padding-left:12px;margin:4px 0;color:#999}
+.md-body h1,.md-body h2,.md-body h3{margin:8px 0 4px;color:#ddd}
+.md-body h1{font-size:18px} .md-body h2{font-size:16px} .md-body h3{font-size:14px}
+.md-body table{border-collapse:collapse;margin:8px 0}
+.md-body td,.md-body th{border:1px solid #333;padding:4px 8px;font-size:13px}
+.md-body th{background:#1a1a1a}
+.md-body a{color:#6af}
+.md-body strong{color:#eee}
+
+/* ── Input ── */
+#input-area{border-top:1px solid #222;padding:10px 20px;display:flex;gap:10px;flex-shrink:0;background:#111}
 #input-area textarea{flex:1;background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:10px;padding:10px 14px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:140px;line-height:1.5}
 #input-area textarea:focus{outline:none;border-color:#f90}
+#input-area textarea:disabled{opacity:.5}
 #input-area button{background:#f90;color:#000;border:none;border-radius:10px;padding:0 22px;font-weight:700;cursor:pointer;font-size:14px;transition:background .15s}
 #input-area button:hover{background:#fa0}
 #input-area button:disabled{opacity:.3;cursor:default}
-.clear-btn{background:none;border:1px solid #333;color:#666;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;margin-left:4px}
-.clear-btn:hover{border-color:#666;color:#aaa}
 </style>
 </head><body>
-<header>
-  <h1>LEELOO DALLAS MULTI PASS</h1>
-  <select id="model-select"><option>Loading...</option></select>
-  <button class="clear-btn" onclick="clearChat()">Clear</button>
-  <span class="status"><span class="dot" id="dot"></span><span id="status">loading...</span></span>
-</header>
+
+<div id="topbar">
+  <div id="bar-main">
+    <h1>LEELOO DALLAS MULTI PASS</h1>
+    <select id="model-select"><option>Loading...</option></select>
+    <div class="bar-actions">
+      <button class="bar-btn" onclick="clearChat()">Clear</button>
+      <button class="bar-btn" onclick="toggleInfo()">Config</button>
+      <span class="dot" id="dot"></span>
+      <span id="status-text">loading...</span>
+    </div>
+  </div>
+  <div id="info-strip"></div>
+</div>
+
 <div id="chat">
   <div class="welcome">
     <h2>LEELOO DALLAS MULTI PASS</h2>
@@ -1103,28 +1157,62 @@ header select option{color:#e0e0e0;padding:4px}
     Requests route through your multi-pass pools with automatic failover.
   </div>
 </div>
+
 <div id="input-area">
-  <textarea id="input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" autofocus></textarea>
+  <textarea id="input" rows="1" placeholder="Type a message... (Enter to send)" autofocus></textarea>
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
+
 <script>
 const BASE = location.origin;
 const chat = document.getElementById("chat");
 const input = document.getElementById("input");
 const sel = document.getElementById("model-select");
 const sendBtn = document.getElementById("send");
-const statusEl = document.getElementById("status");
-const dot = document.getElementById("dot");
+const statusEl = document.getElementById("status-text");
+const dotEl = document.getElementById("dot");
+const infoStrip = document.getElementById("info-strip");
 let messages = [];
 let streaming = false;
+let infoVisible = false;
 
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
 
+function setStatus(state, text) {
+  statusEl.textContent = text;
+  dotEl.className = "dot " + (state === "ready" ? "ok" : state === "busy" ? "busy" : "");
+}
+
+// ── Load config info ──
+async function loadInfo() {
+  try {
+    const h = await (await fetch(BASE + "/health")).json();
+    const tags = [];
+    for (const p of (h.pools || [])) {
+      tags.push('<span class="tag pool"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.strategy) + ' (' + p.members.length + ')</span></span>');
+    }
+    for (const p of (h.presets || [])) {
+      tags.push('<span class="tag preset"><b>' + esc(p.name) + '</b> <span class="val">' + esc(p.entries.join(" > ")) + '</span></span>');
+    }
+    for (const p of (h.providers || [])) {
+      const exh = (h.exhausted || []).includes(p);
+      tags.push('<span class="tag provider' + (exh ? " exhausted" : "") + '"><b>' + esc(p) + '</b>' + (exh ? ' <span class="val">exhausted</span>' : ' <span class="val">ok</span>') + '</span>');
+    }
+    infoStrip.innerHTML = tags.join("");
+  } catch {}
+}
+
+function toggleInfo() {
+  infoVisible = !infoVisible;
+  infoStrip.style.display = infoVisible ? "block" : "none";
+  if (infoVisible) loadInfo();
+}
+
+// ── Load routing ──
 async function loadRouting() {
   try {
-    const resp = await fetch(BASE + "/v1/routing");
-    const data = await resp.json();
+    const data = await (await fetch(BASE + "/v1/routing")).json();
     sel.innerHTML = "";
     let count = 0;
     for (const group of (data.groups || [])) {
@@ -1144,44 +1232,50 @@ async function loadRouting() {
   } catch (e) { setStatus("error", e.message); }
 }
 
-function setStatus(state, text) {
-  statusEl.textContent = text;
-  dot.className = "dot " + (state === "ready" ? "ok" : state === "busy" ? "busy" : "");
+function clearChat() {
+  messages = [];
+  chat.innerHTML = '<div class="welcome"><h2>LEELOO DALLAS MULTI PASS</h2>Chat cleared.</div>';
 }
 
-function clearChat() { messages = []; chat.innerHTML = '<div class="welcome"><h2>LEELOO DALLAS MULTI PASS</h2>Chat cleared.</div>'; }
-
-function addMessage(role, content, meta) {
-  // Remove welcome message
-  const w = chat.querySelector(".welcome"); if (w) w.remove();
-  const div = document.createElement("div");
-  div.className = "msg " + role;
-  div.innerHTML = esc(content) + (meta ? '<div class="meta">' + esc(meta) + '</div>' : '');
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-  return div;
-}
-
-function esc(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
 async function sendMessage() {
   const text = input.value.trim();
   if (!text || streaming) return;
   input.value = ""; input.style.height = "auto";
   messages.push({ role: "user", content: text });
-  addMessage("user", text);
-  streaming = true; sendBtn.disabled = true;
-  setStatus("busy", "streaming...");
 
-  const div = addMessage("assistant", "");
+  // Remove welcome
+  const w = chat.querySelector(".welcome"); if (w) w.remove();
+
+  // User bubble
+  const userDiv = document.createElement("div");
+  userDiv.className = "msg user";
+  userDiv.textContent = text;
+  chat.appendChild(userDiv);
+
+  // Assistant bubble with thinking indicator
+  const msgDiv = document.createElement("div");
+  msgDiv.className = "msg assistant";
+  msgDiv.innerHTML = '<div class="thinking"><div class="dots"><span></span><span></span><span></span></div>Thinking...</div>';
+  chat.appendChild(msgDiv);
+  chat.scrollTop = chat.scrollHeight;
+
+  streaming = true; sendBtn.disabled = true; input.disabled = true;
+  setStatus("busy", "connecting...");
+
   let full = "";
+  let gotFirstToken = false;
+  let smdParser = null;
+  let mdBody = null;
   const t0 = Date.now();
+  const selectedModel = sel.value;
 
   try {
     const resp = await fetch(BASE + "/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: sel.value, messages, stream: true }),
+      body: JSON.stringify({ model: selectedModel, messages, stream: true }),
     });
 
     if (!resp.ok) {
@@ -1191,7 +1285,7 @@ async function sendMessage() {
 
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", usage = null;
+    let buf = "", usage = null, routedProvider = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1206,30 +1300,70 @@ async function sendMessage() {
         try {
           const j = JSON.parse(p);
           const d = j.choices?.[0]?.delta;
-          if (d?.content) { full += d.content; div.innerHTML = esc(full); chat.scrollTop = chat.scrollHeight; }
-          if (d?.tool_calls) { const tc = d.tool_calls[0]; full += "[tool: " + (tc?.function?.name || "?") + "(" + (tc?.function?.arguments || "") + ")]"; div.innerHTML = esc(full); }
+
+          if (d?.content) {
+            if (!gotFirstToken) {
+              gotFirstToken = true;
+              mdBody = document.createElement("div");
+              mdBody.className = "md-body";
+              msgDiv.innerHTML = "";
+              msgDiv.appendChild(mdBody);
+              smdParser = smd.parser(smd.default_renderer(mdBody));
+              setStatus("busy", "receiving...");
+            }
+            full += d.content;
+            smd.parser_write(smdParser, d.content);
+            chat.scrollTop = chat.scrollHeight;
+          }
+
+          if (d?.tool_calls) {
+            if (!gotFirstToken) {
+              gotFirstToken = true;
+              mdBody = document.createElement("div");
+              mdBody.className = "md-body";
+              msgDiv.innerHTML = "";
+              msgDiv.appendChild(mdBody);
+              smdParser = smd.parser(smd.default_renderer(mdBody));
+            }
+            const tc = d.tool_calls[0];
+            const tcText = "\\n**Tool call:** \`" + (tc?.function?.name || "?") + "\`\\n";
+            full += tcText;
+            smd.parser_write(smdParser, tcText);
+          }
+
           if (j.usage) usage = j.usage;
+          if (j.model && !routedProvider) routedProvider = j.model;
+
           if (j.choices?.[0]?.finish_reason) {
+            if (smdParser) smd.parser_end(smdParser);
             const ms = Date.now() - t0;
-            const parts = [sel.value];
+            const meta = document.createElement("div");
+            meta.className = "meta";
+            const parts = [];
+            parts.push('<span class="provider-tag">' + esc(selectedModel) + '</span>');
             if (usage) parts.push(usage.prompt_tokens + " in / " + usage.completion_tokens + " out");
-            parts.push(ms + "ms");
-            div.innerHTML = esc(full) + '<div class="meta">' + esc(parts.join(" | ")) + '</div>';
+            parts.push((ms / 1000).toFixed(1) + "s");
+            meta.innerHTML = parts.join('<span style="color:#333">|</span>');
+            msgDiv.appendChild(meta);
           }
         } catch {}
       }
     }
     messages.push({ role: "assistant", content: full });
   } catch (e) {
-    div.innerHTML = '<span style="color:#f44">' + esc("[Error: " + e.message + "]") + '</span>';
+    msgDiv.innerHTML = '<div class="md-body" style="color:#f44;padding:12px 16px">[Error: ' + esc(e.message) + ']</div>';
   }
-  streaming = false; sendBtn.disabled = false;
+
+  streaming = false; sendBtn.disabled = false; input.disabled = false;
+  input.focus();
   setStatus("ready", "done");
+  if (infoVisible) loadInfo(); // refresh exhausted state
 }
 
 loadRouting();
 </script>
 </body></html>`;
+
 
 // ─── Server ───────────────────────────────────────────────────────────────────
 
