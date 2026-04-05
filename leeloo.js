@@ -195,6 +195,143 @@ function getScheduledOrder(pool, available) {
 	return [...preferred, ...defaults, ...overflow].map((x) => x.prov);
 }
 
+// ─── Quota checkers (ported from extension) ──────────────────────────────────
+
+const CODEX_USAGE_URL = process.env.CHATGPT_BASE_URL || "https://chatgpt.com/backend-api";
+const GEMINI_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const ANTIGRAVITY_QUOTA_URLS = [
+	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+];
+
+function decodeJwtPayload(token) {
+	try {
+		const parts = token.split(".");
+		if (parts.length < 2) return {};
+		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+	} catch { return {}; }
+}
+
+/** Check Codex (ChatGPT) quota. Returns 0-100 remaining percentage or null. */
+async function checkCodexQuota(provider) {
+	const cred = authStorage.get(provider);
+	if (!cred || cred.type !== "oauth" || !cred.access) return null;
+
+	const apiKey = await authStorage.getApiKey(provider);
+	if (!apiKey) return null;
+
+	// Extract account ID from JWT or stored credential
+	const payload = decodeJwtPayload(apiKey);
+	const authClaim = payload["https://api.openai.com/auth"];
+	const accountId = cred.accountId || authClaim?.chatgpt_account_id;
+
+	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
+	if (accountId) headers["chatgpt-account-id"] = accountId;
+
+	try {
+		const resp = await fetch(`${CODEX_USAGE_URL.replace(/\/+$/, "")}/wham/usage`, { headers });
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		const rl = data?.rate_limit;
+		const windows = [rl?.primary_window, rl?.secondary_window]
+			.filter(Boolean)
+			.map((w) => Math.max(0, 100 - (w.used_percent || 0)));
+		return windows.length > 0 ? Math.min(...windows) : null;
+	} catch { return null; }
+}
+
+/** Check Google Gemini CLI quota. Returns 0-100 remaining percentage or null. */
+async function checkGeminiQuota(provider) {
+	const apiKey = await authStorage.getApiKey(provider);
+	if (!apiKey) return null;
+
+	let token;
+	try { const p = JSON.parse(apiKey); token = p.token; } catch { token = apiKey; }
+
+	try {
+		const resp = await fetch(GEMINI_QUOTA_URL, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+				"User-Agent": "google-api-nodejs-client/9.15.1",
+				"X-Goog-Api-Client": "gl-node/22.17.0",
+			},
+			body: "{}",
+		});
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		const fractions = (data?.buckets || [])
+			.map((b) => b?.remainingFraction)
+			.filter((f) => typeof f === "number")
+			.map((f) => Math.round(f * 100));
+		return fractions.length > 0 ? Math.min(...fractions) : null;
+	} catch { return null; }
+}
+
+/** Check Google Antigravity quota. Returns 0-100 remaining percentage or null. */
+async function checkAntigravityQuota(provider) {
+	const apiKey = await authStorage.getApiKey(provider);
+	if (!apiKey) return null;
+
+	let token;
+	try { const p = JSON.parse(apiKey); token = p.token; } catch { token = apiKey; }
+
+	for (const url of ANTIGRAVITY_QUOTA_URLS) {
+		try {
+			const resp = await fetch(url, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+					"User-Agent": "antigravity/1.11.9 windows/amd64",
+					"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+				},
+				body: "{}",
+			});
+			if (!resp.ok) continue;
+			const data = await resp.json();
+			const models = data?.models ? Object.values(data.models) : [];
+			const fractions = models
+				.filter((m) => !m.isInternal)
+				.map((m) => m?.quotaInfo?.remainingFraction)
+				.filter((f) => typeof f === "number")
+				.map((f) => Math.round(f * 100));
+			return fractions.length > 0 ? Math.min(...fractions) : null;
+		} catch { continue; }
+	}
+	return null;
+}
+
+/** Get remaining quota score (0-100) for a provider. null = unknown. */
+async function checkQuota(provider) {
+	const base = getBaseProvider(provider);
+	switch (base) {
+		case "openai-codex": return checkCodexQuota(provider);
+		case "google-gemini-cli": return checkGeminiQuota(provider);
+		case "google-antigravity": return checkAntigravityQuota(provider);
+		default: return null;
+	}
+}
+
+/** Sort providers by quota (best first). Providers with unknown quota go last. */
+async function sortByQuota(providers) {
+	const results = await Promise.all(
+		providers.map(async (prov) => ({ prov, score: await checkQuota(prov) })),
+	);
+	results.sort((a, b) => {
+		if (a.score === null && b.score === null) return 0;
+		if (a.score === null) return 1;
+		if (b.score === null) return -1;
+		return b.score - a.score;
+	});
+	const best = results[0];
+	if (best?.score !== null) {
+		log(`[quota-first] scores: ${results.map((r) => `${r.prov}=${r.score ?? "?"}%`).join(", ")}`);
+	}
+	return results.map((r) => r.prov);
+}
+
 // ─── Custom selector script loader ────────────────────────────────────────────
 
 const selectorCache = new Map();
@@ -309,10 +446,12 @@ async function resolveCandidates(modelId) {
 				log(`[pool:${pool.name}] custom: selector chose ${best}`);
 			}
 		}
-		// quota-first: would need provider-specific quota APIs (Codex, Google).
-		// Fall back to pool member order -- the extension's quota checkers
-		// aren't available outside pi's runtime, but rate-limit failover
-		// still rotates through all members.
+		if (strategy === "quota-first") {
+			memberOrder = await sortByQuota(poolMembers);
+			if (memberOrder.length > 0) {
+				log(`[pool:${pool.name}] quota-first: ${memberOrder[0]} preferred`);
+			}
+		}
 
 		for (const member of memberOrder) {
 			const match = raw.find((c) => c.provider === member);
@@ -855,6 +994,175 @@ function readBody(req) {
 function json() { return { "Content-Type": "application/json" }; }
 function log(...a) { console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a); }
 
+// ─── Chat UI ──────────────────────────────────────────────────────────────────
+
+function handleUI(req, res) {
+	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+	res.end(CHAT_UI_HTML);
+}
+
+const CHAT_UI_HTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leeloo Dallas Multi Pass</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
+header{background:#111;border-bottom:1px solid #222;padding:12px 20px;display:flex;align-items:center;gap:16px;flex-shrink:0}
+header h1{font-size:16px;color:#f90;font-weight:600;white-space:nowrap}
+header select{background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:6px 12px;font-size:13px;min-width:200px}
+header .status{margin-left:auto;font-size:12px;color:#666}
+#chat{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:85%;padding:10px 14px;border-radius:12px;line-height:1.5;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
+.msg.user{align-self:flex-end;background:#1a3a5c;color:#cde;border-bottom-right-radius:4px}
+.msg.assistant{align-self:flex-start;background:#1a1a1a;border:1px solid #222;border-bottom-left-radius:4px}
+.msg .meta{font-size:11px;color:#666;margin-top:6px}
+.msg code{background:#0d0d0d;padding:1px 4px;border-radius:3px;font-size:13px}
+.msg pre{background:#0d0d0d;padding:8px;border-radius:6px;overflow-x:auto;margin:6px 0}
+.msg pre code{background:none;padding:0}
+#input-area{border-top:1px solid #222;padding:12px 20px;display:flex;gap:10px;flex-shrink:0;background:#111}
+#input-area textarea{flex:1;background:#1a1a1a;color:#e0e0e0;border:1px solid #333;border-radius:8px;padding:10px 14px;font-size:14px;font-family:inherit;resize:none;min-height:44px;max-height:120px}
+#input-area textarea:focus{outline:none;border-color:#f90}
+#input-area button{background:#f90;color:#000;border:none;border-radius:8px;padding:0 20px;font-weight:600;cursor:pointer;font-size:14px}
+#input-area button:hover{background:#fa0}
+#input-area button:disabled{opacity:.4;cursor:default}
+.typing{color:#888;font-style:italic;font-size:13px;padding:4px 14px}
+</style>
+</head><body>
+<header>
+  <h1>LEELOO DALLAS MULTI PASS</h1>
+  <select id="model-select"><option>Loading...</option></select>
+  <span class="status" id="status">connecting...</span>
+</header>
+<div id="chat"></div>
+<div id="input-area">
+  <textarea id="input" rows="1" placeholder="Type a message..." autofocus></textarea>
+  <button id="send" onclick="sendMessage()">Send</button>
+</div>
+<script>
+const BASE = location.origin;
+const chat = document.getElementById("chat");
+const input = document.getElementById("input");
+const modelSelect = document.getElementById("model-select");
+const sendBtn = document.getElementById("send");
+const statusEl = document.getElementById("status");
+let messages = [];
+let streaming = false;
+
+// Auto-resize textarea
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 120) + "px";
+});
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// Load models
+async function loadModels() {
+  try {
+    const resp = await fetch(BASE + "/v1/models");
+    const data = await resp.json();
+    modelSelect.innerHTML = "";
+    const models = data.data || [];
+    // Group: presets first, then by provider
+    const presets = models.filter(m => m.owned_by === "pi-multi-pass");
+    const regular = models.filter(m => m.owned_by !== "pi-multi-pass");
+    if (presets.length > 0) {
+      const og = document.createElement("optgroup");
+      og.label = "Presets";
+      presets.forEach(m => { const o = document.createElement("option"); o.value = m.id; o.textContent = m.id; og.appendChild(o); });
+      modelSelect.appendChild(og);
+    }
+    // Group by provider
+    const byProvider = {};
+    regular.forEach(m => { (byProvider[m.owned_by] = byProvider[m.owned_by] || []).push(m); });
+    for (const [prov, pmodels] of Object.entries(byProvider)) {
+      const og = document.createElement("optgroup");
+      og.label = prov;
+      pmodels.forEach(m => { const o = document.createElement("option"); o.value = m.id; o.textContent = m.id; og.appendChild(o); });
+      modelSelect.appendChild(og);
+    }
+    statusEl.textContent = models.length + " models";
+  } catch (e) { statusEl.textContent = "error: " + e.message; }
+}
+
+function addMessage(role, content, meta) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.innerHTML = escapeHtml(content) + (meta ? '<div class="meta">' + escapeHtml(meta) + '</div>' : '');
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || streaming) return;
+  input.value = ""; input.style.height = "auto";
+  messages.push({ role: "user", content: text });
+  addMessage("user", text);
+  streaming = true; sendBtn.disabled = true;
+  statusEl.textContent = "streaming...";
+
+  const assistantDiv = addMessage("assistant", "");
+  let fullText = "";
+
+  try {
+    const resp = await fetch(BASE + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelSelect.value,
+        messages: messages,
+        stream: true,
+      }),
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let usage = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const delta = parsed.choices?.[0]?.delta;
+          if (delta?.content) { fullText += delta.content; assistantDiv.innerHTML = escapeHtml(fullText); chat.scrollTop = chat.scrollHeight; }
+          if (delta?.tool_calls) { fullText += "[tool_call: " + (delta.tool_calls[0]?.function?.name || "?") + "]"; assistantDiv.innerHTML = escapeHtml(fullText); }
+          if (parsed.usage) usage = parsed.usage;
+          const fr = parsed.choices?.[0]?.finish_reason;
+          if (fr) {
+            const meta = (usage ? "tokens: " + usage.prompt_tokens + " in / " + usage.completion_tokens + " out" : "") + " | model: " + modelSelect.value;
+            assistantDiv.innerHTML = escapeHtml(fullText) + '<div class="meta">' + escapeHtml(meta) + '</div>';
+          }
+        } catch {}
+      }
+    }
+    messages.push({ role: "assistant", content: fullText });
+  } catch (e) {
+    assistantDiv.innerHTML = escapeHtml("[Error: " + e.message + "]");
+  }
+  streaming = false; sendBtn.disabled = false;
+  statusEl.textContent = "ready";
+}
+
+loadModels();
+</script>
+</body></html>`;
+
 // ─── Server ───────────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -868,6 +1176,7 @@ const server = createServer(async (req, res) => {
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
 		else if (path === "/health" && req.method === "GET") handleHealth(req, res);
+		else if (path === "/ui" || path === "/") handleUI(req, res);
 		else { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Not found" } })); }
 	} catch (err) {
 		log("Unhandled:", err?.message || err);
@@ -898,7 +1207,9 @@ server.listen(PORT, () => {
   POST /v1/chat/completions   (streaming, tools, images, failover)
   GET  /v1/models             (all models + preset names)
   GET  /health
+  GET  /ui                    Chat UI
 
   OPENAI_BASE_URL=http://localhost:${PORT}/v1
+  Chat UI: http://localhost:${PORT}/ui
 `);
 });
