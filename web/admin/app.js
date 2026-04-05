@@ -314,6 +314,88 @@ function PresetEditor({ presets, onSave }) {
   </div>`;
 }
 
+// ── Auth / OAuth ──
+
+function AuthPanel({ onRefresh }) {
+  const [providers, setProviders] = useState([]);
+  const [busy, setBusy] = useState({});
+  const [polling, setPolling] = useState({});
+
+  async function loadProviders() {
+    try { const d = await api("/v1/auth/providers"); setProviders(d.providers || []); } catch {}
+  }
+  useEffect(() => { loadProviders(); }, []);
+
+  async function startLogin(providerId) {
+    setBusy((b) => ({ ...b, [providerId]: "connecting..." }));
+    try {
+      const res = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`, { method: "POST" });
+      if (res.authUrl) {
+        window.open(res.authUrl, "_blank");
+        setBusy((b) => ({ ...b, [providerId]: "waiting for browser..." }));
+        // Poll for completion
+        setPolling((p) => ({ ...p, [providerId]: true }));
+        pollLogin(providerId);
+      }
+    } catch (e) {
+      setBusy((b) => ({ ...b, [providerId]: `error: ${e.message}` }));
+      setTimeout(() => setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; }), 3000);
+    }
+  }
+
+  async function pollLogin(providerId) {
+    for (let i = 0; i < 120; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const s = await api(`/v1/auth/login/${encodeURIComponent(providerId)}`);
+        if (s.status === "authenticated" || s.hasAuth) {
+          setBusy((b) => { const n = { ...b }; delete n[providerId]; return n; });
+          setPolling((p) => { const n = { ...p }; delete n[providerId]; return n; });
+          await loadProviders();
+          if (onRefresh) onRefresh();
+          return;
+        }
+      } catch {}
+    }
+    setBusy((b) => ({ ...b, [providerId]: "timed out" }));
+    setPolling((p) => { const n = { ...p }; delete n[providerId]; return n; });
+  }
+
+  async function logout(providerId) {
+    if (!confirm(`Logout from ${providerId}?`)) return;
+    try {
+      await api(`/v1/auth/logout/${encodeURIComponent(providerId)}`, { method: "POST" });
+      await loadProviders();
+      if (onRefresh) onRefresh();
+    } catch {}
+  }
+
+  return html`<div>
+    <h2>OAuth accounts</h2>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Login to providers to enable routing. OAuth tokens stored in ~/.pi/agent/auth.json</div>
+    ${providers.map((p) => html`
+      <div className="card" key=${p.id}>
+        <div className="card-row">
+          <div>
+            <span className="name">${p.name}</span>
+            <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${p.id}</span>
+            <span className=${`badge ${p.authenticated ? "on" : "off"}`}>${p.authenticated ? "logged in" : "not logged in"}</span>
+          </div>
+          <div className="actions">
+            ${busy[p.id]
+              ? html`<span style=${{ fontSize: "12px", color: "#f59e0b" }}>${busy[p.id]}</span>`
+              : html`
+                ${!p.authenticated ? html`<button className="btn primary" onClick=${() => startLogin(p.id)}>Login</button>` : null}
+                ${p.authenticated ? html`<button className="btn danger" onClick=${() => logout(p.id)}>Logout</button>` : null}
+              `}
+          </div>
+        </div>
+      </div>
+    `)}
+    ${providers.length === 0 ? html`<div className="empty">Loading providers...</div>` : null}
+  </div>`;
+}
+
 function ConfigPanel({ onRefresh }) {
   const [config, setConfig] = useState(null);
   const [err, setErr] = useState("");
@@ -327,6 +409,8 @@ function ConfigPanel({ onRefresh }) {
 
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
+    <${AuthPanel} onRefresh=${refresh} />
+    <div style=${{ marginTop: "24px" }} />
     <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ~/.pi/agent/multi-pass.json</div>
     <${SubEditor} subs=${config.subscriptions || []} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />

@@ -948,6 +948,119 @@ function handleSubDelete(req, res, subName) {
 	res.end(JSON.stringify({ deleted: subName }));
 }
 
+// ─── Auth / OAuth API ─────────────────────────────────────────────────────────
+
+const pendingLogins = new Map(); // provider -> { resolve, reject, authUrl, status }
+
+function handleAuthProviders(req, res) {
+	const provs = authStorage.getOAuthProviders();
+	const authed = getAllProviders();
+	const result = provs.map((p) => ({
+		id: p.id,
+		name: p.name,
+		authenticated: authed.includes(p.id) && authStorage.hasAuth(p.id),
+	}));
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ providers: result }));
+}
+
+function handleAuthStatus(req, res) {
+	const providerList = getAllProviders();
+	const result = {};
+	for (const p of providerList) {
+		result[p] = { hasAuth: authStorage.hasAuth(p), label: getProviderLabel(p) };
+	}
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ status: result }));
+}
+
+async function handleAuthLogin(req, res, providerId) {
+	// Check if already logging in
+	if (pendingLogins.has(providerId)) {
+		const pending = pendingLogins.get(providerId);
+		if (pending.authUrl) {
+			res.writeHead(200, json());
+			res.end(JSON.stringify({ status: "pending", authUrl: pending.authUrl, message: "Login already in progress. Open the URL to complete." }));
+			return;
+		}
+	}
+
+	log(`[auth] starting OAuth login for ${providerId}`);
+
+	let authUrl = null;
+	let loginResolve, loginReject;
+	const loginPromise = new Promise((resolve, reject) => { loginResolve = resolve; loginReject = reject; });
+
+	pendingLogins.set(providerId, { authUrl: null, status: "starting" });
+
+	// Start login in background
+	authStorage.login(providerId, {
+		onAuth(info) {
+			const url = typeof info === "string" ? info : info?.url || info;
+			authUrl = url;
+			const pending = pendingLogins.get(providerId);
+			if (pending) { pending.authUrl = url; pending.status = "waiting"; }
+			log(`[auth] ${providerId} auth URL ready`);
+		},
+		onPrompt(msg) { log(`[auth] ${providerId} prompt: ${msg}`); },
+		onProgress(msg) { log(`[auth] ${providerId} progress: ${msg}`); },
+		onManualCodeInput() {
+			// Return a promise that never resolves -- we rely on the callback server
+			return new Promise(() => {});
+		},
+		signal: undefined,
+	}).then(() => {
+		log(`[auth] ${providerId} login successful`);
+		pendingLogins.delete(providerId);
+		loginResolve({ success: true });
+	}).catch((err) => {
+		log(`[auth] ${providerId} login failed: ${err.message}`);
+		pendingLogins.delete(providerId);
+		loginReject(err);
+	});
+
+	// Wait for authUrl to be available (max 10s)
+	const t0 = Date.now();
+	while (!authUrl && Date.now() - t0 < 10000) {
+		await new Promise((r) => setTimeout(r, 100));
+	}
+
+	if (!authUrl) {
+		pendingLogins.delete(providerId);
+		res.writeHead(500, json());
+		res.end(JSON.stringify({ error: { message: "Timed out waiting for auth URL" } }));
+		return;
+	}
+
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ status: "pending", authUrl, message: "Open the URL to complete OAuth login." }));
+}
+
+function handleAuthLoginStatus(req, res, providerId) {
+	const pending = pendingLogins.get(providerId);
+	if (pending) {
+		res.writeHead(200, json());
+		res.end(JSON.stringify({ status: pending.status, authUrl: pending.authUrl }));
+		return;
+	}
+	// Check if now authenticated
+	const hasAuth = authStorage.hasAuth(providerId);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ status: hasAuth ? "authenticated" : "not_authenticated", hasAuth }));
+}
+
+async function handleAuthLogout(req, res, providerId) {
+	try {
+		authStorage.remove(providerId);
+		log(`[auth] ${providerId} logged out`);
+		res.writeHead(200, json());
+		res.end(JSON.stringify({ status: "logged_out", provider: providerId }));
+	} catch (e) {
+		res.writeHead(500, json());
+		res.end(JSON.stringify({ error: { message: e.message } }));
+	}
+}
+
 function handleAuditLog(req, res) {
 	const url = new URL(req.url, `http://localhost:${PORT}`);
 	const limit = parseInt(url.searchParams.get("limit") || "100", 10);
@@ -1954,6 +2067,11 @@ const server = createServer(async (req, res) => {
 		else if (path.startsWith("/v1/rules/") && req.method === "PUT") await handleRulesUpdate(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
 		else if (path.startsWith("/v1/rules/") && req.method === "DELETE") handleRulesDelete(req, res, decodeURIComponent(path.split("/v1/rules/")[1]));
 		else if (path === "/v1/audit" && req.method === "GET") handleAuditLog(req, res);
+		else if (path === "/v1/auth/providers" && req.method === "GET") handleAuthProviders(req, res);
+		else if (path === "/v1/auth/status" && req.method === "GET") handleAuthStatus(req, res);
+		else if (path.startsWith("/v1/auth/login/") && req.method === "POST") await handleAuthLogin(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
+		else if (path.startsWith("/v1/auth/login/") && req.method === "GET") handleAuthLoginStatus(req, res, decodeURIComponent(path.split("/v1/auth/login/")[1]));
+		else if (path.startsWith("/v1/auth/logout/") && req.method === "POST") await handleAuthLogout(req, res, decodeURIComponent(path.split("/v1/auth/logout/")[1]));
 		else if (path === "/v1/config" && req.method === "GET") handleConfigGet(req, res);
 		else if (path === "/v1/config" && req.method === "PUT") await handleConfigPut(req, res);
 		else if (path === "/v1/config/pools" && req.method === "GET") await handlePoolsGet(req, res);
