@@ -390,6 +390,43 @@ function tryGetModel(providerName, modelId) {
 async function resolveCandidates(modelId) {
 	const config = loadConfig();
 
+	// ── 0. Pool-scoped: "pool:<name>/<model>" ──
+	const poolMatch = modelId.match(/^pool:([^/]+)\/(.+)$/);
+	if (poolMatch) {
+		const [, poolName, actualModel] = poolMatch;
+		const pool = config.pools.find((p) => p.name === poolName && p.enabled);
+		if (!pool) return [];
+		const candidates = [];
+		const members = pool.members.filter((m) => isAvailable(m));
+
+		// Apply pool strategy
+		const strategy = pool.strategy || "round-robin";
+		let ordered = members;
+		if (strategy === "scheduled" && pool.memberSchedule) {
+			ordered = getScheduledOrder(pool, members);
+		} else if (strategy === "custom" && pool.selectorScript) {
+			const best = await runCustomSelector(pool, members, "", actualModel);
+			if (best) ordered = [best, ...members.filter((m) => m !== best)];
+		} else if (strategy === "quota-first") {
+			ordered = await sortByQuota(members);
+		}
+
+		for (const member of ordered) {
+			const m = tryGetModel(member, actualModel);
+			if (m) candidates.push({ model: m, provider: member, modelId: actualModel });
+		}
+		return candidates;
+	}
+
+	// ── 0b. Provider-scoped: "provider:<name>/<model>" ──
+	const provMatch = modelId.match(/^provider:([^/]+)\/(.+)$/);
+	if (provMatch) {
+		const [, provName, actualModel] = provMatch;
+		if (!isAvailable(provName)) return [];
+		const m = tryGetModel(provName, actualModel);
+		return m ? [{ model: m, provider: provName, modelId: actualModel }] : [];
+	}
+
 	// ── 1. Preset resolution ──
 	const preset = config.presets.find(
 		(p) => p.enabled && p.name.toLowerCase() === modelId.toLowerCase(),
@@ -975,7 +1012,7 @@ function handleRouting(req, res) {
 		});
 	}
 
-	// Pools -- show models available from each pool's base provider
+	// Pools -- models scoped to pool via "pool:<name>/<model>" ID
 	for (const pool of config.pools) {
 		if (!pool.enabled) continue;
 		try {
@@ -985,15 +1022,15 @@ function handleRouting(req, res) {
 			groups.push({
 				label: `${pool.name} [${pool.strategy || "round-robin"}] (${available.length} members)`,
 				items: models.map((m) => ({
-					id: m.id,
+					id: `pool:${pool.name}/${m.id}`,
 					name: m.id,
-					detail: `${pool.baseProvider} via ${available.join(", ")}`,
+					detail: `via ${available.join(", ")}`,
 				})),
 			});
 		} catch { /* skip */ }
 	}
 
-	// Non-pool providers (authenticated but not in any pool)
+	// Non-pool providers scoped via "provider:<name>/<model>" ID
 	const pooled = new Set(config.pools.flatMap((p) => p.members));
 	const standalone = getAllProviders().filter((p) => !pooled.has(p));
 	for (const prov of standalone) {
@@ -1003,7 +1040,11 @@ function handleRouting(req, res) {
 			const models = getModels(base);
 			groups.push({
 				label: prov,
-				items: models.map((m) => ({ id: m.id, name: m.id, detail: prov })),
+				items: models.map((m) => ({
+					id: `provider:${prov}/${m.id}`,
+					name: m.id,
+					detail: prov,
+				})),
 			});
 		} catch { /* skip */ }
 	}
@@ -1312,13 +1353,15 @@ async function sendMessage() {
   let smdParser = null;
   let mdBody = null;
   const t0 = Date.now();
-  const selectedModel = sel.value;
+  const rawSelection = sel.value;
+  // Clean display: "pool:codex-pool/gpt-5.1" -> "codex-pool / gpt-5.1"
+  const selectedModel = rawSelection.replace(/^pool:([^/]+)\/(.+)$/, "$1 / $2").replace(/^provider:([^/]+)\/(.+)$/, "$1 / $2");
 
   try {
     const resp = await fetch(BASE + "/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: selectedModel, messages, stream: true }),
+      body: JSON.stringify({ model: rawSelection, messages, stream: true }),
     });
 
     if (!resp.ok) {
