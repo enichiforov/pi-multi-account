@@ -107,32 +107,160 @@ const RATE_LIMIT_RE = [
 ];
 function isRateLimit(msg) { return RATE_LIMIT_RE.some((r) => r.test(msg)); }
 
+// ─── Pool state (exhausted tracking + cooldown) ──────────────────────────────
+
+const COOLDOWN_MS = 5 * 60 * 1000; // 5 min, same as extension
+const exhaustedMembers = new Map(); // provider -> timestamp
+
+function markExhausted(provider) {
+	exhaustedMembers.set(provider, Date.now());
+	log(`[pool] marked ${provider} exhausted (cooldown ${COOLDOWN_MS / 1000}s)`);
+}
+
+function isExhausted(provider) {
+	const ts = exhaustedMembers.get(provider);
+	if (!ts) return false;
+	if (Date.now() - ts >= COOLDOWN_MS) {
+		exhaustedMembers.delete(provider);
+		return false;
+	}
+	return true;
+}
+
+function isAvailable(provider) {
+	return authStorage.hasAuth(provider) && !isExhausted(provider);
+}
+
+// ─── Schedule evaluation (same logic as extension) ────────────────────────────
+
+const JS_DAY_TO_DOW = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function getDayOfWeek(date) { return JS_DAY_TO_DOW[date.getDay()]; }
+
+function isInHourRange(hour, range) {
+	const [start, end] = range;
+	return start <= end ? (hour >= start && hour < end) : (hour >= start || hour < end);
+}
+
+function isInScheduleWindow(window, now) {
+	if (window.days?.length > 0 && !window.days.includes(getDayOfWeek(now))) return false;
+	if (window.hours && !isInHourRange(now.getHours(), window.hours)) return false;
+	if (window.dateRange) {
+		const d = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+		if (window.dateRange.from && d < window.dateRange.from) return false;
+		if (window.dateRange.to && d > window.dateRange.to) return false;
+	}
+	return true;
+}
+
+function getWindowRemainingMs(window, now) {
+	if (!window.hours) return Infinity;
+	const end = new Date(now);
+	end.setHours(window.hours[1], 0, 0, 0);
+	let remaining = end.getTime() - now.getTime();
+	if (remaining <= 0) remaining += 24 * 60 * 60 * 1000;
+	return remaining;
+}
+
+/** Order members by schedule: preferred (in-window, shortest-remaining first) > default > overflow */
+function getScheduledOrder(pool, available) {
+	const schedule = pool.memberSchedule || {};
+	const now = new Date();
+	const preferred = [], defaults = [], overflow = [];
+
+	for (const prov of available) {
+		const s = schedule[prov];
+		if (!s) { defaults.push({ prov, remaining: Infinity }); continue; }
+		const role = s.role || "default";
+		if (role === "overflow") { overflow.push({ prov, remaining: Infinity }); continue; }
+		if (role === "preferred") {
+			const windows = s.windows || [];
+			if (windows.length === 0) { defaults.push({ prov, remaining: Infinity }); continue; }
+			let active = false, shortest = Infinity;
+			for (const w of windows) {
+				if (isInScheduleWindow(w, now)) {
+					active = true;
+					const r = getWindowRemainingMs(w, now);
+					if (r < shortest) shortest = r;
+				}
+			}
+			if (active) preferred.push({ prov, remaining: shortest });
+			// Preferred but NOT in window -> skip entirely (not even default)
+			continue;
+		}
+		defaults.push({ prov, remaining: Infinity });
+	}
+
+	preferred.sort((a, b) => a.remaining - b.remaining);
+	return [...preferred, ...defaults, ...overflow].map((x) => x.prov);
+}
+
+// ─── Custom selector script loader ────────────────────────────────────────────
+
+const selectorCache = new Map();
+
+async function loadSelector(scriptPath) {
+	let resolved = scriptPath;
+	if (!scriptPath.startsWith("/") && !scriptPath.startsWith("~/")) {
+		resolved = join(AGENT_DIR, scriptPath);
+	} else if (scriptPath.startsWith("~/")) {
+		const home = process.env.HOME || process.env.USERPROFILE || "";
+		resolved = join(home, scriptPath.slice(2));
+	}
+	if (selectorCache.has(resolved)) return selectorCache.get(resolved);
+	if (!existsSync(resolved)) { selectorCache.set(resolved, null); return null; }
+	try {
+		const mod = await import(resolved);
+		const fn = typeof mod.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
+		selectorCache.set(resolved, fn);
+		return fn;
+	} catch { selectorCache.set(resolved, null); return null; }
+}
+
+async function runCustomSelector(pool, available, currentProvider, modelId) {
+	if (!pool.selectorScript) return null;
+	const fn = await loadSelector(pool.selectorScript);
+	if (!fn) return null;
+	const now = new Date();
+	try {
+		const result = await fn({
+			members: [...available],
+			currentProvider: currentProvider || "",
+			modelId,
+			pool: { name: pool.name, baseProvider: pool.baseProvider, members: [...pool.members] },
+			timestamp: now.getTime(),
+			hour: now.getHours(),
+			day: getDayOfWeek(now),
+		});
+		if (typeof result === "string" && available.includes(result)) return result;
+		if (Array.isArray(result)) {
+			const first = result.find((r) => typeof r === "string" && available.includes(r));
+			if (first) return first;
+		}
+	} catch { /* fall through */ }
+	return null;
+}
+
 // ─── Model resolution ─────────────────────────────────────────────────────────
 
-/**
- * Try to get a pi-ai Model for a given provider and modelId.
- * Returns null if the provider doesn't serve that model.
- */
 function tryGetModel(providerName, modelId) {
 	const base = getBaseProvider(providerName);
 	if (!base) return null;
 	try {
 		const m = getModel(base, modelId);
-		// Re-tag with the actual provider name (may be an extra sub)
 		return base !== providerName ? { ...m, provider: providerName } : m;
-	} catch {
-		return null;
-	}
+	} catch { return null; }
 }
 
 /**
  * Resolve a model ID (or preset name) into an ordered list of
- * { model, provider } candidates, respecting pools, chains, and presets.
+ * { model, provider, modelId } candidates, respecting pools, chains,
+ * presets, strategies, and exhausted state.
  */
-function resolveCandidates(modelId) {
+async function resolveCandidates(modelId) {
 	const config = loadConfig();
 
-	// ── 1. Check if modelId is a preset name ──
+	// ── 1. Preset resolution ──
 	const preset = config.presets.find(
 		(p) => p.enabled && p.name.toLowerCase() === modelId.toLowerCase(),
 	);
@@ -140,31 +268,53 @@ function resolveCandidates(modelId) {
 		const candidates = [];
 		for (const entry of preset.entries) {
 			if (!entry.enabled) continue;
-			if (!authStorage.hasAuth(entry.provider)) continue;
+			if (!isAvailable(entry.provider)) continue;
 			const m = tryGetModel(entry.provider, entry.model);
 			if (m) candidates.push({ model: m, provider: entry.provider, modelId: entry.model });
 		}
 		return candidates;
 	}
 
-	// ── 2. Collect all providers that can serve this model ──
+	// ── 2. Collect all providers that serve this model ──
 	const allProviders = getAllProviders();
 	const raw = [];
 	for (const prov of allProviders) {
+		if (!isAvailable(prov)) continue;
 		const m = tryGetModel(prov, modelId);
 		if (m) raw.push({ model: m, provider: prov, modelId });
 	}
 	if (raw.length === 0) return [];
 
-	// ── 3. Order by pool membership ──
-	// Providers in an enabled pool come first (in pool member order),
-	// then non-pool providers.
+	// ── 3. Strategy-aware pool ordering ──
 	const ordered = [];
 	const used = new Set();
 
 	for (const pool of config.pools) {
 		if (!pool.enabled) continue;
-		for (const member of pool.members) {
+		const poolMembers = pool.members.filter((m) => raw.some((c) => c.provider === m));
+		if (poolMembers.length === 0) continue;
+
+		const strategy = pool.strategy || "round-robin";
+		let memberOrder = poolMembers;
+
+		if (strategy === "scheduled" && pool.memberSchedule) {
+			memberOrder = getScheduledOrder(pool, poolMembers);
+			if (memberOrder.length > 0) {
+				log(`[pool:${pool.name}] scheduled: ${memberOrder[0]} selected by schedule priority`);
+			}
+		} else if (strategy === "custom" && pool.selectorScript) {
+			const best = await runCustomSelector(pool, poolMembers, "", modelId);
+			if (best) {
+				memberOrder = [best, ...poolMembers.filter((m) => m !== best)];
+				log(`[pool:${pool.name}] custom: selector chose ${best}`);
+			}
+		}
+		// quota-first: would need provider-specific quota APIs (Codex, Google).
+		// Fall back to pool member order -- the extension's quota checkers
+		// aren't available outside pi's runtime, but rate-limit failover
+		// still rotates through all members.
+
+		for (const member of memberOrder) {
 			const match = raw.find((c) => c.provider === member);
 			if (match && !used.has(member)) {
 				ordered.push(match);
@@ -173,7 +323,7 @@ function resolveCandidates(modelId) {
 		}
 	}
 
-	// ── 4. Append chain targets ──
+	// ── 4. Chain targets ──
 	for (const chain of config.chains) {
 		if (!chain.enabled) continue;
 		for (const entry of chain.entries) {
@@ -181,8 +331,7 @@ function resolveCandidates(modelId) {
 			const pool = config.pools.find((p) => p.name === entry.pool && p.enabled);
 			if (!pool) continue;
 			for (const member of pool.members) {
-				if (used.has(member)) continue;
-				// Chain entries may specify a different model
+				if (used.has(member) || !isAvailable(member)) continue;
 				const m = tryGetModel(member, entry.model);
 				if (m) {
 					ordered.push({ model: m, provider: member, modelId: entry.model });
@@ -192,12 +341,9 @@ function resolveCandidates(modelId) {
 		}
 	}
 
-	// ── 5. Append remaining non-pool providers ──
+	// ── 5. Remaining non-pool providers ──
 	for (const c of raw) {
-		if (!used.has(c.provider)) {
-			ordered.push(c);
-			used.add(c.provider);
-		}
+		if (!used.has(c.provider)) { ordered.push(c); used.add(c.provider); }
 	}
 
 	return ordered;
@@ -572,7 +718,7 @@ async function handleChatCompletions(req, res) {
 		return;
 	}
 
-	const candidates = resolveCandidates(requestModelId);
+	const candidates = await resolveCandidates(requestModelId);
 	if (candidates.length === 0) {
 		res.writeHead(404, json());
 		res.end(JSON.stringify({ error: { message: `No provider found for model "${requestModelId}"` } }));
@@ -616,8 +762,8 @@ async function handleChatCompletions(req, res) {
 			lastError = errMsg;
 
 			if (isRateLimit(errMsg)) {
+				markExhausted(candidate.provider);
 				log(`[${candidate.provider}] rate limited, failover -> next candidate`);
-				// If streaming already started writing, we can't retry
 				if (res.headersSent) return;
 				continue;
 			}
@@ -677,10 +823,12 @@ function handleModels(req, res) {
 function handleHealth(req, res) {
 	const config = loadConfig();
 	const providers = getAllProviders();
+	const exhausted = providers.filter((p) => isExhausted(p));
 	res.writeHead(200, json());
 	res.end(JSON.stringify({
 		status: "ok",
 		providers,
+		exhausted,
 		pools: config.pools.filter((p) => p.enabled).map((p) => ({
 			name: p.name,
 			strategy: p.strategy || "round-robin",
