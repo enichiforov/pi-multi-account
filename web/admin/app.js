@@ -84,7 +84,16 @@ function DashboardPanel({ data }) {
       <thead><tr><th>Provider</th><th>Quota</th><th>Status</th><th>Requests</th><th>Tokens</th><th>Last used</th></tr></thead>
       <tbody>${quotaProviders.map((p) => {
         const ps = providers.find((x) => x.provider === p.provider) || {};
-        return html`<tr key=${p.provider}><td style=${{ color: "#fafafa", fontWeight: 500 }}>${p.label || p.provider}</td><td><${QuotaBar} score=${p.score} /> <span style=${{ color: qColor(p.score) }}>${p.score == null ? "?" : `${p.score}%`}</span></td><td>${exhausted.has(p.provider) ? html`<span className="badge off">exhausted</span>` : html`<span className="badge on">${p.status || "ok"}</span>`}</td><td>${ps.requests || 0}</td><td>${ps.tokens_in || 0} / ${ps.tokens_out || 0}</td><td>${ago(ps.last_used)}</td></tr>`;
+        const statusBadge = exhausted.has(p.provider)
+          ? html`<span className="badge off">exhausted</span>`
+          : p.status === "expired"
+            ? html`<span className="badge warn">expired - re-login</span>`
+            : p.status === "no-auth"
+              ? html`<span className="badge off">no auth</span>`
+              : p.status === "error"
+                ? html`<span className="badge off" title=${p.error || ""}>${p.error?.slice(0, 30) || "error"}</span>`
+                : html`<span className="badge on">${p.status || "ok"}</span>`;
+        return html`<tr key=${p.provider}><td style=${{ color: "#fafafa", fontWeight: 500 }}>${p.label || p.provider}</td><td><${QuotaBar} score=${p.score} /> <span style=${{ color: qColor(p.score) }}>${p.score == null ? "?" : `${p.score}%`}</span></td><td>${statusBadge}</td><td>${ps.requests || 0}</td><td>${ps.tokens_in || 0} / ${ps.tokens_out || 0}</td><td>${ago(ps.last_used)}</td></tr>`;
       })}</tbody>
     </table></div>
     <h2 className="mt">Recent chats</h2>
@@ -206,7 +215,11 @@ function AuthPanel({ onRefresh, reloadNames }) {
           <div>
             <span className="name">${p.name}</span>
             <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${p.id}</span>
-            <span className=${`badge ${p.authenticated ? "on" : "off"}`}>${p.authenticated ? "logged in" : "not logged in"}</span>
+            <span className=${`badge ${p.tokenStatus === "ok" ? "on" : p.tokenStatus === "expired" ? "warn" : "off"}`}>${
+              p.tokenStatus === "ok" ? "logged in" :
+              p.tokenStatus === "expired" ? "token expired" :
+              "not logged in"
+            }</span>
           </div>
           <div className="actions">
             ${busy[p.id]

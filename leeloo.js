@@ -361,8 +361,14 @@ async function checkCodexQuotaDetailed(provider) {
 	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
 	if (accountId) headers["chatgpt-account-id"] = accountId;
 
+	// Check JWT expiry before making the API call
+	if (payload?.exp && payload.exp < Date.now() / 1000) {
+		return { score: null, status: "expired", error: "Token expired - re-login required" };
+	}
+
 	try {
 		const resp = await fetch(`${CODEX_USAGE_URL.replace(/\/+$/, "")}/wham/usage`, { headers });
+		if (resp.status === 401 || resp.status === 403) return { score: null, status: "expired", error: "Token rejected - re-login required" };
 		if (!resp.ok) return { score: null, status: "error", error: `HTTP ${resp.status}` };
 		const data = await resp.json();
 		const rl = data?.rate_limit;
@@ -392,7 +398,10 @@ async function checkCodexQuotaDetailed(provider) {
 			email: profileClaim?.email || data?.email || null,
 			windows,
 		};
-	} catch (e) { return { score: null, status: "error", error: e.message }; }
+	} catch (e) {
+		if (/expired|unauthorized|401/i.test(e.message)) return { score: null, status: "expired", error: e.message };
+		return { score: null, status: "error", error: e.message };
+	}
 }
 
 async function checkGeminiQuotaDetailed(provider) {
@@ -1002,36 +1011,56 @@ function handleSubDelete(req, res, subName) {
 
 const pendingLogins = new Map(); // provider -> { resolve, reject, authUrl, status }
 
-function handleAuthProviders(req, res) {
+async function handleAuthProviders(req, res) {
 	const provs = authStorage.getOAuthProviders();
 	const config = loadConfig();
 	const result = [];
 
+	// Collect all provider IDs to check
+	const allIds = [];
+
 	// Built-in providers
 	for (const p of provs) {
-		result.push({
-			id: p.id,
-			name: p.name,
-			baseProvider: p.id,
-			authenticated: authStorage.hasAuth(p.id),
-			isBuiltin: true,
-		});
+		allIds.push({ id: p.id, name: p.name, baseProvider: p.id, isBuiltin: true });
 	}
 
 	// Extra subscription accounts
 	for (const sub of config.subscriptions) {
 		const subId = `${sub.provider}-${sub.index}`;
-		if (result.some((r) => r.id === subId)) continue;
+		if (allIds.some((r) => r.id === subId)) continue;
 		const baseProv = provs.find((p) => p.id === sub.provider);
-		result.push({
+		allIds.push({
 			id: subId,
 			name: `${baseProv?.name || sub.provider} #${sub.index}${sub.label ? " (" + sub.label + ")" : ""}`,
 			baseProvider: sub.provider,
-			authenticated: authStorage.hasAuth(subId),
 			isBuiltin: false,
 			index: sub.index,
 			label: sub.label,
 		});
+	}
+
+	// Check actual auth status for each (fast: just checks stored creds + JWT expiry)
+	for (const entry of allIds) {
+		const hasAuth = authStorage.hasAuth(entry.id);
+		let tokenStatus = "no-auth";
+		if (hasAuth) {
+			const cred = authStorage.get(entry.id);
+			if (cred?.type === "oauth" && cred.access) {
+				// Quick JWT expiry check (no API call)
+				try {
+					const payload = decodeJwtPayload(cred.access);
+					if (payload?.exp && payload.exp < Date.now() / 1000) {
+						tokenStatus = "expired";
+					} else {
+						tokenStatus = "ok";
+					}
+				} catch {
+					// Non-JWT token (e.g. Google) -- assume ok if cred exists
+					tokenStatus = "ok";
+				}
+			}
+		}
+		result.push({ ...entry, authenticated: hasAuth, tokenStatus });
 	}
 
 	res.writeHead(200, json());

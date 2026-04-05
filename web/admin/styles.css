@@ -42,7 +42,8 @@ h2.mt{margin-top:20px}
 .badge.off{color:#ef4444;border-color:#7f1d1d;background:#1c0a0a}
 .badge.block{color:#ef4444;border-color:#7f1d1d}
 .badge.redact{color:#eab308;border-color:#713f12}
-.badge.warn{color:#3b82f6;border-color:#1e40af}
+.badge.warn{color:#f59e0b;border-color:#92400e;background:#1c1508}
+.badge.info{color:#3b82f6;border-color:#1e40af}
 .badge.model{color:#a78bfa;border-color:#5b21b6}
 .badge.limit{color:#06b6d4;border-color:#155e75}
 .badge.neutral{color:#71717a;border-color:#3f3f46}
