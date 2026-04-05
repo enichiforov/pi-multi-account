@@ -189,6 +189,31 @@ function getBaseProvider(name) {
 	return null;
 }
 
+/**
+ * Get API key for a provider. For base providers, uses authStorage.getApiKey().
+ * For subscriptions (e.g. openai-codex-2), AuthStorage.getApiKey() fails because
+ * it doesn't know the OAuth provider. We fall back to extracting the access token
+ * directly from stored credentials, same as the base provider's getApiKey would.
+ */
+async function getApiKeyForProvider(providerName) {
+	// Try the standard path first (works for base providers)
+	const key = await authStorage.getApiKey(providerName);
+	if (key) return key;
+
+	// For subscriptions: extract directly from stored creds
+	const cred = authStorage.get(providerName);
+	if (!cred || cred.type !== "oauth" || !cred.access) return null;
+
+	const base = getBaseProvider(providerName);
+	if (base === "google-gemini-cli" || base === "google-antigravity") {
+		// Google providers store { access, projectId } serialized
+		return JSON.stringify({ token: cred.access, projectId: cred.projectId });
+	}
+
+	// Anthropic, OpenAI Codex, GitHub Copilot: just the access token
+	return cred.access;
+}
+
 /** Get all provider names (base + extras) that are authenticated. */
 function getAllProviders() {
 	const config = loadConfig();
@@ -325,7 +350,7 @@ async function checkCodexQuotaDetailed(provider) {
 	const cred = authStorage.get(provider);
 	if (!cred || cred.type !== "oauth" || !cred.access) return { score: null, status: "no-auth" };
 
-	const apiKey = await authStorage.getApiKey(provider);
+	const apiKey = await getApiKeyForProvider(provider);
 	if (!apiKey) return { score: null, status: "no-auth" };
 
 	const payload = decodeJwtPayload(apiKey);
@@ -371,7 +396,7 @@ async function checkCodexQuotaDetailed(provider) {
 }
 
 async function checkGeminiQuotaDetailed(provider) {
-	const apiKey = await authStorage.getApiKey(provider);
+	const apiKey = await getApiKeyForProvider(provider);
 	if (!apiKey) return { score: null, status: "no-auth" };
 
 	let token;
@@ -405,7 +430,7 @@ async function checkGeminiQuotaDetailed(provider) {
 }
 
 async function checkAntigravityQuotaDetailed(provider) {
-	const apiKey = await authStorage.getApiKey(provider);
+	const apiKey = await getApiKeyForProvider(provider);
 	if (!apiKey) return { score: null, status: "no-auth" };
 
 	let token;
@@ -1270,8 +1295,9 @@ function tryGetModel(providerName, modelId) {
 	const base = getBaseProvider(providerName);
 	if (!base) return null;
 	try {
-		const m = getModel(base, modelId);
-		return base !== providerName ? { ...m, provider: providerName } : m;
+		// Always use base provider in the model object (pi-ai needs it for API routing).
+		// The subscription name (providerName) is tracked separately for auth lookup.
+		return getModel(base, modelId);
 	} catch { return null; }
 }
 
@@ -1878,7 +1904,7 @@ async function handleChatCompletions(req, res) {
 		const candidate = candidates[attempt];
 
 		try {
-			const apiKey = await authStorage.getApiKey(candidate.provider);
+			const apiKey = await getApiKeyForProvider(candidate.provider);
 			if (!apiKey) {
 				log(`[${candidate.provider}] no API key, skipping`);
 				continue;
