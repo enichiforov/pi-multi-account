@@ -310,6 +310,111 @@ function AuthPanel({ onRefresh, reloadNames }) {
 const ALL_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const ROLES = [{ value: "", label: "default (always available)" }, { value: "preferred", label: "preferred (active in windows only)" }, { value: "overflow", label: "overflow (last resort)" }];
 
+/**
+ * Global reusable chip picker.
+ * Props:
+ *   items: string[] -- current selection
+ *   onChange(newItems): callback
+ *   available?: string[] -- if provided, dropdown picker; else free-form text input
+ *   placeholder?: string
+ *   emptyText?: string
+ *   chipClass?: string -- "on" (green) | "neutral" (gray)
+ */
+function ChipPicker({ items, onChange, available, placeholder, emptyText, chipClass }) {
+  const [draft, setDraft] = useState("");
+  const remaining = available ? available.filter((a) => !items.includes(a)) : null;
+
+  function add(val) {
+    const v = (val ?? draft).trim();
+    if (v && !items.includes(v)) onChange([...items, v]);
+    setDraft("");
+  }
+  function remove(i) { onChange(items.filter((_, idx) => idx !== i)); }
+
+  return html`
+    <div>
+      <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px", minHeight: "24px", alignItems: "center" }}>
+        ${items.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>${emptyText || "None"}</span>` : null}
+        ${items.map((item, i) => html`
+          <span key=${item + i} className=${`badge ${chipClass || "on"}`} style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => remove(i)} title="Click to remove">
+            ${item} ${"x"}
+          </span>
+        `)}
+      </div>
+      ${available ? (
+        remaining.length > 0 ? html`
+          <select onChange=${(e) => { add(e.target.value); e.target.value = ""; }} style=${{ width: "100%" }}>
+            <option value="">${placeholder || "+ Add..."}</option>
+            ${remaining.map((a) => html`<option key=${a} value=${a}>${a}</option>`)}
+          </select>
+        ` : null
+      ) : html`
+        <div style=${{ display: "flex", gap: "6px" }}>
+          <input value=${draft} onInput=${(e) => setDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }} placeholder=${placeholder || "Type and press Enter"} style=${{ flex: 1 }} />
+          <button className="btn" onClick=${() => add()}>+</button>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+/** Visual editor for an array of time windows: [{ hours: [start,end], days: [...], tz?: string }] */
+function WindowListEditor({ windows, onChange }) {
+  const list = windows || [];
+
+  function addWindow() { onChange([...list, { hours: [9, 17], days: [...ALL_DAYS] }]); }
+  function removeWindow(i) { onChange(list.filter((_, idx) => idx !== i)); }
+  function updateWindow(i, patch) {
+    const next = [...list];
+    next[i] = { ...next[i], ...patch };
+    onChange(next);
+  }
+  function toggleDay(i, day) {
+    const w = list[i];
+    const days = w.days && w.days.length ? w.days : [...ALL_DAYS];
+    const newDays = days.includes(day) ? days.filter((d) => d !== day) : [...days, day];
+    updateWindow(i, { days: newDays });
+  }
+  function setAllDays(i) { updateWindow(i, { days: [...ALL_DAYS] }); }
+  function setWeekdays(i) { updateWindow(i, { days: ["mon", "tue", "wed", "thu", "fri"] }); }
+  function setWeekends(i) { updateWindow(i, { days: ["sat", "sun"] }); }
+
+  return html`
+    <div>
+      ${list.length === 0 ? html`<div style=${{ color: "#52525b", fontSize: "12px", padding: "6px 0" }}>No windows -- rule is always inactive. Click Add window.</div>` : null}
+      ${list.map((w, i) => {
+        const days = w.days && w.days.length ? w.days : [...ALL_DAYS];
+        return html`
+          <div key=${i} style=${{ background: "#0d0d0f", border: "1px solid #27272a", borderRadius: "8px", padding: "10px 12px", marginBottom: "8px" }}>
+            <div style=${{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px", flexWrap: "wrap" }}>
+              <span style=${{ color: "#71717a", fontSize: "10px", fontWeight: 700, letterSpacing: "0.5px" }}>HOURS</span>
+              <input type="number" min="0" max="23" value=${w.hours?.[0] ?? 0} onInput=${(e) => updateWindow(i, { hours: [parseInt(e.target.value) || 0, w.hours?.[1] ?? 24] })} style=${{ width: "60px" }} />
+              <span style=${{ color: "#52525b" }}>to</span>
+              <input type="number" min="0" max="24" value=${w.hours?.[1] ?? 24} onInput=${(e) => updateWindow(i, { hours: [w.hours?.[0] ?? 0, parseInt(e.target.value) || 24] })} style=${{ width: "60px" }} />
+              <span style=${{ color: "#3f3f46", fontSize: "10px" }}>(24h, wraps midnight)</span>
+              <div style=${{ flex: 1 }} />
+              <input value=${w.tz || ""} onInput=${(e) => updateWindow(i, { tz: e.target.value || undefined })} placeholder="tz (optional)" style=${{ width: "150px", fontSize: "11px" }} />
+              <button className="btn danger" onClick=${() => removeWindow(i)} style=${{ padding: "3px 8px", fontSize: "11px" }}>x</button>
+            </div>
+            <div style=${{ display: "flex", gap: "4px", flexWrap: "wrap", alignItems: "center" }}>
+              <span style=${{ color: "#71717a", fontSize: "10px", fontWeight: 700, letterSpacing: "0.5px", marginRight: "4px" }}>DAYS</span>
+              ${ALL_DAYS.map((day) => {
+                const active = days.includes(day);
+                return html`<button key=${day} className=${`btn ${active ? "primary" : ""}`} onClick=${() => toggleDay(i, day)} style=${{ padding: "3px 9px", fontSize: "11px", minWidth: "38px" }}>${day}</button>`;
+              })}
+              <div style=${{ flex: 1 }} />
+              <button className="btn" onClick=${() => setAllDays(i)} style=${{ padding: "3px 8px", fontSize: "10px" }}>all</button>
+              <button className="btn" onClick=${() => setWeekdays(i)} style=${{ padding: "3px 8px", fontSize: "10px" }}>weekdays</button>
+              <button className="btn" onClick=${() => setWeekends(i)} style=${{ padding: "3px 8px", fontSize: "10px" }}>weekends</button>
+            </div>
+          </div>
+        `;
+      })}
+      <button className="btn" onClick=${addWindow} style=${{ fontSize: "11px" }}>+ Add window</button>
+    </div>
+  `;
+}
+
 function ScheduleEditor({ members, schedule, onChange }) {
   // schedule = { memberName: { role, windows: [{ hours, days, dateRange }] } }
   const sched = schedule || {};
@@ -397,7 +502,6 @@ function ScheduleEditor({ members, schedule, onChange }) {
 function ApiKeyEditor({ apiKeys, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
-  const [modelDraft, setModelDraft] = useState("");
 
   function startNew() { setEditing("__new__"); setDraft({ name: "", key: "", models: [], enabled: true, label: "" }); }
   function startEdit(k) { setEditing(k.name); setDraft({ ...k, models: [...(k.models || [])] }); }
@@ -410,9 +514,6 @@ function ApiKeyEditor({ apiKeys, onSave }) {
   }
   async function del(name) { if (confirm(`Delete API key "${name}"?`)) { await api(`/v1/config/apikeys/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
 
-  function addModel() { if (modelDraft.trim() && !draft.models.includes(modelDraft.trim())) { setDraft({ ...draft, models: [...draft.models, modelDraft.trim()] }); setModelDraft(""); } }
-  function removeModel(i) { setDraft({ ...draft, models: draft.models.filter((_, idx) => idx !== i) }); }
-
   function renderForm(isNew) {
     return html`
       <div className="card" style=${{ marginBottom: "10px" }}>
@@ -422,14 +523,7 @@ function ApiKeyEditor({ apiKeys, onSave }) {
           <div className="full"><label>API Key</label><input type="password" value=${draft.key || ""} onInput=${(e) => setDraft({ ...draft, key: e.target.value })} placeholder="sk-..." /></div>
           <div className="full">
             <label>Models (empty = any model)</label>
-            <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
-              ${(draft.models || []).map((m, i) => html`<span key=${m} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => removeModel(i)}>${m} x</span>`)}
-              ${!draft.models?.length ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>Any model</span>` : null}
-            </div>
-            <div style=${{ display: "flex", gap: "6px" }}>
-              <input value=${modelDraft} onInput=${(e) => setModelDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); addModel(); } }} placeholder="e.g. gpt-4o, claude-sonnet-4-20250514" style=${{ flex: 1 }} />
-              <button className="btn" onClick=${addModel}>+</button>
-            </div>
+            <${ChipPicker} items=${draft.models || []} onChange=${(v) => setDraft({ ...draft, models: v })} placeholder="e.g. gpt-4o, claude-sonnet-4-20250514" emptyText="Any model" />
           </div>
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
@@ -823,6 +917,12 @@ function RoutingRuleEditor({ rules, names, onSave, readOnly }) {
 
   function updateParam(field, value) { setDraft({ ...draft, params: { ...draft.params, [field]: value } }); }
 
+  // Build the list of available targets (providers + pools + accounts)
+  const availableTargets = [
+    ...((names?.providers || []).map((p) => p.id)),
+    ...((names?.pools || []).map((p) => p.id || p.label)),
+  ];
+
   function renderForm(isNew) {
     const t = draft.type;
     return html`
@@ -834,11 +934,23 @@ function RoutingRuleEditor({ rules, names, onSave, readOnly }) {
 
           ${(t === "time-window" || t === "cost-tier") ? html`
             <div><label>Boost score</label><input type="number" value=${draft.params?.boost ?? 50} onInput=${(e) => updateParam("boost", parseInt(e.target.value) || 0)} /></div>
-            <div className="full"><label>Targets (comma-separated provider/pool/account IDs)</label><input value=${(draft.params?.targets || []).join(", ")} onInput=${(e) => updateParam("targets", e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="anthropic, codex-pool" /></div>
+            <div className="full">
+              <label>Targets (providers, pools, accounts)</label>
+              <${ChipPicker}
+                items=${draft.params?.targets || []}
+                onChange=${(v) => updateParam("targets", v)}
+                available=${availableTargets}
+                emptyText="No targets -- rule applies to all candidates"
+                placeholder="+ Add target..."
+              />
+            </div>
           ` : null}
 
           ${t === "time-window" ? html`
-            <div className="full"><label>Windows (JSON: [{ days: ["mon-fri"], hours: [9, 17], tz: "Europe/Vienna" }])</label><textarea rows="4" value=${JSON.stringify(draft.params?.windows || [], null, 2)} onInput=${(e) => { try { updateParam("windows", JSON.parse(e.target.value)); } catch {} }} /></div>
+            <div className="full">
+              <label>Time windows</label>
+              <${WindowListEditor} windows=${draft.params?.windows || []} onChange=${(v) => updateParam("windows", v)} />
+            </div>
           ` : null}
 
           ${t === "error-blacklist" ? html`
@@ -846,7 +958,7 @@ function RoutingRuleEditor({ rules, names, onSave, readOnly }) {
           ` : null}
 
           ${t === "model-fit" ? [
-            html`<div key="ctx"><label>Min context</label><input type="number" value=${draft.params?.minContext || 0} onInput=${(e) => updateParam("minContext", parseInt(e.target.value) || 0)} /></div>`,
+            html`<div key="ctx"><label>Min context tokens</label><input type="number" value=${draft.params?.minContext || 0} onInput=${(e) => updateParam("minContext", parseInt(e.target.value) || 0)} /></div>`,
             html`<div key="tools"><label>Require tools</label><select value=${String(!!draft.params?.requireTools)} onChange=${(e) => updateParam("requireTools", e.target.value === "true")}><option value="false">No</option><option value="true">Yes</option></select></div>`,
             html`<div key="vis"><label>Require vision</label><select value=${String(!!draft.params?.requireVision)} onChange=${(e) => updateParam("requireVision", e.target.value === "true")}><option value="false">No</option><option value="true">Yes</option></select></div>`,
           ] : null}
@@ -1049,17 +1161,17 @@ function RuleForm({ onCreate, onCancel }) {
   const [name, setName] = useState("");
   const [type, setType] = useState("block");
   const [scope, setScope] = useState("request");
-  const [patterns, setPatterns] = useState("");
+  const [patterns, setPatterns] = useState([]);
   const [replacement, setReplacement] = useState("[REDACTED]");
   const [message, setMessage] = useState("");
-  const [allow, setAllow] = useState("");
-  const [deny, setDeny] = useState("");
+  const [allow, setAllow] = useState([]);
+  const [deny, setDeny] = useState([]);
   const [maxReq, setMaxReq] = useState("60");
   const [winSec, setWinSec] = useState("60");
 
   function submit() {
-    const rule = { name: name || `rule-${Date.now()}`, type, scope, enabled: true, patterns: patterns.split("\n").map((x) => x.trim()).filter(Boolean), replacement: replacement || undefined, message: message || undefined };
-    if (type === "model") { rule.allow = allow.split(",").map((x) => x.trim()).filter(Boolean); rule.deny = deny.split(",").map((x) => x.trim()).filter(Boolean); }
+    const rule = { name: name || `rule-${Date.now()}`, type, scope, enabled: true, patterns, replacement: replacement || undefined, message: message || undefined };
+    if (type === "model") { rule.allow = allow; rule.deny = deny; }
     if (type === "limit") { rule.maxRequests = parseInt(maxReq) || 60; rule.windowSeconds = parseInt(winSec) || 60; }
     onCreate(rule);
   }
@@ -1070,11 +1182,28 @@ function RuleForm({ onCreate, onCancel }) {
         <div><label>Name</label><input value=${name} onInput=${(e) => setName(e.target.value)} placeholder="e.g. block-secrets" /></div>
         <div><label>Type</label><select value=${type} onChange=${(e) => setType(e.target.value)}><option value="block">block</option><option value="redact">redact</option><option value="warn">warn</option><option value="model">model</option><option value="limit">limit</option></select></div>
         <div><label>Scope</label><select value=${scope} onChange=${(e) => setScope(e.target.value)}><option value="request">request</option><option value="response">response</option><option value="both">both</option></select></div>
-        ${(type === "block" || type === "redact" || type === "warn") && html`<div className="full"><label>Patterns (regex, one per line)</label><textarea value=${patterns} onInput=${(e) => setPatterns(e.target.value)} placeholder="AKIA[0-9A-Z]{16}" /></div>`}
-        ${type === "redact" && html`<div><label>Replacement</label><input value=${replacement} onInput=${(e) => setReplacement(e.target.value)} /></div>`}
-        ${(type === "block" || type === "model") && html`<div><label>Block message</label><input value=${message} onInput=${(e) => setMessage(e.target.value)} placeholder="Blocked by policy" /></div>`}
-        ${type === "model" && [html`<div key="a"><label>Allow (globs)</label><input value=${allow} onInput=${(e) => setAllow(e.target.value)} placeholder="claude-*, gpt-5*" /></div>`, html`<div key="d"><label>Deny (globs)</label><input value=${deny} onInput=${(e) => setDeny(e.target.value)} placeholder="gpt-4o*" /></div>`]}
-        ${type === "limit" && [html`<div key="mr"><label>Max requests</label><input value=${maxReq} onInput=${(e) => setMaxReq(e.target.value)} type="number" /></div>`, html`<div key="ws"><label>Window (seconds)</label><input value=${winSec} onInput=${(e) => setWinSec(e.target.value)} type="number" /></div>`]}
+        ${(type === "block" || type === "redact" || type === "warn") ? html`
+          <div className="full">
+            <label>Patterns (regex, one per chip)</label>
+            <${ChipPicker} items=${patterns} onChange=${setPatterns} placeholder="AKIA[0-9A-Z]{16}" emptyText="No patterns" />
+          </div>
+        ` : null}
+        ${type === "redact" ? html`<div><label>Replacement</label><input value=${replacement} onInput=${(e) => setReplacement(e.target.value)} /></div>` : null}
+        ${(type === "block" || type === "model") ? html`<div><label>Block message</label><input value=${message} onInput=${(e) => setMessage(e.target.value)} placeholder="Blocked by policy" /></div>` : null}
+        ${type === "model" ? [
+          html`<div key="a" className="full">
+            <label>Allow (model globs)</label>
+            <${ChipPicker} items=${allow} onChange=${setAllow} placeholder="claude-*, gpt-5*" emptyText="No allow list" />
+          </div>`,
+          html`<div key="d" className="full">
+            <label>Deny (model globs)</label>
+            <${ChipPicker} items=${deny} onChange=${setDeny} placeholder="gpt-4o*" emptyText="No deny list" chipClass="off" />
+          </div>`,
+        ] : null}
+        ${type === "limit" ? [
+          html`<div key="mr"><label>Max requests</label><input value=${maxReq} onInput=${(e) => setMaxReq(e.target.value)} type="number" /></div>`,
+          html`<div key="ws"><label>Window (seconds)</label><input value=${winSec} onInput=${(e) => setWinSec(e.target.value)} type="number" /></div>`,
+        ] : null}
       </div>
       <div className="actions" style=${{ marginTop: "12px" }}><button className="btn primary" onClick=${submit}>Create</button><button className="btn" onClick=${onCancel}>Cancel</button></div>
     </div>
@@ -1244,32 +1373,6 @@ function UsersPanel() {
 
   function getUserStats(username) { return stats.find((s) => s.username === username); }
 
-  // Available presets/pools for dropdowns
-  const configPresets = (names?.pools || []).map((p) => p.label).concat(
-    // We need preset names too - fetch from config
-  );
-
-  function ChipPicker({ label, items, available, onChange, emptyText }) {
-    function add(val) { if (val && !items.includes(val)) onChange([...items, val]); }
-    function remove(i) { onChange(items.filter((_, idx) => idx !== i)); }
-    const remaining = available.filter((a) => !items.includes(a));
-    return html`
-      <div className="full">
-        <label>${label}</label>
-        <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px", minHeight: "24px" }}>
-          ${items.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>${emptyText || "None (all access)"}</span>` : null}
-          ${items.map((item, i) => html`<span key=${item} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => remove(i)}>${item} ${"x"}</span>`)}
-        </div>
-        ${remaining.length > 0 ? html`
-          <select onChange=${(e) => { add(e.target.value); e.target.value = ""; }} style=${{ width: "100%" }}>
-            <option value="">+ Add...</option>
-            ${remaining.map((a) => html`<option key=${a} value=${a}>${a}</option>`)}
-          </select>
-        ` : null}
-      </div>
-    `;
-  }
-
   const availablePresetNames = (names?.presets || []).map((p) => p.label);
   const availablePoolNames = (names?.pools || []).map((p) => p.label);
 
@@ -1279,20 +1382,24 @@ function UsersPanel() {
       <div className="card" style=${{ marginBottom: "12px" }}>
         <div className="form-grid">
           ${isNew ? html`<div className="full"><label>Username</label><input value=${draft.username} onInput=${(e) => setDraft({ ...draft, username: e.target.value })} placeholder="e.g. alice" /></div>` : html`<div className="full"><label>Username</label><input value=${draft.username} disabled style=${{ opacity: 0.6 }} /></div>`}
-          <${ChipPicker}
-            label="Allowed presets (empty = all access)"
-            items=${draft.allowedPresets}
-            available=${availablePresetNames}
-            onChange=${(v) => setDraft({ ...draft, allowedPresets: v })}
-            emptyText="No restrictions -- all presets allowed"
-          />
-          <${ChipPicker}
-            label="Allowed pools (empty = all access)"
-            items=${draft.allowedPools}
-            available=${availablePoolNames}
-            onChange=${(v) => setDraft({ ...draft, allowedPools: v })}
-            emptyText="No restrictions -- all pools allowed"
-          />
+          <div className="full">
+            <label>Allowed presets (empty = all access)</label>
+            <${ChipPicker}
+              items=${draft.allowedPresets}
+              available=${availablePresetNames}
+              onChange=${(v) => setDraft({ ...draft, allowedPresets: v })}
+              emptyText="No restrictions -- all presets allowed"
+            />
+          </div>
+          <div className="full">
+            <label>Allowed pools (empty = all access)</label>
+            <${ChipPicker}
+              items=${draft.allowedPools}
+              available=${availablePoolNames}
+              onChange=${(v) => setDraft({ ...draft, allowedPools: v })}
+              emptyText="No restrictions -- all pools allowed"
+            />
+          </div>
           <div>
             <label>Daily token budget (0 = unlimited)</label>
             <input type="number" value=${draft.budgets?.daily_tokens || ""} onInput=${(e) => setDraft({ ...draft, budgets: { ...draft.budgets, daily_tokens: e.target.value } })} placeholder="e.g. 500000" />
