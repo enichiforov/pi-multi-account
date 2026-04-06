@@ -1087,6 +1087,10 @@ async function handleConfigPut(req, res) {
 	if (body.pools !== undefined) config.pools = body.pools;
 	if (body.chains !== undefined) config.chains = body.chains;
 	if (body.presets !== undefined) config.presets = body.presets;
+	if (body.apiKeys !== undefined) config.apiKeys = body.apiKeys;
+	if (body.accounts !== undefined) config.accounts = body.accounts;
+	if (body.modes !== undefined) config.modes = body.modes;
+	if (body.routingRules !== undefined) config.routingRules = body.routingRules;
 	saveConfig(config);
 	res.writeHead(200, json());
 	res.end(JSON.stringify(config));

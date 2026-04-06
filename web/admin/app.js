@@ -590,16 +590,32 @@ function ChainEditor({ chains, names, onSave }) {
 
 // ── Presets ──
 
-function PresetEditor({ presets, names, onSave }) {
+function PresetEditor({ presets, modes, names, onSave, readOnly }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
+  const [modelDraft, setModelDraft] = useState("");
+  const [fallbackDraft, setFallbackDraft] = useState("");
+  const [presetMode, setPresetMode] = useState("v2"); // v2 | v1 (legacy)
 
-  function startEdit(p) { setEditing(p.name); setDraft({ ...p, entries: [...(p.entries || [])] }); }
-  function startNew() { setEditing("__new__"); setDraft({ name: "", enabled: true, entries: [] }); }
+  function startEdit(p) {
+    setEditing(p.name);
+    const isV2 = !!p.mode;
+    setPresetMode(isV2 ? "v2" : "v1");
+    setDraft({ ...p, entries: [...(p.entries || [])], preferredModels: [...(p.preferredModels || [])], fallbackModels: [...(p.fallbackModels || [])] });
+  }
+  function startNew() {
+    setEditing("__new__");
+    setPresetMode("v2");
+    setDraft({ name: "", enabled: true, entries: [], mode: "", preferredModels: [], fallbackModels: [] });
+  }
   function cancel() { setEditing(null); }
   async function save() {
-    if (editing === "__new__") { await api("/v1/config/presets", jpost(draft)); }
-    else { await api(`/v1/config/presets/${encodeURIComponent(editing)}`, jput(draft)); }
+    const payload = { ...draft };
+    // Strip the "other" mode's fields based on chosen type
+    if (presetMode === "v2") { delete payload.entries; }
+    else { delete payload.mode; delete payload.preferredModels; delete payload.fallbackModels; }
+    if (editing === "__new__") { await api("/v1/config/presets", jpost(payload)); }
+    else { await api(`/v1/config/presets/${encodeURIComponent(editing)}`, jput(payload)); }
     setEditing(null); onSave();
   }
   async function del(name) { if (confirm(`Delete preset "${name}"?`)) { await api(`/v1/config/presets/${encodeURIComponent(name)}`, { method: "DELETE" }); onSave(); } }
@@ -608,21 +624,177 @@ function PresetEditor({ presets, names, onSave }) {
   function addEntry() { setDraft({ ...draft, entries: [...draft.entries, { provider: "", enabled: true }] }); }
   function removeEntry(i) { setDraft({ ...draft, entries: draft.entries.filter((_, idx) => idx !== i) }); }
 
+  function addModel(target) {
+    const v = target === "preferred" ? modelDraft : fallbackDraft;
+    if (!v.trim()) return;
+    const arr = target === "preferred" ? draft.preferredModels : draft.fallbackModels;
+    if (!arr.includes(v.trim())) {
+      setDraft({ ...draft, [target === "preferred" ? "preferredModels" : "fallbackModels"]: [...arr, v.trim()] });
+    }
+    if (target === "preferred") setModelDraft(""); else setFallbackDraft("");
+  }
+  function removeModel(target, i) {
+    const arr = target === "preferred" ? draft.preferredModels : draft.fallbackModels;
+    setDraft({ ...draft, [target === "preferred" ? "preferredModels" : "fallbackModels"]: arr.filter((_, idx) => idx !== i) });
+  }
+
   function renderForm(isNew) {
     return html`
       <div className="card">
         <div className="form-grid">
           <div><label>Name</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. coding-premium" /></div>
           <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
+          <div className="full">
+            <label>Type</label>
+            <select value=${presetMode} onChange=${(e) => setPresetMode(e.target.value)}>
+              <option value="v2">v2: route via mode + preferred models (recommended)</option>
+              <option value="v1">v1: ordered list of provider/model entries (legacy)</option>
+            </select>
+          </div>
         </div>
-        <div style=${{ marginTop: "10px" }}>
-          <label>Entries (drag to reorder)</label>
-          <${SortableList} items=${draft.entries} onReorder=${(arr) => setDraft({ ...draft, entries: arr })} renderItem=${(e, i) => html`
-            <${ProviderSelect} value=${e.provider} onChange=${(v) => updateEntry(i, "provider", v)} names=${names} allowPools=${true} allowChains=${true} placeholder="provider, pool, or chain" />
-            <select value=${String(e.enabled !== false)} onChange=${(ev) => updateEntry(i, "enabled", ev.target.value)} style=${{ width: "60px", fontSize: "12px" }}><option value="true">On</option><option value="false">Off</option></select>
-            <button className="btn danger" onClick=${() => removeEntry(i)} style=${{ padding: "4px 8px" }}>x</button>
-          `} />
-          <button className="btn" onClick=${addEntry} style=${{ marginTop: "4px" }}>+ Add entry</button>
+
+        ${presetMode === "v2" ? html`
+          <div style=${{ marginTop: "10px" }}>
+            <label>Mode</label>
+            <select value=${draft.mode || ""} onChange=${(e) => setDraft({ ...draft, mode: e.target.value })}>
+              <option value="">-- pick a mode --</option>
+              ${(modes || []).map((m) => html`<option key=${m.id} value=${m.id}>${m.id}${m.description ? " -- " + m.description : ""}</option>`)}
+            </select>
+          </div>
+          <div style=${{ marginTop: "10px" }}>
+            <label>Preferred models (tried in order)</label>
+            <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
+              ${draft.preferredModels.map((m, i) => html`<span key=${m} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => removeModel("preferred", i)}>${m} x</span>`)}
+              ${draft.preferredModels.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>None -- candidate's first model used</span>` : null}
+            </div>
+            <div style=${{ display: "flex", gap: "6px" }}>
+              <input value=${modelDraft} onInput=${(e) => setModelDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); addModel("preferred"); } }} placeholder="e.g. claude-opus, gpt-5.4" style=${{ flex: 1 }} />
+              <button className="btn" onClick=${() => addModel("preferred")}>+</button>
+            </div>
+          </div>
+          <div style=${{ marginTop: "10px" }}>
+            <label>Fallback models</label>
+            <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
+              ${draft.fallbackModels.map((m, i) => html`<span key=${m} className="badge neutral" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => removeModel("fallback", i)}>${m} x</span>`)}
+              ${draft.fallbackModels.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>None</span>` : null}
+            </div>
+            <div style=${{ display: "flex", gap: "6px" }}>
+              <input value=${fallbackDraft} onInput=${(e) => setFallbackDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); addModel("fallback"); } }} placeholder="e.g. claude-sonnet, gpt-5-mini" style=${{ flex: 1 }} />
+              <button className="btn" onClick=${() => addModel("fallback")}>+</button>
+            </div>
+          </div>
+        ` : html`
+          <div style=${{ marginTop: "10px" }}>
+            <label>Entries (drag to reorder)</label>
+            <${SortableList} items=${draft.entries} onReorder=${(arr) => setDraft({ ...draft, entries: arr })} renderItem=${(e, i) => html`
+              <${ProviderSelect} value=${e.provider} onChange=${(v) => updateEntry(i, "provider", v)} names=${names} allowPools=${true} allowChains=${true} placeholder="provider, pool, or chain" />
+              <select value=${String(e.enabled !== false)} onChange=${(ev) => updateEntry(i, "enabled", ev.target.value)} style=${{ width: "60px", fontSize: "12px" }}><option value="true">On</option><option value="false">Off</option></select>
+              <button className="btn danger" onClick=${() => removeEntry(i)} style=${{ padding: "4px 8px" }}>x</button>
+            `} />
+            <button className="btn" onClick=${addEntry} style=${{ marginTop: "4px" }}>+ Add entry</button>
+          </div>
+        `}
+
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
+      </div>
+    `;
+  }
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Presets</h2>${!readOnly ? html`<button className="btn primary" onClick=${startNew}>+ Add</button>` : null}</div>
+    ${presets.map((p) => editing === p.name ? renderForm(false) : html`
+      <div className="card" key=${p.name}>
+        <div className="card-row">
+          <div>
+            <span className="name">${p.name}</span>
+            <span className=${`badge ${p.enabled !== false ? "on" : "off"}`}>${p.enabled !== false ? "on" : "off"}</span>
+            ${p.mode ? html`<span className="badge info">v2 mode: ${p.mode}</span>` : html`<span className="badge neutral">v1: ${(p.entries || []).length} entries</span>`}
+          </div>
+          ${!readOnly ? html`<div className="actions"><button className="btn" onClick=${() => startEdit(p)}>Edit</button><button className="btn danger" onClick=${() => del(p.name)}>Del</button></div>` : null}
+        </div>
+        <div className="meta">${
+          p.mode
+            ? `mode: ${p.mode}${p.preferredModels?.length ? " | preferred: " + p.preferredModels.join(", ") : ""}${p.fallbackModels?.length ? " | fallback: " + p.fallbackModels.join(", ") : ""}`
+            : ((p.entries || []).filter((e) => e.enabled !== false).map((e) => e.provider).join(" -> ") || "no entries")
+        }</div>
+      </div>
+    `)}
+    ${editing === "__new__" ? renderForm(true) : null}
+  </div>`;
+}
+
+// ── Routing rules editor ──
+
+const RULE_TYPES = [
+  { value: "time-window", label: "time-window (boost during hours/days)" },
+  { value: "quota-burn", label: "quota-burn (prefer expiring soon)" },
+  { value: "cost-tier", label: "cost-tier (prefer cheap targets)" },
+  { value: "model-fit", label: "model-fit (filter by capability)" },
+  { value: "error-blacklist", label: "error-blacklist (skip recent errors)" },
+  { value: "cooldown", label: "cooldown (skip exhausted)" },
+  { value: "custom", label: "custom (JS file path)" },
+];
+
+function RoutingRuleEditor({ rules, names, onSave, readOnly }) {
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState({});
+
+  function startNew() { setEditing("__new__"); setDraft({ id: "", type: "time-window", description: "", params: { boost: 50, targets: [], windows: [{ hours: [9, 17], days: ["mon", "tue", "wed", "thu", "fri"] }] } }); }
+  function startEdit(r) { setEditing(r.id); setDraft({ ...r, params: { ...(r.params || {}) } }); }
+  function cancel() { setEditing(null); }
+
+  async function save() {
+    const cfg = await api("/v1/config");
+    const all = [...(cfg.routingRules || [])];
+    if (editing === "__new__") all.push(draft);
+    else {
+      const i = all.findIndex((r) => r.id === editing);
+      if (i >= 0) all[i] = draft;
+    }
+    await api("/v1/config", jput({ routingRules: all }));
+    setEditing(null); onSave();
+  }
+  async function del(id) {
+    if (!confirm(`Delete rule "${id}"?`)) return;
+    const cfg = await api("/v1/config");
+    const all = (cfg.routingRules || []).filter((r) => r.id !== id);
+    await api("/v1/config", jput({ routingRules: all }));
+    onSave();
+  }
+
+  function updateParam(field, value) { setDraft({ ...draft, params: { ...draft.params, [field]: value } }); }
+
+  function renderForm(isNew) {
+    const t = draft.type;
+    return html`
+      <div className="card">
+        <div className="form-grid">
+          <div><label>ID</label><input value=${draft.id} onInput=${(e) => setDraft({ ...draft, id: e.target.value })} placeholder="e.g. prefer-anthropic-evening" disabled=${!isNew} /></div>
+          <div><label>Type</label><select value=${draft.type} onChange=${(e) => setDraft({ ...draft, type: e.target.value, params: {} })}>${RULE_TYPES.map((r) => html`<option key=${r.value} value=${r.value}>${r.label}</option>`)}</select></div>
+          <div className="full"><label>Description (optional)</label><input value=${draft.description || ""} onInput=${(e) => setDraft({ ...draft, description: e.target.value })} placeholder="What this rule does" /></div>
+
+          ${(t === "time-window" || t === "cost-tier") ? html`
+            <div><label>Boost score</label><input type="number" value=${draft.params?.boost ?? 50} onInput=${(e) => updateParam("boost", parseInt(e.target.value) || 0)} /></div>
+            <div className="full"><label>Targets (comma-separated provider/pool/account IDs)</label><input value=${(draft.params?.targets || []).join(", ")} onInput=${(e) => updateParam("targets", e.target.value.split(",").map((s) => s.trim()).filter(Boolean))} placeholder="anthropic, codex-pool" /></div>
+          ` : null}
+
+          ${t === "time-window" ? html`
+            <div className="full"><label>Windows (JSON: [{ days: ["mon-fri"], hours: [9, 17], tz: "Europe/Vienna" }])</label><textarea rows="4" value=${JSON.stringify(draft.params?.windows || [], null, 2)} onInput=${(e) => { try { updateParam("windows", JSON.parse(e.target.value)); } catch {} }} /></div>
+          ` : null}
+
+          ${t === "error-blacklist" ? html`
+            <div><label>Window (minutes)</label><input type="number" value=${draft.params?.windowMinutes || 5} onInput=${(e) => updateParam("windowMinutes", parseInt(e.target.value) || 5)} /></div>
+          ` : null}
+
+          ${t === "model-fit" ? [
+            html`<div key="ctx"><label>Min context</label><input type="number" value=${draft.params?.minContext || 0} onInput=${(e) => updateParam("minContext", parseInt(e.target.value) || 0)} /></div>`,
+            html`<div key="tools"><label>Require tools</label><select value=${String(!!draft.params?.requireTools)} onChange=${(e) => updateParam("requireTools", e.target.value === "true")}><option value="false">No</option><option value="true">Yes</option></select></div>`,
+            html`<div key="vis"><label>Require vision</label><select value=${String(!!draft.params?.requireVision)} onChange=${(e) => updateParam("requireVision", e.target.value === "true")}><option value="false">No</option><option value="true">Yes</option></select></div>`,
+          ] : null}
+
+          ${t === "custom" ? html`
+            <div className="full"><label>Script path (relative to ~/.pi/agent/)</label><input value=${draft.params?.code || ""} onInput=${(e) => updateParam("code", e.target.value)} placeholder="rules/my-rule.js" /></div>
+          ` : null}
         </div>
         <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
       </div>
@@ -630,17 +802,149 @@ function PresetEditor({ presets, names, onSave }) {
   }
 
   return html`<div>
-    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Presets</h2><button className="btn primary" onClick=${startNew}>+ Add</button></div>
-    ${presets.map((p) => editing === p.name ? renderForm(false) : html`
-      <div className="card" key=${p.name}>
+    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Routing rules</h2>${!readOnly ? html`<button className="btn primary" onClick=${startNew}>+ Add rule</button>` : null}</div>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Reusable decision pieces. Used by modes to filter and rank candidates per request.</div>
+    ${rules.length === 0 && editing !== "__new__" ? html`<div className="empty">No routing rules. Add a time-window rule to boost a provider during specific hours, or a quota-burn rule to use expiring quotas first.</div>` : null}
+    ${rules.map((r) => editing === r.id ? renderForm(false) : html`
+      <div className="card" key=${r.id}>
         <div className="card-row">
-          <div><span className="name">${p.name}</span><span className=${`badge ${p.enabled !== false ? "on" : "off"}`}>${p.enabled !== false ? "on" : "off"}</span><span className="badge neutral">${(p.entries || []).length} entries</span></div>
-          <div className="actions"><button className="btn" onClick=${() => startEdit(p)}>Edit</button><button className="btn danger" onClick=${() => del(p.name)}>Del</button></div>
+          <div><span className="name">${r.id}</span><span className="badge neutral">${r.type}</span></div>
+          ${!readOnly ? html`<div className="actions"><button className="btn" onClick=${() => startEdit(r)}>Edit</button><button className="btn danger" onClick=${() => del(r.id)}>Del</button></div>` : null}
         </div>
-        <div className="meta">${(p.entries || []).filter((e) => e.enabled !== false).map((e) => e.provider).join(" -> ") || "no entries"}</div>
+        ${r.description ? html`<div className="meta">${r.description}</div>` : null}
+        <div className="meta" style=${{ fontFamily: "monospace", fontSize: "11px" }}>${JSON.stringify(r.params || {})}</div>
       </div>
     `)}
     ${editing === "__new__" ? renderForm(true) : null}
+  </div>`;
+}
+
+// ── Modes editor ──
+
+function ModeEditor({ modes, rules, names, onSave, readOnly }) {
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState({});
+
+  function startNew() { setEditing("__new__"); setDraft({ id: "", description: "", candidates: [], rules: [], onError: "next-in-order", enabled: true }); }
+  function startEdit(m) { setEditing(m.id); setDraft({ ...m, candidates: [...(m.candidates || [])], rules: [...(m.rules || [])] }); }
+  function cancel() { setEditing(null); }
+
+  async function save() {
+    const cfg = await api("/v1/config");
+    const all = [...(cfg.modes || [])];
+    if (editing === "__new__") all.push(draft);
+    else {
+      const i = all.findIndex((m) => m.id === editing);
+      if (i >= 0) all[i] = draft;
+    }
+    await api("/v1/config", jput({ modes: all }));
+    setEditing(null); onSave();
+  }
+  async function del(id) {
+    if (!confirm(`Delete mode "${id}"?`)) return;
+    const cfg = await api("/v1/config");
+    const all = (cfg.modes || []).filter((m) => m.id !== id);
+    await api("/v1/config", jput({ modes: all }));
+    onSave();
+  }
+
+  function addCandidate(val) { if (val && !draft.candidates.includes(val)) setDraft({ ...draft, candidates: [...draft.candidates, val] }); }
+  function removeCandidate(i) { setDraft({ ...draft, candidates: draft.candidates.filter((_, idx) => idx !== i) }); }
+  function addRule(val) { if (val && !draft.rules.includes(val)) setDraft({ ...draft, rules: [...draft.rules, val] }); }
+  function removeRule(i) { setDraft({ ...draft, rules: draft.rules.filter((_, idx) => idx !== i) }); }
+
+  function renderForm(isNew) {
+    const allRefs = [
+      ...((names?.providers || []).map((p) => p.id)),
+      ...((names?.pools || []).map((p) => p.label)),
+      ...modes.filter((m) => m.id !== draft.id).map((m) => m.id),
+    ];
+    const remainingCandidates = allRefs.filter((r) => !draft.candidates.includes(r));
+    const remainingRules = rules.map((r) => r.id).filter((r) => !draft.rules.includes(r));
+
+    return html`
+      <div className="card">
+        <div className="form-grid">
+          <div><label>ID</label><input value=${draft.id} onInput=${(e) => setDraft({ ...draft, id: e.target.value })} placeholder="e.g. coding-premium" disabled=${!isNew} /></div>
+          <div><label>On error</label><select value=${draft.onError} onChange=${(e) => setDraft({ ...draft, onError: e.target.value })}><option value="next-in-order">next-in-order</option><option value="re-evaluate">re-evaluate</option><option value="fail-fast">fail-fast</option></select></div>
+          <div className="full"><label>Description</label><input value=${draft.description || ""} onInput=${(e) => setDraft({ ...draft, description: e.target.value })} /></div>
+
+          <div className="full">
+            <label>Candidates (drag to reorder; accounts, pools, or other modes)</label>
+            <${SortableList} items=${draft.candidates} onReorder=${(arr) => setDraft({ ...draft, candidates: arr })} renderItem=${(c, i) => html`
+              <span style=${{ flex: 1, fontSize: "13px", color: "#e4e4e7" }}>${c}</span>
+              <button className="btn danger" onClick=${() => removeCandidate(i)} style=${{ padding: "2px 8px", fontSize: "11px" }}>x</button>
+            `} />
+            ${remainingCandidates.length > 0 ? html`
+              <select onChange=${(e) => { addCandidate(e.target.value); e.target.value = ""; }} style=${{ width: "100%", marginTop: "4px" }}>
+                <option value="">+ Add candidate...</option>
+                ${remainingCandidates.map((r) => html`<option key=${r} value=${r}>${r}</option>`)}
+              </select>
+            ` : null}
+          </div>
+
+          <div className="full">
+            <label>Rules (applied in order)</label>
+            <${SortableList} items=${draft.rules} onReorder=${(arr) => setDraft({ ...draft, rules: arr })} renderItem=${(r, i) => html`
+              <span style=${{ flex: 1, fontSize: "13px", color: "#e4e4e7" }}>${r}</span>
+              <button className="btn danger" onClick=${() => removeRule(i)} style=${{ padding: "2px 8px", fontSize: "11px" }}>x</button>
+            `} />
+            ${remainingRules.length > 0 ? html`
+              <select onChange=${(e) => { addRule(e.target.value); e.target.value = ""; }} style=${{ width: "100%", marginTop: "4px" }}>
+                <option value="">+ Add rule...</option>
+                ${remainingRules.map((r) => html`<option key=${r} value=${r}>${r}</option>`)}
+              </select>
+            ` : null}
+          </div>
+        </div>
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
+      </div>
+    `;
+  }
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Modes</h2>${!readOnly ? html`<button className="btn primary" onClick=${startNew}>+ Add mode</button>` : null}</div>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Cross-provider routing pipelines. Modes declare candidates + rules, then per-request the rules filter and rank to pick the best one.</div>
+    ${modes.length === 0 && editing !== "__new__" ? html`<div className="empty">No modes. Create a mode that mixes Anthropic, OpenAI, and your pools, then attach rules to control selection.</div>` : null}
+    ${modes.map((m) => editing === m.id ? renderForm(false) : html`
+      <div className="card" key=${m.id}>
+        <div className="card-row">
+          <div><span className="name">${m.id}</span><span className="badge neutral">${(m.candidates || []).length} candidates</span><span className="badge neutral">${(m.rules || []).length} rules</span><span className="badge neutral">on error: ${m.onError}</span></div>
+          ${!readOnly ? html`<div className="actions"><button className="btn" onClick=${() => startEdit(m)}>Edit</button><button className="btn danger" onClick=${() => del(m.id)}>Del</button></div>` : null}
+        </div>
+        ${m.description ? html`<div className="meta">${m.description}</div>` : null}
+        <div className="meta">candidates: ${(m.candidates || []).join(", ")}</div>
+        ${m.rules?.length ? html`<div className="meta">rules: ${m.rules.join(" -> ")}</div>` : null}
+      </div>
+    `)}
+    ${editing === "__new__" ? renderForm(true) : null}
+  </div>`;
+}
+
+// ── Routing tab combines rules + modes ──
+
+function RoutingPanel({ onRefresh }) {
+  const [config, setConfig] = useState(null);
+  const [err, setErr] = useState("");
+  const { names, reloadNames } = useNames();
+
+  async function load() { setErr(""); try { setConfig(await api("/v1/config")); } catch (e) { setErr(e.message); } }
+  useEffect(() => { load(); }, []);
+
+  async function refresh() { await load(); reloadNames(); if (onRefresh) onRefresh(); }
+
+  if (!config) return html`<div className="empty">${err || "Loading..."}</div>`;
+
+  const readOnly = !!config._readOnly;
+
+  return html`<div>
+    ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
+    ${readOnly ? html`<div className="card" style=${{ borderColor: "#92400e", background: "#1c1508", marginBottom: "16px" }}><span style=${{ color: "#f59e0b", fontWeight: 600 }}>Read-only:</span> config managed by ${config._source}. Edit the file directly to make changes.</div>` : null}
+    <${RoutingRuleEditor} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
+    <div style=${{ marginTop: "24px" }} />
+    <${ModeEditor} modes=${config.modes || []} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
+    <div style=${{ marginTop: "24px" }} />
+    <${PresetEditor} presets=${config.presets || []} modes=${config.modes || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
   </div>`;
 }
 
@@ -658,18 +962,21 @@ function ConfigPanel({ onRefresh }) {
 
   if (!config) return html`<div className="empty">${err || "Loading..."}</div>`;
 
+  const readOnly = !!config._readOnly;
+
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
+    ${readOnly ? html`<div className="card" style=${{ borderColor: "#92400e", background: "#1c1508", marginBottom: "16px" }}><span style=${{ color: "#f59e0b", fontWeight: 600 }}>Read-only:</span> config managed by ${config._source}. Edit the JS file directly to make changes.</div>` : null}
     <${AuthPanel} onRefresh=${refresh} reloadNames=${reloadNames} />
     <div style=${{ marginTop: "24px" }} />
     <${ApiKeyEditor} apiKeys=${config.apiKeys || []} onSave=${refresh} />
     <div style=${{ marginTop: "24px" }} />
-    <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ~/.pi/agent/multi-pass.json</div>
+    <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ${config._source || "~/.pi/agent/multi-pass.json"}</div>
     <${PoolEditor} pools=${config.pools || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
     <${ChainEditor} chains=${config.chains || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
-    <${PresetEditor} presets=${config.presets || []} names=${names} onSave=${refresh} />
+    <div style=${{ fontSize: "11px", color: "#52525b", marginBottom: "6px" }}>Tip: for cross-provider intent routing with rules, use the <strong>Routing</strong> tab.</div>
   </div>`;
 }
 
@@ -1042,7 +1349,7 @@ function App() {
 
   function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
 
-  const tabs = ["dashboard", "config", "users", "rules", "audit"];
+  const tabs = ["dashboard", "config", "routing", "users", "rules", "audit"];
 
   return html`
     <div className="app">
@@ -1058,6 +1365,7 @@ function App() {
         ${error ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${error}</div>` : null}
         ${tab === "dashboard" ? html`<${DashboardPanel} data=${dash} />` : null}
         ${tab === "config" ? html`<${ConfigPanel} onRefresh=${() => load("dashboard", true)} />` : null}
+        ${tab === "routing" ? html`<${RoutingPanel} onRefresh=${() => load("dashboard", true)} />` : null}
         ${tab === "users" ? html`<${UsersPanel} />` : null}
         ${tab === "rules" ? html`<${RulesPanel} rules=${rules} onRefresh=${() => load("rules")} />` : null}
         ${tab === "audit" ? html`<${AuditPanel} entries=${audit} onRefresh=${() => load("audit")} />` : null}
