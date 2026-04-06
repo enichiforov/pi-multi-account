@@ -43,15 +43,24 @@ function useNames() {
 
 /** Dropdown for selecting a provider/subscription */
 function ProviderSelect({ value, onChange, names, allowPools, allowChains, placeholder }) {
-  const provs = names?.providers || [];
+  const allProvs = names?.providers || [];
+  const oauthProvs = allProvs.filter((p) => p.type !== "apikey");
+  const apiKeyProvs = allProvs.filter((p) => p.type === "apikey");
   const pools = names?.pools || [];
   const chains = names?.chains || [];
   return html`
     <select value=${value || ""} onChange=${(e) => onChange(e.target.value)}>
       <option value="">${placeholder || "-- select --"}</option>
-      <optgroup label="Providers">
-        ${provs.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}${p.authenticated ? "" : " (no auth)"}</option>`)}
-      </optgroup>
+      ${oauthProvs.length ? html`
+        <optgroup label="OAuth providers">
+          ${oauthProvs.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}${p.authenticated ? "" : " (no auth)"}</option>`)}
+        </optgroup>
+      ` : null}
+      ${apiKeyProvs.length ? html`
+        <optgroup label="API keys">
+          ${apiKeyProvs.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}</option>`)}
+        </optgroup>
+      ` : null}
       ${allowPools && pools.length ? html`
         <optgroup label="Pools">
           ${pools.map((p) => html`<option key=${p.id} value=${p.id}>${p.label}</option>`)}
@@ -458,7 +467,9 @@ function ApiKeyEditor({ apiKeys, onSave }) {
 function PoolEditor({ pools, names, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
-  const providerNames = (names?.providers || []).map((p) => p.id);
+  const allProviders = names?.providers || [];
+  const providerNames = allProviders.map((p) => p.id);
+  const apiKeyNames = allProviders.filter((p) => p.type === "apikey").map((p) => p.id);
 
   function startEdit(p) { setEditing(p.name); setDraft({ ...p, members: [...(p.members || [])] }); }
   function startNew() { setEditing("__new__"); setDraft({ name: "", enabled: true, baseProvider: BASE_PROVIDERS[0], members: [], strategy: "round-robin" }); }
@@ -475,7 +486,8 @@ function PoolEditor({ pools, names, onSave }) {
 
   function renderForm(isNew) {
     // Filter providers to those matching the base provider
-    const eligible = providerNames.filter((n) => n === draft.baseProvider || n.startsWith(draft.baseProvider + "-"));
+    // OAuth providers matching the base provider + all API key entries
+    const eligible = providerNames.filter((n) => n === draft.baseProvider || n.startsWith(draft.baseProvider + "-") || apiKeyNames.includes(n));
     return html`
       <div className="card">
         <div className="form-grid">
