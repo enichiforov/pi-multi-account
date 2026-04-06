@@ -96,7 +96,7 @@ function ensureDir() {
 }
 
 function loadConfig() {
-	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [] };
+	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] };
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 		return {
@@ -105,9 +105,13 @@ function loadConfig() {
 			chains: Array.isArray(raw.chains) ? raw.chains : [],
 			presets: Array.isArray(raw.presets) ? raw.presets : [],
 			apiKeys: Array.isArray(raw.apiKeys) ? raw.apiKeys : [],
+			// v2 fields (optional)
+			accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
+			modes: Array.isArray(raw.modes) ? raw.modes : [],
+			routingRules: Array.isArray(raw.routingRules) ? raw.routingRules : [],
 		};
 	} catch {
-		return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [] };
+		return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] };
 	}
 }
 
@@ -1653,6 +1657,290 @@ async function runCustomSelector(pool, available, currentProvider, modelId) {
 	return null;
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Routing v2: accounts -> modes -> rules pipeline
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// New routing model that runs alongside the legacy pool/chain/preset path.
+// A request is routed via v2 only if `model` resolves to a v2 mode or to a
+// v2 preset (which references a mode). Otherwise we fall back to the legacy
+// routing in resolveCandidates().
+//
+// Built-in rule types:
+//   time-window     -- score boost during specified time windows
+//   quota-burn      -- score boost for accounts whose quota expires soonest
+//   cost-tier       -- score boost for cheap/free accounts
+//   model-fit       -- filter out accounts that can't serve the request
+//   error-blacklist -- filter out accounts that errored recently
+//   cooldown        -- filter out exhausted accounts (default applied)
+//   custom          -- run a JS function (file path or inline)
+
+const ROUTING_RULE_REGISTRY = {
+	"time-window": (params) => async (candidates, ctx) => {
+		const targets = new Set(params.targets || []);
+		const boost = params.boost ?? 50;
+		const now = ctx.now || new Date();
+		const dow = JS_DAY_TO_DOW[now.getDay()];
+		const hour = now.getHours();
+		const inWindow = (params.windows || []).some((w) => {
+			if (w.days && !w.days.includes(dow) && !w.days.some((d) => expandDayRange(d).includes(dow))) return false;
+			if (w.hours && !isInHourRange(hour, w.hours)) return false;
+			return true;
+		});
+		if (!inWindow) return { candidates };
+		const scores = {};
+		for (const c of candidates) {
+			const matches = targets.has(c.id) || (c.poolId && targets.has(c.poolId));
+			if (matches || targets.size === 0) scores[c.id] = boost;
+		}
+		return { candidates, scores };
+	},
+
+	"quota-burn": (params) => async (candidates, ctx) => {
+		const scores = {};
+		await Promise.all(candidates.map(async (c) => {
+			try {
+				const detail = await checkQuotaDetailed(c.id);
+				if (detail?.windows?.length) {
+					const earliest = detail.windows
+						.map((w) => w.resetAt ? new Date(w.resetAt).getTime() : Infinity)
+						.reduce((a, b) => Math.min(a, b), Infinity);
+					if (earliest !== Infinity) {
+						const hoursUntilReset = (earliest - Date.now()) / (60 * 60 * 1000);
+						// Smaller hoursUntilReset = higher boost (use it before you lose it)
+						scores[c.id] = Math.max(0, 100 - hoursUntilReset);
+					}
+				}
+			} catch {}
+		}));
+		return { candidates, scores };
+	},
+
+	"cost-tier": (params) => async (candidates, ctx) => {
+		const targets = new Set(params.targets || []);
+		const boost = params.boost ?? 30;
+		const scores = {};
+		for (const c of candidates) {
+			if (targets.has(c.id) || (c.poolId && targets.has(c.poolId))) scores[c.id] = boost;
+		}
+		return { candidates, scores };
+	},
+
+	"model-fit": (params) => async (candidates, ctx) => {
+		const minContext = params.minContext || 0;
+		const requireTools = !!params.requireTools;
+		const requireVision = !!params.requireVision;
+		// Filter is best-effort -- without per-model metadata we mostly let things through.
+		// Custom rules can do more sophisticated checks.
+		return { candidates };
+	},
+
+	"error-blacklist": (params) => async (candidates, ctx) => {
+		const windowMs = (params.windowMinutes || 5) * 60 * 1000;
+		const now = Date.now();
+		const recentErrored = new Set(
+			(ctx.history || [])
+				.filter((h) => h.error && (now - new Date(h.timestamp).getTime()) < windowMs)
+				.map((h) => h.candidate)
+		);
+		return { candidates: candidates.filter((c) => !recentErrored.has(c.id)) };
+	},
+
+	"cooldown": (params) => async (candidates, ctx) => {
+		return { candidates: candidates.filter((c) => !isExhausted(c.id)) };
+	},
+
+	"custom": (params) => {
+		// Inline function or file path
+		if (typeof params.fn === "function") return params.fn;
+		if (params.code) {
+			const path = params.code;
+			return async (candidates, ctx) => {
+				try {
+					const fn = await loadCustomRoutingRule(path);
+					if (typeof fn === "function") return await fn(candidates, ctx);
+				} catch (e) { log(`[rule:custom] error in ${path}: ${e.message}`); }
+				return { candidates };
+			};
+		}
+		return async (candidates) => ({ candidates });
+	},
+};
+
+const customRuleCache = new Map();
+async function loadCustomRoutingRule(scriptPath) {
+	let resolved = scriptPath;
+	if (!scriptPath.startsWith("/") && !scriptPath.startsWith("~/")) {
+		resolved = join(AGENT_DIR, scriptPath);
+	} else if (scriptPath.startsWith("~/")) {
+		const home = process.env.HOME || process.env.USERPROFILE || "";
+		resolved = join(home, scriptPath.slice(2));
+	}
+	if (customRuleCache.has(resolved)) return customRuleCache.get(resolved);
+	if (!existsSync(resolved)) return null;
+	try {
+		const mod = await import(`file://${resolved}?t=${Date.now()}`);
+		const fn = mod.default || mod.rule;
+		customRuleCache.set(resolved, fn);
+		return fn;
+	} catch (e) { log(`[rule:custom] failed to load ${resolved}: ${e.message}`); return null; }
+}
+
+function expandDayRange(spec) {
+	const days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+	const m = spec.match(/^(mon|tue|wed|thu|fri|sat|sun)-(mon|tue|wed|thu|fri|sat|sun)$/);
+	if (!m) return [spec];
+	const a = days.indexOf(m[1]);
+	const b = days.indexOf(m[2]);
+	if (a < 0 || b < 0) return [spec];
+	const out = [];
+	let i = a;
+	while (true) { out.push(days[i]); if (i === b) break; i = (i + 1) % 7; }
+	return out;
+}
+
+/** Compile a rule config entry into an apply function. */
+function compileRoutingRule(ruleConfig) {
+	const factory = ROUTING_RULE_REGISTRY[ruleConfig.type];
+	if (!factory) { log(`[rule] unknown type: ${ruleConfig.type}`); return null; }
+	return factory(ruleConfig.params || {});
+}
+
+/**
+ * Resolve a list of candidate references (account IDs, pool IDs, mode IDs)
+ * into a flat list of account candidates. Detects cycles and limits depth.
+ */
+function expandModeCandidates(refs, config, depth = 0, visited = new Set()) {
+	if (depth > 5) { log("[mode] max depth exceeded"); return []; }
+	const out = [];
+	for (const rawRef of refs || []) {
+		// Strip "pool:" / "mode:" prefixes -- both forms accepted
+		const ref = rawRef.replace(/^(pool|mode):/, "");
+		if (visited.has(ref)) continue;
+		visited.add(ref);
+
+		// Account?
+		const account = config.accounts.find((a) => a.id === ref);
+		if (account) { out.push({ id: account.id, account }); continue; }
+
+		// API key entry (legacy v1 shape, treat as account)
+		const apiKey = config.apiKeys.find((k) => k.name === ref);
+		if (apiKey) { out.push({ id: apiKey.name, account: { id: apiKey.name, kind: "apiKey", ...apiKey } }); continue; }
+
+		// OAuth subscription/provider (treat as implicit account)
+		if (getBaseProvider(ref) || SUPPORTED_PROVIDERS.includes(ref)) {
+			out.push({ id: ref, account: { id: ref, kind: "oauth", provider: getBaseProvider(ref) || ref } });
+			continue;
+		}
+
+		// Pool?
+		const pool = config.pools.find((p) => (p.name === ref || p.id === ref) && p.enabled !== false);
+		if (pool) {
+			for (const m of pool.members || []) {
+				if (visited.has(m)) continue;
+				const sub = expandModeCandidates([m], config, depth + 1, visited);
+				for (const s of sub) { s.poolId = pool.name || pool.id; out.push(s); }
+			}
+			continue;
+		}
+
+		// Mode?
+		const mode = config.modes.find((m) => m.id === ref);
+		if (mode) {
+			const sub = expandModeCandidates(mode.candidates, config, depth + 1, visited);
+			for (const s of sub) { s.modeId = mode.id; out.push(s); }
+			continue;
+		}
+
+		log(`[mode] unknown candidate ref: ${rawRef}`);
+	}
+	return out;
+}
+
+/** Resolve a model/preset ID to a v2 mode + preset (if applicable). */
+function resolveV2Route(modelOrPresetId) {
+	const config = loadConfig();
+	let preset = config.presets.find((p) => p.id === modelOrPresetId || p.name === modelOrPresetId);
+	let mode;
+	if (preset && preset.mode) {
+		mode = config.modes.find((m) => m.id === preset.mode);
+	} else {
+		mode = config.modes.find((m) => m.id === modelOrPresetId);
+	}
+	if (!mode) return null;
+	return { config, preset, mode };
+}
+
+/**
+ * Run the v2 routing pipeline. Returns an ordered list of { provider, modelId, model }
+ * candidates compatible with the existing chat handler loop.
+ */
+async function routeViaV2(modelOrPresetId, ctx) {
+	const route = resolveV2Route(modelOrPresetId);
+	if (!route) return null;
+	const { config, preset, mode } = route;
+
+	// 1. Expand candidates (accounts/pools/nested modes)
+	let candidates = expandModeCandidates(mode.candidates, config);
+	if (candidates.length === 0) return [];
+
+	// 2. Always apply cooldown filter (skip exhausted)
+	candidates = candidates.filter((c) => !isExhausted(c.id));
+
+	// 3. Build accumulated scores from rules
+	const scores = {};
+	for (const ruleId of (mode.rules || [])) {
+		const ruleConfig = config.routingRules.find((r) => r.id === ruleId);
+		if (!ruleConfig) { log(`[mode:${mode.id}] rule not found: ${ruleId}`); continue; }
+		const apply = compileRoutingRule(ruleConfig);
+		if (!apply) continue;
+		try {
+			const result = await apply(candidates, ctx);
+			if (result?.candidates) candidates = result.candidates;
+			if (result?.scores) {
+				for (const [id, s] of Object.entries(result.scores)) {
+					scores[id] = (scores[id] || 0) + s;
+				}
+			}
+		} catch (e) { log(`[rule:${ruleId}] error: ${e.message}`); }
+	}
+
+	// 4. Sort by accumulated score (descending), tie-break by original order
+	candidates.sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
+
+	// 5. Pick the model. Prefer preset.preferredModels in order, fall back to fallbackModels.
+	const preferredModels = preset?.preferredModels || [];
+	const fallbackModels = preset?.fallbackModels || [];
+	const modelOrder = [...preferredModels, ...fallbackModels];
+
+	const result = [];
+	for (const cand of candidates) {
+		const providerName = cand.account?.id || cand.id;
+		// Try each model in preference order
+		const tries = modelOrder.length > 0 ? modelOrder : [null];
+		for (const wantedModel of tries) {
+			let modelId = wantedModel;
+			if (!modelId) {
+				// No preference -- pick the provider's first available model
+				try {
+					const base = getBaseProvider(providerName) || cand.account?.provider;
+					if (base) {
+						const models = getModels(base);
+						modelId = models[0]?.id;
+					}
+				} catch {}
+			}
+			if (!modelId) continue;
+			const model = tryGetModel(providerName, modelId);
+			if (model) {
+				result.push({ model, provider: providerName, modelId, score: scores[cand.id] || 0 });
+				break; // one model per candidate is enough; the loop tries next candidate
+			}
+		}
+	}
+	return result;
+}
+
 // ─── Model resolution ─────────────────────────────────────────────────────────
 
 function tryGetModel(providerName, modelId) {
@@ -1746,6 +2034,15 @@ async function applyPoolStrategy(pool, members, modelId) {
 
 async function resolveCandidates(modelId) {
 	const config = loadConfig();
+
+	// ── v2 routing: check if this is a mode or v2 preset ──
+	if (config.modes.length > 0 || (config.presets.some((p) => p.mode))) {
+		const v2 = await routeViaV2(modelId, { now: new Date(), history: [] });
+		if (v2 && v2.length > 0) {
+			log(`[v2] routed ${modelId} -> ${v2.length} candidates`);
+			return v2;
+		}
+	}
 
 	// ── 0. Pool-scoped: "pool:<name>" or "pool:<name>/<model>" ──
 	const poolMatch = modelId.match(/^pool:([^/]+)(?:\/(.+))?$/);

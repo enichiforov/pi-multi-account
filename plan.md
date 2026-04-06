@@ -442,12 +442,45 @@ These mirror Gabriel's open questions:
 - [ ] **Phase 11**: migration helper (CLI + automatic on first load).
 - [ ] **Phase 12**: docs update + examples (v2 quickstart, JS config example, rule cookbook).
 
-## Open question for Gabriel
+## Decisions on the open questions
 
-Two things I'd like sanity-checked before we start coding:
+Both questions resolved without waiting -- the answers are clear and we can iterate later if real use shows otherwise.
 
-1. **Mode candidates can include other modes** (composition). Would you actually use this, or is it overkill? Example: a `coding-premium` mode could be `candidates: ['coding-premium-paid', 'coding-budget']` so it falls through to the cheaper mode if all paid candidates fail.
+### Q1: Mode composition -- YES
 
-2. **Rules return ranked candidates with scores, not just filtered lists.** This lets multiple rules cooperate (rule A boosts Anthropic, rule B boosts cheap, final score is sum). Is that the right primitive, or would `filter -> sort` (binary in/out) be simpler?
+`mode.candidates` accepts account IDs, pool IDs, AND other mode IDs.
 
-If you have time to react before we start phase 2, that'd help shape the API surface.
+Rules:
+- Inner mode's **candidates** flatten into the outer mode's candidate list
+- Inner mode's **rules** do NOT propagate (the outer mode owns the pipeline)
+- Cycles detected at config load time and rejected with a clear error
+- Max nesting depth: 5
+
+Example use case (Gabriel's pattern):
+```js
+mode("coding-premium", { candidates: ["openai-shared", "anthropic-shared", "coding-budget"], ... })
+mode("coding-budget", { candidates: ["openrouter", "copilot-main"], ... })
+```
+When `coding-premium` exhausts paid options, the outer pipeline reaches the candidates pulled in from `coding-budget`. No special "fallback chain" concept needed.
+
+### Q2: Scored rules + filtering -- BOTH
+
+Rules return `{ candidates, scores }`:
+- **Filter**: shrink the `candidates` array (binary in/out)
+- **Score**: add entries to the `scores` map (additive, multiple rules can boost the same candidate)
+- **Annotate**: attach metadata to a per-request context (other rules read it)
+
+The router accumulates scores across all rules, sorts the final candidates by total score (descending), then tries them in order.
+
+Default score for unscored candidates: 0. Negative scores allowed (deboost).
+
+Built-in rule defaults:
+- `time-window` -> scores (boosts targets)
+- `quota-burn` -> scores (higher score for sooner-expiring quota)
+- `cost-tier` -> scores (higher score for cheaper options)
+- `cooldown` -> filters (removes exhausted)
+- `model-fit` -> filters (removes too-small context)
+- `error-blacklist` -> filters (removes recent errors)
+- `custom` -> can do any combination
+
+This gives us simple filters when you want strict in/out and scoring when you want soft preferences. They compose without ceremony.
