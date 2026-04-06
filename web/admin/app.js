@@ -1422,7 +1422,6 @@ function RoutingPanel({ onRefresh }) {
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
     ${readOnly ? html`<div className="card" style=${{ borderColor: "#92400e", background: "#1c1508", marginBottom: "16px" }}><span style=${{ color: "#f59e0b", fontWeight: 600 }}>Read-only:</span> config managed by ${config._source}. Edit the file directly to make changes.</div>` : null}
-    ${!readOnly ? html`<${AiEditPanel} config=${config} onApplied=${refresh} />` : null}
     <${RoutingRuleEditor} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
     <div style=${{ marginTop: "24px" }} />
     <${ModeEditor} modes=${config.modes || []} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
@@ -1452,6 +1451,7 @@ function ConfigPanel({ onRefresh }) {
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
     ${readOnly ? html`<div className="card" style=${{ borderColor: "#92400e", background: "#1c1508", marginBottom: "16px" }}><span style=${{ color: "#f59e0b", fontWeight: 600 }}>Read-only:</span> config managed by ${config._source}. Edit the JS file directly to make changes.</div>` : null}
+    ${!readOnly ? html`<${AiEditPanel} config=${config} onApplied=${refresh} />` : null}
     <${AuthPanel} onRefresh=${refresh} reloadNames=${reloadNames} />
     <div style=${{ marginTop: "24px" }} />
     <${ApiKeyEditor} apiKeys=${config.apiKeys || []} onSave=${refresh} />

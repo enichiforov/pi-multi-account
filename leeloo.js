@@ -2135,8 +2135,14 @@ const ROUTING_RULE_REGISTRY = {
 	},
 
 	"quota-burn": (params) => async (candidates, ctx) => {
+		const targets = new Set(params.targets || []);
+		const scoreMax = params.maxBoost ?? 100;
 		const scores = {};
-		await Promise.all(candidates.map(async (c) => {
+		// Filter to targeted candidates only when targets is set
+		const eligible = targets.size > 0
+			? candidates.filter((c) => targets.has(c.id) || (c.poolId && targets.has(c.poolId)))
+			: candidates;
+		await Promise.all(eligible.map(async (c) => {
 			try {
 				const detail = await checkQuotaDetailed(c.id);
 				if (detail?.windows?.length) {
@@ -2146,7 +2152,7 @@ const ROUTING_RULE_REGISTRY = {
 					if (earliest !== Infinity) {
 						const hoursUntilReset = (earliest - Date.now()) / (60 * 60 * 1000);
 						// Smaller hoursUntilReset = higher boost (use it before you lose it)
-						scores[c.id] = Math.max(0, 100 - hoursUntilReset);
+						scores[c.id] = Math.max(0, scoreMax - hoursUntilReset);
 					}
 				}
 			} catch {}
