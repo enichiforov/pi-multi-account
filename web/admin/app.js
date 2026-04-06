@@ -385,14 +385,12 @@ function ScheduleEditor({ members, schedule, onChange }) {
 
 // ── API Keys ──
 
-const API_KEY_TYPES = ["openai", "anthropic", "azure", "custom"];
-
 function ApiKeyEditor({ apiKeys, onSave }) {
   const [editing, setEditing] = useState(null);
   const [draft, setDraft] = useState({});
   const [modelDraft, setModelDraft] = useState("");
 
-  function startNew() { setEditing("__new__"); setDraft({ name: "", type: "openai", key: "", baseUrl: "https://api.openai.com/v1", models: [], enabled: true, label: "" }); }
+  function startNew() { setEditing("__new__"); setDraft({ name: "", key: "", models: [], enabled: true, label: "" }); }
   function startEdit(k) { setEditing(k.name); setDraft({ ...k, models: [...(k.models || [])] }); }
   function cancel() { setEditing(null); }
 
@@ -411,19 +409,16 @@ function ApiKeyEditor({ apiKeys, onSave }) {
       <div className="card" style=${{ marginBottom: "10px" }}>
         <div className="form-grid">
           <div><label>Name (unique ID)</label><input value=${draft.name} onInput=${(e) => setDraft({ ...draft, name: e.target.value })} placeholder="e.g. oai-team-1" disabled=${!isNew} style=${!isNew ? { opacity: 0.6 } : {}} /></div>
-          <div><label>Label</label><input value=${draft.label || ""} onInput=${(e) => setDraft({ ...draft, label: e.target.value })} placeholder="e.g. Team key" /></div>
-          <div><label>Type</label><select value=${draft.type} onChange=${(e) => setDraft({ ...draft, type: e.target.value })}>${API_KEY_TYPES.map((t) => html`<option key=${t} value=${t}>${t}</option>`)}</select></div>
-          <div><label>Enabled</label><select value=${String(draft.enabled)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
+          <div><label>Label</label><input value=${draft.label || ""} onInput=${(e) => setDraft({ ...draft, label: e.target.value })} placeholder="e.g. Team account" /></div>
           <div className="full"><label>API Key</label><input type="password" value=${draft.key || ""} onInput=${(e) => setDraft({ ...draft, key: e.target.value })} placeholder="sk-..." /></div>
-          <div className="full"><label>Base URL</label><input value=${draft.baseUrl || ""} onInput=${(e) => setDraft({ ...draft, baseUrl: e.target.value })} placeholder="https://api.openai.com/v1" /></div>
           <div className="full">
-            <label>Models (empty = any model accepted)</label>
+            <label>Models (empty = any model)</label>
             <div style=${{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
-              ${draft.models.map((m, i) => html`<span key=${m} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => removeModel(i)}>${m} x</span>`)}
-              ${draft.models.length === 0 ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>Any model (no restriction)</span>` : null}
+              ${(draft.models || []).map((m, i) => html`<span key=${m} className="badge on" style=${{ cursor: "pointer", fontSize: "12px", padding: "3px 8px" }} onClick=${() => removeModel(i)}>${m} x</span>`)}
+              ${!draft.models?.length ? html`<span style=${{ color: "#52525b", fontSize: "12px" }}>Any model</span>` : null}
             </div>
             <div style=${{ display: "flex", gap: "6px" }}>
-              <input value=${modelDraft} onInput=${(e) => setModelDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); addModel(); } }} placeholder="e.g. gpt-4o" style=${{ flex: 1 }} />
+              <input value=${modelDraft} onInput=${(e) => setModelDraft(e.target.value)} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); addModel(); } }} placeholder="e.g. gpt-4o, claude-sonnet-4-20250514" style=${{ flex: 1 }} />
               <button className="btn" onClick=${addModel}>+</button>
             </div>
           </div>
@@ -435,7 +430,7 @@ function ApiKeyEditor({ apiKeys, onSave }) {
 
   return html`<div>
     <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>API keys</h2><button className="btn primary" onClick=${startNew}>+ Add key</button></div>
-    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Add raw API keys for OpenAI, Anthropic, Azure, or any OpenAI-compatible endpoint. Pool and route them just like OAuth accounts.</div>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Add raw API keys for any OpenAI-compatible endpoint. Pool and route them just like OAuth accounts.</div>
     ${editing === "__new__" ? renderForm(true) : null}
     ${apiKeys.map((k) => editing === k.name ? renderForm(false) : html`
       <div className="card" key=${k.name}>
@@ -443,7 +438,6 @@ function ApiKeyEditor({ apiKeys, onSave }) {
           <div>
             <span className="name">${k.label || k.name}</span>
             <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${k.name}</span>
-            <span className="badge neutral">${k.type}</span>
             <span className=${`badge ${k.enabled !== false ? "on" : "off"}`}>${k.enabled !== false ? "active" : "disabled"}</span>
             ${k.models?.length ? html`<span className="badge neutral">${k.models.join(", ")}</span>` : html`<span className="badge neutral">any model</span>`}
           </div>
@@ -452,10 +446,10 @@ function ApiKeyEditor({ apiKeys, onSave }) {
             <button className="btn danger" onClick=${() => del(k.name)}>Del</button>
           </div>
         </div>
-        <div className="meta">${k.baseUrl || "https://api.openai.com/v1"} | key: ${k.key ? k.key.slice(0, 8) + "..." : "not set"}</div>
+        <div className="meta">key: ${k.key ? k.key.slice(0, 12) + "..." : "not set"}</div>
       </div>
     `)}
-    ${apiKeys.length === 0 && editing !== "__new__" ? html`<div className="empty">No API keys configured. Use "+ Add key" to add OpenAI, Anthropic, or custom API keys.</div>` : null}
+    ${apiKeys.length === 0 && editing !== "__new__" ? html`<div className="empty">No API keys. Add OpenAI or any OpenAI-compatible API keys to pool and route them.</div>` : null}
   </div>`;
 }
 

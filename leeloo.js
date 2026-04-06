@@ -1252,11 +1252,9 @@ async function handleAuthProviders(req, res) {
 		if (allIds.some((r) => r.id === k.name)) continue;
 		allIds.push({
 			id: k.name,
-			name: `${k.label || k.name}`,
-			baseProvider: k.type || "openai",
+			name: k.label || k.name,
 			isBuiltin: false,
 			isApiKey: true,
-			baseUrl: k.baseUrl,
 			models: k.models,
 		});
 	}
@@ -1442,14 +1440,20 @@ async function handleAuthLogout(req, res, providerId) {
 
 // ─── API Key CRUD ─────────────────────────────────────────────────────────────
 
+function inferBaseUrl(key) {
+	if (!key) return "https://api.openai.com/v1";
+	if (key.startsWith("sk-ant-")) return "https://api.anthropic.com/v1";
+	return "https://api.openai.com/v1";
+}
+
 async function handleApiKeyCreate(req, res) {
 	const body = JSON.parse(await readBody(req));
 	const config = loadConfig();
+	const key = body.key || "";
 	const entry = {
 		name: body.name || `key-${Date.now()}`,
-		type: body.type || "openai",
-		key: body.key || "",
-		baseUrl: body.baseUrl || "https://api.openai.com/v1",
+		key,
+		baseUrl: body.baseUrl || inferBaseUrl(key),
 		models: body.models || [],
 		enabled: body.enabled !== false,
 		label: body.label || "",
@@ -1657,7 +1661,7 @@ function tryGetModel(providerName, modelId) {
 	if (keyEntry) {
 		const models = keyEntry.models || [];
 		if (models.length > 0 && !models.includes(modelId)) return null;
-		return { id: modelId, provider: providerName, __apiKey: true, __baseUrl: keyEntry.baseUrl || "https://api.openai.com/v1" };
+		return { id: modelId, provider: providerName, __apiKey: true };
 	}
 
 	const base = getBaseProvider(providerName);
@@ -1672,20 +1676,13 @@ function tryGetModel(providerName, modelId) {
  * Bypasses pi-ai entirely -- just forwards the request and streams back.
  */
 async function proxyToApiKeyProvider(res, keyEntry, apiKey, requestBody, doStream) {
-	const baseUrl = (keyEntry.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+	const baseUrl = (keyEntry.baseUrl || inferBaseUrl(apiKey)).replace(/\/+$/, "");
 	const url = `${baseUrl}/chat/completions`;
 
 	const headers = {
 		"Content-Type": "application/json",
 		Authorization: `Bearer ${apiKey}`,
 	};
-
-	// Anthropic API uses a different header
-	if (keyEntry.type === "anthropic") {
-		headers["x-api-key"] = apiKey;
-		headers["anthropic-version"] = "2023-06-01";
-		delete headers.Authorization;
-	}
 
 	const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify(requestBody) });
 
