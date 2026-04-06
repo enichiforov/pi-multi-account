@@ -22,16 +22,16 @@ Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- us
   - [How routing works](#how-routing-works)
   - [Chat UI](#chat-ui)
   - [Persistent data files](#persistent-data-files)
-- [Integration guides](#integration-guides)
-  - [pi coding agent](#pi-coding-agent)
-  - [Cursor](#cursor)
-  - [Windsurf / Codeium](#windsurf--codeium)
-  - [Continue (VS Code / JetBrains)](#continue-vs-code--jetbrains)
-  - [Cline (VS Code)](#cline-vs-code)
-  - [aider](#aider)
-  - [OpenAI Python SDK](#openai-python-sdk)
-  - [OpenAI Node SDK](#openai-node-sdk)
-  - [curl](#curl)
+  - [Integration guides](#integration-guides)
+    - [pi coding agent](#pi-coding-agent)
+    - [Cursor](#cursor)
+    - [Windsurf / Codeium](#windsurf--codeium)
+    - [Continue (VS Code / JetBrains)](#continue-vs-code--jetbrains)
+    - [Cline (VS Code)](#cline-vs-code)
+    - [aider](#aider)
+    - [OpenAI Python SDK](#openai-python-sdk)
+    - [OpenAI Node SDK](#openai-node-sdk)
+    - [curl](#curl)
 - [Supported providers](#supported-providers)
 - [Built-in limits support](#built-in-limits-support)
 - [Config files](#config-files)
@@ -594,13 +594,13 @@ Chat completion responses include extra fields:
 | `~/.pi/agent/leeloo-usage.jsonl` | Usage log (per-user request tracking) |
 | `~/.pi/agent/auth.json` | OAuth credentials |
 
-## Integration guides
+### Integration guides
 
 Leeloo is a standard OpenAI-compatible proxy. Any tool that supports a custom `base_url` / `api_base` works out of the box. Set the model to any preset name (`coding-premium`, `fastest`), pool (`pool:codex-pool`), or raw model ID.
 
 All routing, failover, DLP rules, and budget enforcement happen transparently -- the tool thinks it's talking to OpenAI.
 
-### pi coding agent
+#### pi coding agent
 
 [pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) can use Leeloo as its provider backend. Create a custom provider config:
 
@@ -628,7 +628,7 @@ pi
 
 Then select `coding-premium` or any preset/pool as your model in pi.
 
-### Cursor
+#### Cursor
 
 Add to your Cursor settings (`.cursor/settings.json` or via Settings UI):
 
@@ -643,14 +643,14 @@ Then pick `coding-premium` (or any preset name) from Cursor's model dropdown.
 
 For team setups: each developer gets their own user token from `/admin` -> Users, with budget limits and preset restrictions.
 
-### Windsurf / Codeium
+#### Windsurf / Codeium
 
 Settings -> Custom Model Provider:
 - **Base URL**: `http://localhost:4000/v1`
 - **API Key**: `<token>`
 - **Model**: `coding-premium`
 
-### Continue (VS Code / JetBrains)
+#### Continue (VS Code / JetBrains)
 
 `.continue/config.yaml`:
 ```yaml
@@ -676,7 +676,7 @@ models:
 
 Each model entry shows up as a separate option in Continue's model picker.
 
-### Cline (VS Code)
+#### Cline (VS Code)
 
 In VS Code settings (`settings.json`):
 ```json
@@ -688,7 +688,7 @@ In VS Code settings (`settings.json`):
 }
 ```
 
-### aider
+#### aider
 
 ```bash
 export OPENAI_API_BASE=http://localhost:4000/v1
@@ -696,7 +696,7 @@ export OPENAI_API_KEY=<token>
 aider --model coding-premium
 ```
 
-### OpenAI Python SDK
+#### OpenAI Python SDK
 
 ```python
 from openai import OpenAI
@@ -723,7 +723,7 @@ for chunk in stream:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-### OpenAI Node SDK
+#### OpenAI Node SDK
 
 ```javascript
 import OpenAI from "openai";
@@ -740,7 +740,7 @@ const response = await client.chat.completions.create({
 console.log(response.choices[0].message.content);
 ```
 
-### curl
+#### curl
 
 ```bash
 curl http://localhost:4000/v1/chat/completions \
@@ -752,7 +752,7 @@ curl http://localhost:4000/v1/chat/completions \
   }'
 ```
 
-### Tips for team deployments
+#### Tips for team deployments
 
 - Run Leeloo on an internal server (not just localhost)
 - Set `LEELOO_KEY` to a persistent admin token via `.env`
