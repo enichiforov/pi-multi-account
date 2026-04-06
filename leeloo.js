@@ -95,27 +95,70 @@ function ensureDir() {
 	if (!existsSync(AGENT_DIR)) mkdirSync(AGENT_DIR, { recursive: true });
 }
 
-function loadConfig() {
-	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] };
+const JS_CONFIG_PATHS = [
+	join(AGENT_DIR, "multi-pass.config.js"),
+	join(AGENT_DIR, "multi-pass.config.mjs"),
+];
+
+function getJsConfigPath() {
+	return JS_CONFIG_PATHS.find((p) => existsSync(p));
+}
+
+let _jsConfigCache = null;
+let _jsConfigMtime = 0;
+
+async function loadJsConfig(jsPath) {
 	try {
-		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-		return {
-			subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
-			pools: Array.isArray(raw.pools) ? raw.pools : [],
-			chains: Array.isArray(raw.chains) ? raw.chains : [],
-			presets: Array.isArray(raw.presets) ? raw.presets : [],
-			apiKeys: Array.isArray(raw.apiKeys) ? raw.apiKeys : [],
-			// v2 fields (optional)
-			accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
-			modes: Array.isArray(raw.modes) ? raw.modes : [],
-			routingRules: Array.isArray(raw.routingRules) ? raw.routingRules : [],
-		};
-	} catch {
-		return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] };
+		const stat = (await import("node:fs")).statSync(jsPath);
+		const mtime = stat.mtimeMs;
+		if (_jsConfigCache && _jsConfigMtime === mtime) return _jsConfigCache;
+		const mod = await import(`file://${jsPath}?t=${mtime}`);
+		const cfg = mod.default || mod.config;
+		if (!cfg) throw new Error("config.js must export default a config object");
+		_jsConfigCache = normalizeConfig(cfg);
+		_jsConfigMtime = mtime;
+		return _jsConfigCache;
+	} catch (e) {
+		log(`[config] failed to load JS config ${jsPath}: ${e.message}`);
+		return null;
 	}
 }
 
+function normalizeConfig(raw) {
+	return {
+		subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions : [],
+		pools: Array.isArray(raw.pools) ? raw.pools : [],
+		chains: Array.isArray(raw.chains) ? raw.chains : [],
+		presets: Array.isArray(raw.presets) ? raw.presets : [],
+		apiKeys: Array.isArray(raw.apiKeys) ? raw.apiKeys : [],
+		accounts: Array.isArray(raw.accounts) ? raw.accounts : [],
+		modes: Array.isArray(raw.modes) ? raw.modes : [],
+		routingRules: Array.isArray(raw.routingRules) ? raw.routingRules : (Array.isArray(raw.rules) ? raw.rules : []),
+	};
+}
+
+const _emptyConfig = () => ({ subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] });
+
+function loadConfig() {
+	// JS config takes precedence (cached for hot reload via mtime)
+	const jsPath = getJsConfigPath();
+	if (jsPath && _jsConfigCache) return _jsConfigCache;
+
+	if (!existsSync(CONFIG_PATH)) return _emptyConfig();
+	try {
+		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+		return normalizeConfig(raw);
+	} catch {
+		return _emptyConfig();
+	}
+}
+
+function isReadOnlyConfig() {
+	return !!getJsConfigPath();
+}
+
 function saveConfig(config) {
+	if (isReadOnlyConfig()) throw new Error("Config is read-only (managed by multi-pass.config.js)");
 	ensureDir();
 	// Strip rules from config if they were accidentally included
 	const { rules, ...clean } = config;
@@ -1031,8 +1074,9 @@ function handleRulesDelete(req, res, ruleName) {
 // ─── Config CRUD API ─────────────────────────────────────────────────────────
 
 function handleConfigGet(req, res) {
+	const cfg = loadConfig();
 	res.writeHead(200, json());
-	res.end(JSON.stringify(loadConfig()));
+	res.end(JSON.stringify({ ...cfg, _readOnly: isReadOnlyConfig(), _source: getJsConfigPath() || CONFIG_PATH }));
 }
 
 async function handleConfigPut(req, res) {
@@ -2957,6 +3001,13 @@ const server = createServer(async (req, res) => {
 			if (!isAdmin) { res.writeHead(403, json()); res.end(JSON.stringify({ error: { message: "Admin access required" } })); return true; }
 			return false;
 		};
+		// ── Block writes when JS config is in use ──
+		const isWrite = req.method === "POST" || req.method === "PUT" || req.method === "DELETE";
+		if (isWrite && isReadOnlyConfig() && path.startsWith("/v1/config/")) {
+			res.writeHead(403, json());
+			res.end(JSON.stringify({ error: { message: "Config is managed by multi-pass.config.js (read-only via admin)" } }));
+			return;
+		}
 
 		// ── API routes ──
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
@@ -3061,6 +3112,12 @@ async function runInit() {
 	rl.close();
 }
 
+// Load JS config (if any) before binding the server
+const _jsPath = getJsConfigPath();
+if (_jsPath) {
+	await loadJsConfig(_jsPath);
+}
+
 server.listen(PORT, () => {
 	const config = loadConfig();
 	const providers = getAllProviders();
@@ -3096,6 +3153,7 @@ server.listen(PORT, () => {
 
   Admin token: ${ADMIN_TOKEN}
   ${process.env.LEELOO_KEY ? "(from LEELOO_KEY" + (envFile ? " via " + envFile : " env") + ")" : "(random -- run 'leeloo init' or set LEELOO_KEY to persist)"}
+${_jsPath ? `\n  Config: ${_jsPath} (read-only via JS)` : ""}
 `);
 
 	rotateUsageLog();
