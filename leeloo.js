@@ -96,7 +96,7 @@ function ensureDir() {
 }
 
 function loadConfig() {
-	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [] };
+	if (!existsSync(CONFIG_PATH)) return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [] };
 	try {
 		const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 		return {
@@ -104,9 +104,10 @@ function loadConfig() {
 			pools: Array.isArray(raw.pools) ? raw.pools : [],
 			chains: Array.isArray(raw.chains) ? raw.chains : [],
 			presets: Array.isArray(raw.presets) ? raw.presets : [],
+			apiKeys: Array.isArray(raw.apiKeys) ? raw.apiKeys : [],
 		};
 	} catch {
-		return { subscriptions: [], pools: [], chains: [], presets: [] };
+		return { subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [] };
 	}
 }
 
@@ -356,26 +357,32 @@ function getBaseProvider(name) {
  * it doesn't know the OAuth provider. We fall back to extracting the access token
  * directly from stored credentials, same as the base provider's getApiKey would.
  */
+/** Lookup an API key entry by name from config. */
+function getApiKeyEntry(providerName) {
+	return loadConfig().apiKeys.find((k) => k.name === providerName && k.enabled !== false);
+}
+
 async function getApiKeyForProvider(providerName) {
-	// Try the standard path first (works for base providers)
+	// 1. Check API key entries first (raw keys in config)
+	const keyEntry = getApiKeyEntry(providerName);
+	if (keyEntry?.key) return keyEntry.key;
+
+	// 2. Try the standard path (works for base OAuth providers)
 	const key = await authStorage.getApiKey(providerName);
 	if (key) return key;
 
-	// For subscriptions: extract directly from stored creds
+	// 3. For subscriptions: extract directly from stored creds
 	const cred = authStorage.get(providerName);
 	if (!cred || cred.type !== "oauth" || !cred.access) return null;
 
 	const base = getBaseProvider(providerName);
 	if (base === "google-gemini-cli" || base === "google-antigravity") {
-		// Google providers store { access, projectId } serialized
 		return JSON.stringify({ token: cred.access, projectId: cred.projectId });
 	}
-
-	// Anthropic, OpenAI Codex, GitHub Copilot: just the access token
 	return cred.access;
 }
 
-/** Get all provider names (base + extras) that are authenticated. */
+/** Get all provider names (base OAuth + subscriptions + API keys) that are ready. */
 function getAllProviders() {
 	const config = loadConfig();
 	const providers = [];
@@ -386,7 +393,16 @@ function getAllProviders() {
 		const name = `${sub.provider}-${sub.index}`;
 		if (authStorage.hasAuth(name)) providers.push(name);
 	}
+	// API key entries -- always "authenticated" if they have a key
+	for (const k of config.apiKeys) {
+		if (k.enabled !== false && k.key) providers.push(k.name);
+	}
 	return providers;
+}
+
+/** Check if a provider is an API key entry (not OAuth). */
+function isApiKeyProvider(providerName) {
+	return !!getApiKeyEntry(providerName);
 }
 
 // ─── Rate limit detection ─────────────────────────────────────────────────────
@@ -418,7 +434,9 @@ function isExhausted(provider) {
 }
 
 function isAvailable(provider) {
-	return authStorage.hasAuth(provider) && !isExhausted(provider);
+	if (isExhausted(provider)) return false;
+	if (isApiKeyProvider(provider)) return true; // API key entries are always "authed"
+	return authStorage.hasAuth(provider);
 }
 
 // ─── Schedule evaluation (same logic as extension) ────────────────────────────
@@ -1229,25 +1247,37 @@ async function handleAuthProviders(req, res) {
 		});
 	}
 
-	// Check actual auth status for each (fast: just checks stored creds + JWT expiry)
+	// API key entries
+	for (const k of config.apiKeys) {
+		if (allIds.some((r) => r.id === k.name)) continue;
+		allIds.push({
+			id: k.name,
+			name: `${k.label || k.name}`,
+			baseProvider: k.type || "openai",
+			isBuiltin: false,
+			isApiKey: true,
+			baseUrl: k.baseUrl,
+			models: k.models,
+		});
+	}
+
+	// Check actual auth status for each
 	for (const entry of allIds) {
+		if (entry.isApiKey) {
+			const ke = config.apiKeys.find((k) => k.name === entry.id);
+			result.push({ ...entry, authenticated: !!(ke?.key), tokenStatus: ke?.key ? "ok" : "no-key", enabled: ke?.enabled !== false });
+			continue;
+		}
 		const hasAuth = authStorage.hasAuth(entry.id);
 		let tokenStatus = "no-auth";
 		if (hasAuth) {
 			const cred = authStorage.get(entry.id);
 			if (cred?.type === "oauth" && cred.access) {
-				// Quick JWT expiry check (no API call)
 				try {
 					const payload = decodeJwtPayload(cred.access);
-					if (payload?.exp && payload.exp < Date.now() / 1000) {
-						tokenStatus = "expired";
-					} else {
-						tokenStatus = "ok";
-					}
-				} catch {
-					// Non-JWT token (e.g. Google) -- assume ok if cred exists
-					tokenStatus = "ok";
-				}
+					if (payload?.exp && payload.exp < Date.now() / 1000) tokenStatus = "expired";
+					else tokenStatus = "ok";
+				} catch { tokenStatus = "ok"; }
 			}
 		}
 		result.push({ ...entry, authenticated: hasAuth, tokenStatus });
@@ -1272,6 +1302,11 @@ function handleKnownNames(req, res) {
 		if (allNames.some((n) => n.id === subId)) continue;
 		const baseProv = provs.find((p) => p.id === sub.provider);
 		allNames.push({ id: subId, label: `${baseProv?.name || sub.provider} #${sub.index}${sub.label ? " (" + sub.label + ")" : ""}`, type: "subscription", authenticated: authStorage.hasAuth(subId) });
+	}
+	// API key entries
+	for (const k of config.apiKeys) {
+		if (allNames.some((n) => n.id === k.name)) continue;
+		allNames.push({ id: k.name, label: k.label || k.name, type: "apikey", authenticated: !!(k.key) });
 	}
 
 	// Pool names
@@ -1403,6 +1438,50 @@ async function handleAuthLogout(req, res, providerId) {
 		res.writeHead(500, json());
 		res.end(JSON.stringify({ error: { message: e.message } }));
 	}
+}
+
+// ─── API Key CRUD ─────────────────────────────────────────────────────────────
+
+async function handleApiKeyCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const entry = {
+		name: body.name || `key-${Date.now()}`,
+		type: body.type || "openai",
+		key: body.key || "",
+		baseUrl: body.baseUrl || "https://api.openai.com/v1",
+		models: body.models || [],
+		enabled: body.enabled !== false,
+		label: body.label || "",
+	};
+	if (config.apiKeys.some((k) => k.name === entry.name)) {
+		res.writeHead(409, json());
+		res.end(JSON.stringify({ error: { message: `API key "${entry.name}" already exists` } }));
+		return;
+	}
+	config.apiKeys.push(entry);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ apiKey: { ...entry, key: entry.key ? entry.key.slice(0, 8) + "..." : "" } }));
+}
+
+async function handleApiKeyUpdate(req, res, name) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.apiKeys.findIndex((k) => k.name === name);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "API key not found" } })); return; }
+	config.apiKeys[idx] = { ...config.apiKeys[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ apiKey: { ...config.apiKeys[idx], key: config.apiKeys[idx].key?.slice(0, 8) + "..." } }));
+}
+
+function handleApiKeyDelete(req, res, name) {
+	const config = loadConfig();
+	config.apiKeys = config.apiKeys.filter((k) => k.name !== name);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: name }));
 }
 
 // ─── User CRUD API ────────────────────────────────────────────────────────────
@@ -1573,13 +1652,71 @@ async function runCustomSelector(pool, available, currentProvider, modelId) {
 // ─── Model resolution ─────────────────────────────────────────────────────────
 
 function tryGetModel(providerName, modelId) {
+	// API key providers: create a virtual model object (no pi-ai needed)
+	const keyEntry = getApiKeyEntry(providerName);
+	if (keyEntry) {
+		const models = keyEntry.models || [];
+		if (models.length > 0 && !models.includes(modelId)) return null;
+		return { id: modelId, provider: providerName, __apiKey: true, __baseUrl: keyEntry.baseUrl || "https://api.openai.com/v1" };
+	}
+
 	const base = getBaseProvider(providerName);
 	if (!base) return null;
 	try {
-		// Always use base provider in the model object (pi-ai needs it for API routing).
-		// The subscription name (providerName) is tracked separately for auth lookup.
 		return getModel(base, modelId);
 	} catch { return null; }
+}
+
+/**
+ * Direct proxy to an OpenAI-compatible endpoint (for API key providers).
+ * Bypasses pi-ai entirely -- just forwards the request and streams back.
+ */
+async function proxyToApiKeyProvider(res, keyEntry, apiKey, requestBody, doStream) {
+	const baseUrl = (keyEntry.baseUrl || "https://api.openai.com/v1").replace(/\/+$/, "");
+	const url = `${baseUrl}/chat/completions`;
+
+	const headers = {
+		"Content-Type": "application/json",
+		Authorization: `Bearer ${apiKey}`,
+	};
+
+	// Anthropic API uses a different header
+	if (keyEntry.type === "anthropic") {
+		headers["x-api-key"] = apiKey;
+		headers["anthropic-version"] = "2023-06-01";
+		delete headers.Authorization;
+	}
+
+	const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify(requestBody) });
+
+	if (!resp.ok) {
+		const errText = await resp.text().catch(() => "");
+		const status = resp.status;
+		if (status === 429 || /rate.?limit|too many/i.test(errText)) throw new Error(`Rate limited (${status})`);
+		throw new Error(`API error ${status}: ${errText.slice(0, 200)}`);
+	}
+
+	if (doStream) {
+		res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+		// Pipe the SSE stream directly
+		const reader = resp.body.getReader();
+		const dec = new TextDecoder();
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (!res.destroyed) res.write(dec.decode(value, { stream: true }));
+			}
+		} finally {
+			if (!res.destroyed) res.end();
+		}
+	} else {
+		const data = await resp.json();
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.end(JSON.stringify(data));
+	}
+
+	return resp;
 }
 
 /**
@@ -2225,6 +2362,16 @@ async function handleChatCompletions(req, res) {
 
 			log(`[${candidate.provider}] ${candidate.modelId} (attempt ${attempt + 1}/${maxAttempts})`);
 
+			// API key providers: direct proxy (bypass pi-ai)
+			const keyEntry = getApiKeyEntry(candidate.provider);
+			if (keyEntry) {
+				const t0p = Date.now();
+				const proxyBody = { ...parsed, model: candidate.modelId, messages: requestMessages, stream: doStream };
+				await proxyToApiKeyProvider(res, keyEntry, apiKey, proxyBody, doStream);
+				trackRequest(candidate.provider, candidate.modelId, null, Date.now() - t0p, null, requestText, null, username);
+				return;
+			}
+
 			if (doStream) {
 				await handleStreaming(res, candidate.model, context, opts, requestModelId, candidate.provider, requestText, username);
 			} else {
@@ -2550,6 +2697,10 @@ const server = createServer(async (req, res) => {
 		else if (path === "/v1/config/subscriptions" && req.method === "POST") { if (!adminOnly()) await handleSubCreate(req, res); }
 		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "PUT") { if (!adminOnly()) await handleSubUpdate(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1])); }
 		else if (path.startsWith("/v1/config/subscriptions/") && req.method === "DELETE") { if (!adminOnly()) handleSubDelete(req, res, decodeURIComponent(path.split("/v1/config/subscriptions/")[1])); }
+		// API keys
+		else if (path === "/v1/config/apikeys" && req.method === "POST") { if (!adminOnly()) await handleApiKeyCreate(req, res); }
+		else if (path.startsWith("/v1/config/apikeys/") && req.method === "PUT") { if (!adminOnly()) await handleApiKeyUpdate(req, res, decodeURIComponent(path.split("/v1/config/apikeys/")[1])); }
+		else if (path.startsWith("/v1/config/apikeys/") && req.method === "DELETE") { if (!adminOnly()) handleApiKeyDelete(req, res, decodeURIComponent(path.split("/v1/config/apikeys/")[1])); }
 		// User management (admin only)
 		else if (path === "/v1/users" && req.method === "GET") { if (!adminOnly()) handleUsersList(req, res); }
 		else if (path === "/v1/users" && req.method === "POST") { if (!adminOnly()) await handleUserCreate(req, res); }
