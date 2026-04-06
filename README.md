@@ -22,6 +22,14 @@ Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- us
   - [How routing works](#how-routing-works)
   - [Chat UI](#chat-ui)
   - [Persistent data files](#persistent-data-files)
+  - [Routing v2: modes, rules, intent routing](#routing-v2-modes-rules-intent-routing)
+    - [Why v2](#why-v2)
+    - [Concepts](#concepts)
+    - [Built-in routing rule types](#built-in-routing-rule-types)
+    - [JSON config example](#json-config-example)
+    - [JS config (multi-pass.config.js)](#js-config-multi-passconfigjs)
+    - [Routing tab in admin](#routing-tab-in-admin)
+    - [CLI commands](#cli-commands)
   - [Integration guides](#integration-guides)
     - [pi coding agent](#pi-coding-agent)
     - [Cursor](#cursor)
@@ -593,6 +601,217 @@ Chat completion responses include extra fields:
 | `~/.pi/agent/leeloo-audit.jsonl` | Audit log (rule violations, persisted) |
 | `~/.pi/agent/leeloo-usage.jsonl` | Usage log (per-user request tracking) |
 | `~/.pi/agent/auth.json` | OAuth credentials |
+
+### Routing v2: modes, rules, intent routing
+
+The original pool/chain/preset model is great at same-provider failover. v2 adds **cross-provider intent routing** -- pick a provider per request based on time, quota, cost, or your own JS rules.
+
+#### Why v2
+
+Old model: `pool` = group of accounts of the same provider, with one strategy. `chain` = static fallover order. `preset` = ordered list of provider/model entries.
+
+New model: `mode` = a list of candidates (any mix of accounts, pools, or other modes) plus a pipeline of `rules` that filter and rank candidates per request. The router applies all rules, sorts by score, then tries the top candidate -- with `re-evaluate` on error so rules see the new context.
+
+You can mix:
+- 10 OpenAI keys (round-robin via a pool)
+- 1 Anthropic Pro account
+- 1 OpenRouter API key
+- 1 Copilot subscription
+
+...all in one `coding-premium` mode that prefers Anthropic during evening hours, burns expiring quotas first, and falls back to OpenRouter for cheap simple tasks.
+
+#### Concepts
+
+| Concept | Purpose |
+|---|---|
+| `accounts` | Unified primitive: any access point (subscription or apiKey) |
+| `pools` | Same-provider rotation (still useful) |
+| `routingRules` | Reusable decision functions: filter, score, or both |
+| `modes` | Cross-provider routing pipeline: candidates + rules + onError |
+| `presets` | Client-facing virtual model: maps to a mode + preferred/fallback models |
+
+Routing pipeline:
+
+```
+preset -> mode -> expand candidates (accounts/pools/nested modes)
+       -> filter exhausted -> apply rules in order (filter + score)
+       -> sort by total score -> try top candidate
+       -> on error: re-evaluate (rules see the error context)
+```
+
+Mode candidates can include other modes (composition, max depth 5, cycles detected at load time).
+
+Rules return `{ candidates, scores }` -- they can shrink the array (filter) and/or contribute to per-candidate scores. Total score is summed across all rules. Sort descending.
+
+#### Built-in routing rule types
+
+| Type | What it does | Key params |
+|---|---|---|
+| `time-window` | Score boost during specified hours/days | targets, windows, boost |
+| `quota-burn` | Boost candidates whose quota expires soonest | -- |
+| `cost-tier` | Boost cheap/free targets | targets, boost |
+| `model-fit` | Filter by required context size, tools, vision | minContext, requireTools, requireVision |
+| `error-blacklist` | Filter recently errored candidates | windowMinutes |
+| `cooldown` | Filter exhausted candidates (always-on) | -- |
+| `custom` | Run inline JS function (JS config) or file path (JSON) | fn or code |
+
+#### JSON config example
+
+Add to `~/.pi/agent/multi-pass.json`:
+
+```json
+{
+  "subscriptions": [...],
+  "pools": [
+    { "name": "codex-shared", "baseProvider": "openai-codex", "members": ["openai-codex", "openai-codex-2"], "strategy": "round-robin", "enabled": true }
+  ],
+  "routingRules": [
+    {
+      "id": "prefer-anthropic-evening",
+      "type": "time-window",
+      "params": {
+        "targets": ["anthropic"],
+        "windows": [{ "days": ["mon", "tue", "wed", "thu", "fri"], "hours": [18, 23] }],
+        "boost": 100
+      }
+    },
+    {
+      "id": "burn-expiring-first",
+      "type": "quota-burn"
+    }
+  ],
+  "modes": [
+    {
+      "id": "coding-premium",
+      "description": "Best quality coding mode",
+      "candidates": ["anthropic", "pool:codex-shared"],
+      "rules": ["prefer-anthropic-evening", "burn-expiring-first"],
+      "onError": "re-evaluate"
+    }
+  ],
+  "presets": [
+    {
+      "name": "coding-premium-v2",
+      "mode": "coding-premium",
+      "preferredModels": ["claude-sonnet-4-20250514", "gpt-5.1"],
+      "fallbackModels": ["claude-haiku", "gpt-5.0-mini"],
+      "enabled": true
+    }
+  ]
+}
+```
+
+When a client sends `model: "coding-premium-v2"`:
+1. Resolve preset -> mode `coding-premium`
+2. Expand candidates: `anthropic` + members of `codex-shared` pool
+3. Filter exhausted (always applied)
+4. Run `prefer-anthropic-evening` -- boosts anthropic +100 if it's a weekday evening
+5. Run `burn-expiring-first` -- boosts whichever account's quota expires soonest
+6. Sort by total score, try the top candidate with `claude-sonnet-4-20250514`
+7. On error: re-evaluate (rules re-run with the failed candidate in `ctx.history`)
+
+#### JS config (multi-pass.config.js)
+
+For power users who want IntelliSense, env vars, imports, and inline custom rules. Place at `~/.pi/agent/multi-pass.config.js`:
+
+```js
+import { defineConfig, account, pool, mode, preset, rule } from
+  "/path/to/pi-multi-pass/config.js";
+
+export default defineConfig({
+  accounts: [
+    account("anthropic", { provider: "anthropic", kind: "subscription" }),
+    account("openai-codex", { provider: "openai-codex", kind: "subscription" }),
+    account("openrouter", {
+      provider: "openrouter",
+      kind: "apiKey",
+      key: process.env.OPENROUTER_KEY,
+    }),
+  ],
+
+  pools: [
+    pool("codex-shared", {
+      baseProvider: "openai-codex",
+      members: ["openai-codex", "openai-codex-2"],
+      strategy: "round-robin",
+    }),
+  ],
+
+  rules: [
+    rule.timeWindow("prefer-anthropic-evening", {
+      targets: ["anthropic"],
+      windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], hours: [18, 23] }],
+      boost: 100,
+    }),
+
+    rule.quotaBurn("burn-expiring-first"),
+
+    rule.costTier("prefer-cheap", {
+      targets: ["openrouter"],
+      boost: 30,
+    }),
+
+    // Inline custom rule -- no separate file
+    rule.custom("avoid-personal-models", async (candidates, ctx) => {
+      return {
+        candidates: candidates.filter((c) => !c.id.includes("personal")),
+      };
+    }),
+  ],
+
+  modes: [
+    mode("coding-premium", {
+      candidates: ["anthropic", "codex-shared"],
+      rules: ["prefer-anthropic-evening", "burn-expiring-first", "avoid-personal-models"],
+      onError: "re-evaluate",
+    }),
+
+    mode("coding-budget", {
+      candidates: ["openrouter", "codex-shared"],
+      rules: ["prefer-cheap"],
+      onError: "next-in-order",
+    }),
+  ],
+
+  presets: [
+    preset("coding-premium", {
+      mode: "coding-premium",
+      preferredModels: ["claude-sonnet-4-20250514", "gpt-5.1"],
+    }),
+    preset("coding-budget", {
+      mode: "coding-budget",
+      preferredModels: ["gpt-5.1-mini"],
+    }),
+  ],
+});
+```
+
+When `multi-pass.config.js` exists, the JSON config is ignored and the admin UI becomes read-only (banner shown). Edit the JS file directly. Hot-reloads on file change.
+
+#### Routing tab in admin
+
+`/admin` -> **Routing** tab provides:
+
+- **Routing rules** editor: form per rule type, drag-to-reorder
+- **Modes** editor: candidate picker (drag-to-reorder), rule list (drag-to-reorder), onError dropdown
+- **Presets** editor: type selector (v2 with mode + preferred models | v1 legacy entries)
+
+When JS config is detected, the tab shows a read-only banner and all edit buttons are hidden.
+
+#### CLI commands
+
+```bash
+# Initial setup wizard
+node leeloo.js init
+
+# Migrate v1 JSON config to v2 shape
+# (creates a backup, generates accounts/modes from existing data)
+node leeloo.js migrate
+
+# Export JSON config to multi-pass.config.js template
+node leeloo.js export-js
+# Then update the import path and move to ~/.pi/agent/multi-pass.config.js
+```
 
 ### Integration guides
 

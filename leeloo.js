@@ -69,9 +69,12 @@ const envFile = loadEnvFile();
 
 const args = process.argv.slice(2);
 let PORT = parseInt(process.env.LEELOO_PORT || "4000", 10);
+let CLI_COMMAND = null;
 for (let i = 0; i < args.length; i++) {
 	if (args[i] === "--port" && args[i + 1]) PORT = parseInt(args[i + 1], 10);
-	if (args[i] === "init") { await runInit(); process.exit(0); }
+	if (args[i] === "init") CLI_COMMAND = "init";
+	if (args[i] === "migrate") CLI_COMMAND = "migrate";
+	if (args[i] === "export-js") CLI_COMMAND = "export-js";
 }
 
 // ─── Admin token ──────────────────────────────────────────────────────────────
@@ -3115,6 +3118,147 @@ async function runInit() {
 `);
 	rl.close();
 }
+
+// ─── Migration: v1 -> v2 shape ────────────────────────────────────────────────
+
+async function runMigrate() {
+	if (!existsSync(CONFIG_PATH)) {
+		console.log(`No config at ${CONFIG_PATH}. Run 'leeloo init' first.`);
+		return;
+	}
+
+	const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+	const before = JSON.stringify(raw, null, 2);
+
+	// Backup
+	const backupPath = CONFIG_PATH + ".v1.bak";
+	writeFileSync(backupPath, before, "utf-8");
+	console.log(`\n  Backed up ${CONFIG_PATH} -> ${backupPath}`);
+
+	// Build accounts from subscriptions + apiKeys + base providers seen in pools
+	const accounts = Array.isArray(raw.accounts) ? [...raw.accounts] : [];
+	const accountIds = new Set(accounts.map((a) => a.id));
+
+	for (const sub of raw.subscriptions || []) {
+		const id = `${sub.provider}-${sub.index}`;
+		if (!accountIds.has(id)) {
+			accounts.push({ id, provider: sub.provider, kind: "subscription", label: sub.label || "" });
+			accountIds.add(id);
+		}
+	}
+	for (const k of raw.apiKeys || []) {
+		if (!accountIds.has(k.name)) {
+			accounts.push({ id: k.name, provider: "openai", kind: "apiKey", key: k.key, baseUrl: k.baseUrl, label: k.label || "" });
+			accountIds.add(k.name);
+		}
+	}
+
+	// Convert old presets that have entries[] to new shape with mode
+	const modes = Array.isArray(raw.modes) ? [...raw.modes] : [];
+	const newPresets = [];
+	for (const p of raw.presets || []) {
+		if (p.mode) { newPresets.push(p); continue; } // already v2
+		if (!p.entries || p.entries.length === 0) { newPresets.push(p); continue; }
+
+		// Generate a mode from the entries
+		const modeId = `mode-${p.name}`;
+		const modeCandidates = p.entries.filter((e) => e.enabled !== false).map((e) => e.provider);
+		const preferredModels = p.entries.filter((e) => e.enabled !== false && e.model).map((e) => e.model);
+		modes.push({
+			id: modeId,
+			description: `Auto-generated from preset "${p.name}"`,
+			candidates: modeCandidates,
+			rules: ["builtin-cooldown"],
+			onError: "next-in-order",
+		});
+		newPresets.push({
+			...p,
+			mode: modeId,
+			preferredModels,
+			fallbackModels: [],
+		});
+	}
+
+	// Ensure builtin cooldown rule exists
+	const routingRules = Array.isArray(raw.routingRules) ? [...raw.routingRules] : [];
+	if (!routingRules.find((r) => r.id === "builtin-cooldown")) {
+		routingRules.push({ id: "builtin-cooldown", type: "cooldown", description: "Skip exhausted candidates" });
+	}
+
+	const v2 = {
+		...raw,
+		accounts,
+		modes,
+		routingRules,
+		presets: newPresets,
+	};
+
+	writeFileSync(CONFIG_PATH, JSON.stringify(v2, null, 2), "utf-8");
+
+	console.log(`\n  Migration complete:`);
+	console.log(`    accounts: ${accounts.length} (was ${(raw.accounts || []).length})`);
+	console.log(`    modes:    ${modes.length} (was ${(raw.modes || []).length})`);
+	console.log(`    rules:    ${routingRules.length} (was ${(raw.routingRules || []).length})`);
+	console.log(`    presets:  ${newPresets.length}`);
+	console.log(`\n  Restore with: cp ${backupPath} ${CONFIG_PATH}\n`);
+}
+
+// ─── Export: JSON -> JS config ────────────────────────────────────────────────
+
+async function runExportJs() {
+	if (!existsSync(CONFIG_PATH)) {
+		console.log(`No config at ${CONFIG_PATH}.`);
+		return;
+	}
+	const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+
+	const accountsCode = (raw.accounts || []).map((a) => `    account("${a.id}", ${JSON.stringify({ provider: a.provider, kind: a.kind, label: a.label, key: a.key, baseUrl: a.baseUrl })})`).join(",\n");
+	const poolsCode = (raw.pools || []).map((p) => `    pool("${p.name || p.id}", ${JSON.stringify({ baseProvider: p.baseProvider, members: p.members, strategy: p.strategy })})`).join(",\n");
+	const rulesCode = (raw.routingRules || []).map((r) => {
+		if (r.type === "time-window") return `    rule.timeWindow("${r.id}", ${JSON.stringify(r.params)})`;
+		if (r.type === "quota-burn") return `    rule.quotaBurn("${r.id}", ${JSON.stringify(r.params || {})})`;
+		if (r.type === "cost-tier") return `    rule.costTier("${r.id}", ${JSON.stringify(r.params)})`;
+		if (r.type === "cooldown") return `    rule.cooldown("${r.id}")`;
+		if (r.type === "model-fit") return `    rule.modelFit("${r.id}", ${JSON.stringify(r.params)})`;
+		if (r.type === "error-blacklist") return `    rule.errorBlacklist("${r.id}", ${JSON.stringify(r.params || {})})`;
+		if (r.type === "custom") return `    rule.custom("${r.id}", ${JSON.stringify(r.params?.code || "")})`;
+		return `    /* unknown rule type: ${r.type} */`;
+	}).join(",\n");
+	const modesCode = (raw.modes || []).map((m) => `    mode("${m.id}", ${JSON.stringify({ description: m.description, candidates: m.candidates, rules: m.rules, onError: m.onError })})`).join(",\n");
+	const presetsCode = (raw.presets || []).map((p) => `    preset("${p.name || p.id}", ${JSON.stringify({ mode: p.mode, preferredModels: p.preferredModels, fallbackModels: p.fallbackModels, entries: p.entries })})`).join(",\n");
+
+	const out = `// Auto-generated from ${CONFIG_PATH}
+// Edit freely -- when this file exists, JSON config is ignored.
+import { defineConfig, account, pool, mode, preset, rule } from "/PATH/TO/pi-multi-pass/config.js";
+
+export default defineConfig({
+  accounts: [
+${accountsCode}
+  ],
+  pools: [
+${poolsCode}
+  ],
+  rules: [
+${rulesCode}
+  ],
+  modes: [
+${modesCode}
+  ],
+  presets: [
+${presetsCode}
+  ],
+});
+`;
+	const outPath = join(AGENT_DIR, "multi-pass.config.js.exported");
+	writeFileSync(outPath, out, "utf-8");
+	console.log(`\n  Exported to ${outPath}`);
+	console.log(`  Update the import path, then move to ${join(AGENT_DIR, "multi-pass.config.js")} to activate.\n`);
+}
+
+// Run CLI commands and exit (no server)
+if (CLI_COMMAND === "init") { await runInit(); process.exit(0); }
+if (CLI_COMMAND === "migrate") { await runMigrate(); process.exit(0); }
+if (CLI_COMMAND === "export-js") { await runExportJs(); process.exit(0); }
 
 // Load JS config (if any) before binding the server
 const _jsPath = getJsConfigPath();
