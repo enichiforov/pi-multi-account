@@ -1099,6 +1099,271 @@ async function handleConfigPut(req, res) {
 	res.end(JSON.stringify(config));
 }
 
+// ─── AI config editor ────────────────────────────────────────────────────────
+
+const CONFIG_REFERENCE = `
+multi-pass.json schema reference:
+
+{
+  "subscriptions": [
+    // OAuth-based extra accounts (managed via login flow)
+    { "provider": "openai-codex", "index": 2, "label": "work email" }
+  ],
+
+  "apiKeys": [
+    // Raw API keys (e.g. OpenAI sk-..., Anthropic sk-ant-...)
+    {
+      "name": "oai-team-1",     // unique ID
+      "label": "Team account",
+      "key": "sk-...",
+      "models": ["gpt-4o", "gpt-4o-mini"], // optional restriction
+      "enabled": true
+    }
+  ],
+
+  "accounts": [
+    // v2 unified primitive: any access point. Used in v2 modes/pools.
+    {
+      "id": "anthropic-main",
+      "provider": "anthropic",
+      "kind": "subscription",  // or "apiKey"
+      "key": "sk-ant-...",     // for apiKey kind
+      "baseUrl": "https://api.anthropic.com/v1",  // optional
+      "label": "Personal Claude",
+      "enabled": true
+    }
+  ],
+
+  "pools": [
+    // Same-provider rotation
+    {
+      "name": "codex-shared",
+      "baseProvider": "openai-codex",
+      "members": ["openai-codex", "openai-codex-2"],
+      "strategy": "round-robin",  // or "quota-first" | "scheduled" | "custom"
+      "enabled": true
+    }
+  ],
+
+  "routingRules": [
+    // Reusable decision pieces. Filter and/or score candidates.
+    {
+      "id": "prefer-anthropic-evening",
+      "type": "time-window",     // see types below
+      "description": "Boost Anthropic on weekday evenings",
+      "params": {
+        "targets": ["anthropic"],
+        "windows": [
+          { "days": ["mon","tue","wed","thu","fri"], "hours": [18, 23], "tz": "Europe/Vienna" }
+        ],
+        "boost": 100
+      }
+    },
+    // Other rule types:
+    // type: "quota-burn"     params: {} (boosts soonest-expiring)
+    // type: "cost-tier"      params: { targets: [...], boost: number }
+    // type: "model-fit"      params: { minContext, requireTools, requireVision }
+    // type: "error-blacklist" params: { windowMinutes }
+    // type: "cooldown"       params: {} (always applied)
+    // type: "custom"         params: { code: "rules/my-rule.js" }
+  ],
+
+  "modes": [
+    // v2 cross-provider routing pipeline
+    {
+      "id": "coding-premium",
+      "description": "Best quality coding mode",
+      "candidates": ["anthropic", "pool:codex-shared", "openrouter"],
+      // candidates can reference: account.id, pool name (with or without "pool:" prefix), or another mode.id
+      "rules": ["prefer-anthropic-evening", "burn-expiring-first"],
+      // rules apply in order; filter shrinks candidates, score adds to priority
+      "onError": "re-evaluate"  // or "next-in-order" | "fail-fast"
+    }
+  ],
+
+  "presets": [
+    // v2 client-facing alias: virtual model name -> mode + preferred models
+    {
+      "name": "coding-premium",
+      "id": "coding-premium",
+      "mode": "coding-premium",
+      "preferredModels": ["claude-sonnet-4-20250514", "gpt-5.1"],
+      "fallbackModels": ["gpt-5.0-mini"],
+      "enabled": true
+    }
+    // Or v1 legacy form with entries[]:
+    // { "name": "x", "entries": [{ "provider": "anthropic", "model": "claude-sonnet-4", "enabled": true }] }
+  ],
+
+  "chains": [
+    // Legacy ordered failover (v1)
+    { "name": "premium", "enabled": true, "entries": [{ "pool": "codex-shared", "model": "gpt-5.1" }] }
+  ]
+}
+
+Routing pipeline (when client requests model="<preset-or-mode-id>"):
+  1. Resolve preset -> mode (or mode directly)
+  2. Expand mode.candidates (accounts/pools/nested modes flatten in)
+  3. Filter exhausted accounts
+  4. For each rule in mode.rules: filter and/or score candidates
+  5. Sort by accumulated score (descending)
+  6. Try preset.preferredModels in order against the top candidate
+  7. On error: re-evaluate (rules see error in ctx.history)
+`;
+
+async function handleConfigAiEdit(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const instruction = body.instruction;
+	const targetModel = body.model || "coding-premium"; // use the user's preset
+
+	if (!instruction) {
+		res.writeHead(400, json());
+		res.end(JSON.stringify({ error: { message: "instruction required" } }));
+		return;
+	}
+
+	const config = loadConfig();
+	const cleanConfig = { ...config };
+	delete cleanConfig._readOnly; delete cleanConfig._source;
+	// Strip secrets before sending to LLM
+	cleanConfig.apiKeys = (cleanConfig.apiKeys || []).map((k) => ({ ...k, key: k.key ? "[REDACTED]" : "" }));
+	cleanConfig.accounts = (cleanConfig.accounts || []).map((a) => ({ ...a, key: a.key ? "[REDACTED]" : undefined }));
+
+	const systemPrompt = `You are a configuration assistant for pi-multi-pass / Leeloo, an OpenAI-compatible LLM routing proxy.
+
+Your job: take the user's natural-language request and propose a precise update to their multi-pass.json config.
+
+${CONFIG_REFERENCE}
+
+Rules:
+1. Return ONLY a single JSON code block followed by a markdown explanation.
+2. The JSON code block must be the COMPLETE updated config (not a diff, not a patch).
+3. Preserve all existing fields the user did not ask to change.
+4. Never invent API keys -- if a key is shown as "[REDACTED]" in the input, keep it as "[REDACTED]" in the output (the server will preserve the real key).
+5. Never break existing routing -- if the user adds a new rule, leave existing rules intact unless they explicitly say to replace them.
+6. Use IDs that already exist in the config. If you need to reference a new account/pool/rule, also create it.
+7. After the JSON, add a short markdown section (## Changes) explaining what you changed and why, in bullet points.
+
+Output format:
+\`\`\`json
+{ ... entire updated config ... }
+\`\`\`
+
+## Changes
+- Added rule X because the user wanted Y
+- Modified mode Z to ...
+`;
+
+	const userPrompt = `Current config (apiKeys/account keys redacted for security):
+\`\`\`json
+${JSON.stringify(cleanConfig, null, 2)}
+\`\`\`
+
+User request:
+${instruction}`;
+
+	// Call ourselves on /v1/chat/completions using the admin token
+	try {
+		const resp = await fetch(`http://localhost:${PORT}/v1/chat/completions`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${ADMIN_TOKEN}`,
+			},
+			body: JSON.stringify({
+				model: targetModel,
+				stream: false,
+				messages: [
+					{ role: "system", content: systemPrompt },
+					{ role: "user", content: userPrompt },
+				],
+			}),
+		});
+
+		if (!resp.ok) {
+			const err = await resp.json().catch(() => ({}));
+			res.writeHead(502, json());
+			res.end(JSON.stringify({ error: { message: `LLM call failed: ${err?.error?.message || resp.statusText}` } }));
+			return;
+		}
+
+		const data = await resp.json();
+		const content = data?.choices?.[0]?.message?.content || "";
+
+		// Extract JSON code block
+		const jsonMatch = content.match(/```json\s*([\s\S]*?)```/);
+		if (!jsonMatch) {
+			res.writeHead(502, json());
+			res.end(JSON.stringify({ error: { message: "LLM response missing JSON code block", raw: content } }));
+			return;
+		}
+
+		let proposed;
+		try { proposed = JSON.parse(jsonMatch[1]); }
+		catch (e) {
+			res.writeHead(502, json());
+			res.end(JSON.stringify({ error: { message: `LLM produced invalid JSON: ${e.message}`, raw: jsonMatch[1] } }));
+			return;
+		}
+
+		// Re-inject real keys (LLM only saw [REDACTED])
+		if (Array.isArray(proposed.apiKeys)) {
+			for (const k of proposed.apiKeys) {
+				if (k.key === "[REDACTED]") {
+					const orig = (config.apiKeys || []).find((x) => x.name === k.name);
+					if (orig) k.key = orig.key;
+				}
+			}
+		}
+		if (Array.isArray(proposed.accounts)) {
+			for (const a of proposed.accounts) {
+				if (a.key === "[REDACTED]") {
+					const orig = (config.accounts || []).find((x) => x.id === a.id);
+					if (orig) a.key = orig.key;
+				}
+			}
+		}
+
+		// Extract markdown explanation (everything after the JSON block)
+		const explanation = content.slice(jsonMatch.index + jsonMatch[0].length).trim();
+
+		res.writeHead(200, json());
+		res.end(JSON.stringify({
+			proposed,
+			explanation,
+			model_used: data.x_model,
+			provider_used: data.x_provider,
+			usage: data.usage,
+		}));
+	} catch (e) {
+		res.writeHead(500, json());
+		res.end(JSON.stringify({ error: { message: e.message } }));
+	}
+}
+
+async function handleConfigAiApply(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const proposed = body.config;
+	if (!proposed || typeof proposed !== "object") {
+		res.writeHead(400, json());
+		res.end(JSON.stringify({ error: { message: "proposed config required" } }));
+		return;
+	}
+	try {
+		// Backup current config first
+		const backupPath = CONFIG_PATH + ".ai-bak-" + Date.now();
+		if (existsSync(CONFIG_PATH)) {
+			writeFileSync(backupPath, readFileSync(CONFIG_PATH, "utf-8"), "utf-8");
+		}
+		saveConfig(normalizeConfig(proposed));
+		res.writeHead(200, json());
+		res.end(JSON.stringify({ saved: true, backup: backupPath }));
+	} catch (e) {
+		res.writeHead(500, json());
+		res.end(JSON.stringify({ error: { message: e.message } }));
+	}
+}
+
 // Granular: pools
 async function handlePoolsGet(req, res) {
 	res.writeHead(200, json());
@@ -2112,6 +2377,145 @@ async function routeViaV2(modelOrPresetId, ctx) {
 		}
 	}
 	return result;
+}
+
+/**
+ * Run the v2 routing pipeline in dry-run mode and return a detailed trace.
+ * Doesn't call any LLM. Used by /v1/routing/simulate for debugging routing
+ * rules and previewing decisions for hypothetical contexts.
+ */
+async function simulateRoute(modelOrPresetId, ctx) {
+	const trace = {
+		input: { model: modelOrPresetId, now: ctx.now?.toISOString() || new Date().toISOString(), userTag: ctx.userTag, prompt: ctx.prompt },
+		resolution: null,
+		expansion: null,
+		filtered: null,
+		ruleSteps: [],
+		finalOrder: [],
+		picked: null,
+		modelChoice: null,
+		errors: [],
+	};
+
+	// 1. Resolve to a v2 route (preset or mode)
+	const route = resolveV2Route(modelOrPresetId);
+	if (!route) {
+		trace.errors.push(`No v2 mode or preset found for "${modelOrPresetId}". Falls through to legacy routing.`);
+		return trace;
+	}
+	const { config, preset, mode } = route;
+	trace.resolution = { preset: preset?.id || null, mode: mode.id, modeDescription: mode.description };
+
+	// 2. Expand candidates
+	let candidates = expandModeCandidates(mode.candidates, config);
+	trace.expansion = {
+		candidates: candidates.map((c) => ({ id: c.id, kind: c.account?.kind, poolId: c.poolId, modeId: c.modeId })),
+		total: candidates.length,
+	};
+	if (candidates.length === 0) {
+		trace.errors.push("No candidates after expansion -- mode.candidates is empty or all references are invalid.");
+		return trace;
+	}
+
+	// 3. Filter exhausted (cooldown)
+	const beforeFilter = candidates.length;
+	const exhausted = candidates.filter((c) => isExhausted(c.id)).map((c) => c.id);
+	candidates = candidates.filter((c) => !isExhausted(c.id));
+	trace.filtered = { exhausted, before: beforeFilter, after: candidates.length };
+
+	// 4. Apply rules in order, capturing each step
+	const scores = {};
+	for (const ruleId of (mode.rules || [])) {
+		const ruleConfig = config.routingRules.find((r) => r.id === ruleId);
+		if (!ruleConfig) {
+			trace.ruleSteps.push({ rule: ruleId, type: "missing", error: "rule not found in config" });
+			continue;
+		}
+		const before = candidates.map((c) => c.id);
+		const apply = compileRoutingRule(ruleConfig);
+		if (!apply) {
+			trace.ruleSteps.push({ rule: ruleId, type: ruleConfig.type, error: "rule failed to compile" });
+			continue;
+		}
+
+		const stepScores = {};
+		try {
+			const result = await apply(candidates, ctx);
+			if (result?.candidates) candidates = result.candidates;
+			if (result?.scores) {
+				for (const [id, s] of Object.entries(result.scores)) {
+					stepScores[id] = s;
+					scores[id] = (scores[id] || 0) + s;
+				}
+			}
+		} catch (e) {
+			trace.ruleSteps.push({ rule: ruleId, type: ruleConfig.type, error: e.message });
+			continue;
+		}
+
+		const after = candidates.map((c) => c.id);
+		trace.ruleSteps.push({
+			rule: ruleId,
+			type: ruleConfig.type,
+			description: ruleConfig.description,
+			removed: before.filter((id) => !after.includes(id)),
+			scoresAdded: stepScores,
+			runningScores: { ...scores },
+		});
+	}
+
+	// 5. Sort by accumulated score
+	candidates.sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
+	trace.finalOrder = candidates.map((c) => ({
+		id: c.id,
+		score: scores[c.id] || 0,
+		kind: c.account?.kind,
+		poolId: c.poolId,
+	}));
+
+	// 6. Pick top + best model
+	const top = candidates[0];
+	if (top) {
+		const preferredModels = preset?.preferredModels || [];
+		const fallbackModels = preset?.fallbackModels || [];
+		const modelOrder = [...preferredModels, ...fallbackModels];
+		const providerName = top.account?.id || top.id;
+
+		let pickedModel = null;
+		const modelTries = [];
+		const tries = modelOrder.length > 0 ? modelOrder : [null];
+		for (const wantedModel of tries) {
+			let modelId = wantedModel;
+			if (!modelId) {
+				try {
+					const base = getBaseProvider(providerName) || top.account?.provider;
+					if (base) modelId = getModels(base)[0]?.id;
+				} catch {}
+			}
+			if (!modelId) continue;
+			const model = tryGetModel(providerName, modelId);
+			modelTries.push({ model: modelId, ok: !!model });
+			if (model) { pickedModel = modelId; break; }
+		}
+
+		trace.picked = { provider: providerName, score: scores[top.id] || 0 };
+		trace.modelChoice = { tries: modelTries, picked: pickedModel };
+	}
+
+	return trace;
+}
+
+async function handleRoutingSimulate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const ctx = {
+		now: body.now ? new Date(body.now) : new Date(),
+		userTag: body.userTag,
+		prompt: body.prompt,
+		history: [],
+	};
+	const trace = await simulateRoute(body.model, ctx);
+	res.writeHead(200, json());
+	res.end(JSON.stringify(trace));
 }
 
 // ─── Model resolution ─────────────────────────────────────────────────────────
@@ -3142,6 +3546,7 @@ const server = createServer(async (req, res) => {
 		if (path === "/v1/chat/completions" && req.method === "POST") await handleChatCompletions(req, res);
 		else if (path === "/v1/models" && req.method === "GET") handleModels(req, res);
 		else if (path === "/v1/routing" && req.method === "GET") handleRouting(req, res);
+		else if (path === "/v1/routing/simulate" && req.method === "POST") { if (!adminOnly()) await handleRoutingSimulate(req, res); }
 		// Admin-only endpoints
 		else if (path === "/v1/quota" && req.method === "GET") { if (!adminOnly()) await handleQuota(req, res); }
 		else if (path === "/v1/stats" && req.method === "GET") { if (!adminOnly()) handleStats(req, res); }
@@ -3158,6 +3563,8 @@ const server = createServer(async (req, res) => {
 		else if (path.startsWith("/v1/auth/logout/") && req.method === "POST") { if (!adminOnly()) await handleAuthLogout(req, res, decodeURIComponent(path.split("/v1/auth/logout/")[1])); }
 		else if (path === "/v1/config" && req.method === "GET") { if (!adminOnly()) handleConfigGet(req, res); }
 		else if (path === "/v1/config" && req.method === "PUT") { if (!adminOnly()) await handleConfigPut(req, res); }
+		else if (path === "/v1/config/ai-edit" && req.method === "POST") { if (!adminOnly()) await handleConfigAiEdit(req, res); }
+		else if (path === "/v1/config/ai-apply" && req.method === "POST") { if (!adminOnly()) await handleConfigAiApply(req, res); }
 		else if (path === "/v1/config/pools" && req.method === "GET") { if (!adminOnly()) await handlePoolsGet(req, res); }
 		else if (path === "/v1/config/pools" && req.method === "POST") { if (!adminOnly()) await handlePoolCreate(req, res); }
 		else if (path.startsWith("/v1/config/pools/") && req.method === "PUT") { if (!adminOnly()) await handlePoolUpdate(req, res, decodeURIComponent(path.split("/v1/config/pools/")[1])); }

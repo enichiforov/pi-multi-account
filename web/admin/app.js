@@ -1092,6 +1092,303 @@ function ModeEditor({ modes, rules, names, onSave, readOnly }) {
   </div>`;
 }
 
+// ── Simulator ──
+
+function SimulatePanel({ config }) {
+  const [target, setTarget] = useState("");
+  const [date, setDate] = useState(() => {
+    const d = new Date();
+    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+    return d.toISOString().slice(0, 16);
+  });
+  const [prompt, setPrompt] = useState("");
+  const [trace, setTrace] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const targets = [
+    ...(config.presets || []).filter((p) => p.mode).map((p) => ({ value: p.id || p.name, label: `preset: ${p.id || p.name}` })),
+    ...(config.modes || []).map((m) => ({ value: m.id, label: `mode: ${m.id}` })),
+  ];
+
+  async function simulate() {
+    if (!target) { setErr("Pick a preset or mode first"); return; }
+    setBusy(true); setErr(""); setTrace(null);
+    try {
+      const t = await api("/v1/routing/simulate", jpost({
+        model: target,
+        now: new Date(date).toISOString(),
+        prompt: prompt || undefined,
+      }));
+      setTrace(t);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  function quickTime(spec) {
+    const d = new Date();
+    if (spec === "morning") { d.setHours(9, 0, 0, 0); }
+    else if (spec === "evening") { d.setHours(20, 0, 0, 0); }
+    else if (spec === "midnight") { d.setHours(0, 30, 0, 0); }
+    else if (spec === "weekend") {
+      const daysToSat = (6 - d.getDay() + 7) % 7 || 7;
+      d.setDate(d.getDate() + daysToSat);
+      d.setHours(14, 0, 0, 0);
+    }
+    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+    setDate(d.toISOString().slice(0, 16));
+  }
+
+  return html`<div>
+    <h2>Simulator</h2>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Dry-run the routing pipeline without calling the LLM. Pick a preset or mode, set the time, and see exactly which rules fire and which candidate wins.</div>
+
+    <div className="card" style=${{ marginBottom: "16px" }}>
+      <div className="form-grid">
+        <div className="full"><label>Target (preset or mode)</label>
+          <select value=${target} onChange=${(e) => setTarget(e.target.value)}>
+            <option value="">-- pick one --</option>
+            ${targets.map((t) => html`<option key=${t.value} value=${t.value}>${t.label}</option>`)}
+          </select>
+        </div>
+        <div className="full"><label>Simulated time</label>
+          <input type="datetime-local" value=${date} onInput=${(e) => setDate(e.target.value)} />
+          <div style=${{ display: "flex", gap: "4px", marginTop: "6px", flexWrap: "wrap" }}>
+            <button className="btn" onClick=${() => quickTime("now")} style=${{ fontSize: "10px", padding: "3px 8px" }}>now</button>
+            <button className="btn" onClick=${() => quickTime("morning")} style=${{ fontSize: "10px", padding: "3px 8px" }}>9am today</button>
+            <button className="btn" onClick=${() => quickTime("evening")} style=${{ fontSize: "10px", padding: "3px 8px" }}>8pm today</button>
+            <button className="btn" onClick=${() => quickTime("midnight")} style=${{ fontSize: "10px", padding: "3px 8px" }}>00:30 today</button>
+            <button className="btn" onClick=${() => quickTime("weekend")} style=${{ fontSize: "10px", padding: "3px 8px" }}>weekend 2pm</button>
+          </div>
+        </div>
+        <div className="full"><label>Sample prompt (optional)</label>
+          <textarea value=${prompt} onInput=${(e) => setPrompt(e.target.value)} placeholder="Some custom rules look at prompt content" rows="2" />
+        </div>
+      </div>
+      <div className="actions" style=${{ marginTop: "12px" }}><button className="btn primary" onClick=${simulate} disabled=${busy || !target}>${busy ? "Simulating..." : "Simulate"}</button></div>
+    </div>
+
+    ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>${err}</div>` : null}
+    ${trace ? html`<${TraceView} trace=${trace} />` : null}
+  </div>`;
+}
+
+function TraceView({ trace }) {
+  return html`
+    <div className="card">
+      <h2 style=${{ marginBottom: "10px" }}>Pipeline trace</h2>
+
+      <div style=${{ marginBottom: "12px" }}>
+        <div className="meta" style=${{ marginBottom: "4px" }}>Input</div>
+        <div style=${{ fontFamily: "monospace", fontSize: "12px", color: "#a1a1aa", padding: "8px 12px", background: "#0d0d0f", borderRadius: "6px", border: "1px solid #27272a" }}>
+          model: ${trace.input.model} | now: ${trace.input.now}${trace.input.prompt ? " | prompt: " + trace.input.prompt.slice(0, 60) : ""}
+        </div>
+      </div>
+
+      ${trace.errors?.length ? html`
+        <div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d", background: "#1c0a0a", marginBottom: "12px" }}>
+          ${trace.errors.map((e, i) => html`<div key=${i}>${e}</div>`)}
+        </div>
+      ` : null}
+
+      ${trace.resolution ? html`
+        <div style=${{ marginBottom: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>1. Resolution</div>
+          <div className="card" style=${{ marginBottom: 0, padding: "10px 12px" }}>
+            ${trace.resolution.preset ? html`<span className="badge info">preset: ${trace.resolution.preset}</span>` : null}
+            <span className="badge neutral">mode: ${trace.resolution.mode}</span>
+            ${trace.resolution.modeDescription ? html`<div className="meta">${trace.resolution.modeDescription}</div>` : null}
+          </div>
+        </div>
+      ` : null}
+
+      ${trace.expansion ? html`
+        <div style=${{ marginBottom: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>2. Candidate expansion (${trace.expansion.total})</div>
+          <div className="card" style=${{ marginBottom: 0, padding: "10px 12px" }}>
+            ${trace.expansion.candidates.map((c) => html`
+              <span key=${c.id} className="badge neutral" style=${{ marginRight: "4px", marginBottom: "4px", display: "inline-block" }}>
+                ${c.id}${c.kind ? " (" + c.kind + ")" : ""}${c.poolId ? " from " + c.poolId : ""}
+              </span>
+            `)}
+          </div>
+        </div>
+      ` : null}
+
+      ${trace.filtered ? html`
+        <div style=${{ marginBottom: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>3. Cooldown filter (${trace.filtered.before} -> ${trace.filtered.after})</div>
+          ${trace.filtered.exhausted.length > 0 ? html`
+            <div className="card" style=${{ marginBottom: 0, padding: "10px 12px" }}>
+              <span style=${{ fontSize: "12px", color: "#52525b", marginRight: "6px" }}>removed:</span>
+              ${trace.filtered.exhausted.map((id) => html`<span key=${id} className="badge off" style=${{ marginRight: "4px" }}>${id}</span>`)}
+            </div>
+          ` : html`<div style=${{ fontSize: "11px", color: "#52525b", padding: "4px 0" }}>nothing filtered</div>`}
+        </div>
+      ` : null}
+
+      ${trace.ruleSteps?.length ? html`
+        <div style=${{ marginBottom: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>4. Rule pipeline (${trace.ruleSteps.length} rules)</div>
+          ${trace.ruleSteps.map((step, i) => html`
+            <div key=${i} className="card" style=${{ marginBottom: "6px", padding: "10px 12px" }}>
+              <div>
+                <span className="name">${step.rule}</span>
+                <span className="badge neutral">${step.type}</span>
+                ${step.error ? html`<span className="badge off">${step.error}</span>` : null}
+              </div>
+              ${step.description ? html`<div className="meta">${step.description}</div>` : null}
+              ${step.removed?.length ? html`<div className="meta">removed: ${step.removed.map((id) => html`<span className="badge off" style=${{ marginRight: "3px" }}>${id}</span>`)}</div>` : null}
+              ${Object.keys(step.scoresAdded || {}).length > 0 ? html`
+                <div className="meta">scores: ${Object.entries(step.scoresAdded).map(([id, s]) => html`<span style=${{ marginRight: "8px" }}><code style=${{ color: s > 0 ? "#22c55e" : "#ef4444" }}>${id}: ${s > 0 ? "+" : ""}${s}</code></span>`)}</div>
+              ` : null}
+            </div>
+          `)}
+        </div>
+      ` : null}
+
+      ${trace.finalOrder?.length ? html`
+        <div style=${{ marginBottom: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>5. Final order (sorted by score)</div>
+          <div className="table-wrap"><table>
+            <thead><tr><th>#</th><th>Candidate</th><th>Kind</th><th>Pool</th><th>Score</th></tr></thead>
+            <tbody>
+              ${trace.finalOrder.map((c, i) => html`
+                <tr key=${c.id} style=${i === 0 ? { background: "#052e16" } : {}}>
+                  <td>${i + 1}${i === 0 ? " WINNER" : ""}</td>
+                  <td style=${{ fontWeight: i === 0 ? 700 : 400, color: i === 0 ? "#22c55e" : "#a1a1aa" }}>${c.id}</td>
+                  <td>${c.kind || "--"}</td>
+                  <td>${c.poolId || "--"}</td>
+                  <td><strong>${c.score}</strong></td>
+                </tr>
+              `)}
+            </tbody>
+          </table></div>
+        </div>
+      ` : null}
+
+      ${trace.modelChoice ? html`
+        <div style=${{ marginBottom: "8px" }}>
+          <div className="meta" style=${{ marginBottom: "4px" }}>6. Model selection</div>
+          <div className="card" style=${{ marginBottom: 0, padding: "10px 12px" }}>
+            <div>
+              <span className="name">${trace.picked.provider}</span>
+              ${trace.modelChoice.picked ? html`<span className="badge on">picked: ${trace.modelChoice.picked}</span>` : html`<span className="badge off">no model picked</span>`}
+            </div>
+            ${trace.modelChoice.tries.length > 0 ? html`
+              <div className="meta">tries: ${trace.modelChoice.tries.map((t) => html`<span className=${`badge ${t.ok ? "on" : "off"}`} style=${{ marginRight: "4px" }}>${t.model}${t.ok ? " ok" : " skip"}</span>`)}</div>
+            ` : null}
+          </div>
+        </div>
+      ` : null}
+    </div>
+  `;
+}
+
+// ── AI config editor ──
+
+function AiEditPanel({ config, onApplied }) {
+  const [open, setOpen] = useState(false);
+  const [instruction, setInstruction] = useState("");
+  const [model, setModel] = useState("coding-premium");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState("");
+
+  const targets = [
+    ...(config.presets || []).map((p) => p.id || p.name),
+    ...(config.modes || []).map((m) => m.id),
+  ];
+
+  async function generate() {
+    if (!instruction.trim()) return;
+    setBusy(true); setErr(""); setResult(null);
+    try {
+      const r = await api("/v1/config/ai-edit", jpost({ instruction, model }));
+      setResult(r);
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  async function apply() {
+    if (!result?.proposed) return;
+    if (!confirm("Apply the proposed config? A backup of the current config will be created.")) return;
+    setBusy(true);
+    try {
+      await api("/v1/config/ai-apply", jpost({ config: result.proposed }));
+      setResult(null);
+      setInstruction("");
+      setOpen(false);
+      if (onApplied) onApplied();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
+  }
+
+  if (!open) {
+    return html`
+      <div style=${{ marginBottom: "16px" }}>
+        <button className="btn primary" onClick=${() => setOpen(true)} style=${{ fontSize: "13px" }}>
+          Ask AI to edit config
+        </button>
+      </div>
+    `;
+  }
+
+  return html`
+    <div className="card" style=${{ marginBottom: "16px", borderColor: "#3b1f6e" }}>
+      <div className="card-row" style=${{ marginBottom: "10px" }}>
+        <h2 style=${{ margin: 0, color: "#a78bfa" }}>Ask AI to edit config</h2>
+        <button className="btn" onClick=${() => { setOpen(false); setResult(null); setErr(""); }}>Close</button>
+      </div>
+      <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>Describe what you want to change. The AI sees your current config (with secrets redacted) and proposes a complete updated config plus an explanation. You review and apply.</div>
+
+      <div className="form-grid">
+        <div className="full">
+          <label>Your request</label>
+          <textarea value=${instruction} onInput=${(e) => setInstruction(e.target.value)} placeholder="e.g. Add a routing rule that prefers Anthropic on Friday evenings, and add it to coding-premium mode" rows="4" />
+        </div>
+        <div>
+          <label>Use this preset/model to think</label>
+          <select value=${model} onChange=${(e) => setModel(e.target.value)}>
+            ${targets.map((t) => html`<option key=${t} value=${t}>${t}</option>`)}
+          </select>
+        </div>
+      </div>
+      <div className="actions" style=${{ marginTop: "12px" }}>
+        <button className="btn primary" onClick=${generate} disabled=${busy || !instruction.trim()}>${busy ? "Thinking..." : "Generate"}</button>
+      </div>
+
+      ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d", marginTop: "12px" }}>${err}</div>` : null}
+
+      ${result ? html`
+        <div style=${{ marginTop: "16px" }}>
+          <div className="meta" style=${{ marginBottom: "6px" }}>
+            generated by ${result.provider_used || "?"} / ${result.model_used || "?"}
+            ${result.usage ? html` | ${result.usage.prompt_tokens} in / ${result.usage.completion_tokens} out` : null}
+          </div>
+
+          ${result.explanation ? html`
+            <div className="card" style=${{ background: "#0d0d0f", marginBottom: "10px" }}>
+              <div className="meta" style=${{ marginBottom: "6px" }}>Explanation</div>
+              <pre style=${{ fontFamily: "inherit", whiteSpace: "pre-wrap", color: "#d4d4d8", background: "transparent", border: "none", padding: 0, fontSize: "13px", lineHeight: "1.5" }}>${result.explanation}</pre>
+            </div>
+          ` : null}
+
+          <details>
+            <summary style=${{ cursor: "pointer", color: "#a1a1aa", fontSize: "12px", marginBottom: "8px" }}>View proposed config (JSON)</summary>
+            <pre>${JSON.stringify(result.proposed, null, 2)}</pre>
+          </details>
+
+          <div className="actions" style=${{ marginTop: "12px" }}>
+            <button className="btn primary" onClick=${apply} disabled=${busy}>Apply to config</button>
+            <button className="btn" onClick=${() => setResult(null)}>Discard</button>
+          </div>
+        </div>
+      ` : null}
+    </div>
+  `;
+}
+
 // ── Routing tab combines rules + modes ──
 
 function RoutingPanel({ onRefresh }) {
@@ -1111,11 +1408,14 @@ function RoutingPanel({ onRefresh }) {
   return html`<div>
     ${err ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${err}</div>` : null}
     ${readOnly ? html`<div className="card" style=${{ borderColor: "#92400e", background: "#1c1508", marginBottom: "16px" }}><span style=${{ color: "#f59e0b", fontWeight: 600 }}>Read-only:</span> config managed by ${config._source}. Edit the file directly to make changes.</div>` : null}
+    ${!readOnly ? html`<${AiEditPanel} config=${config} onApplied=${refresh} />` : null}
     <${RoutingRuleEditor} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
     <div style=${{ marginTop: "24px" }} />
     <${ModeEditor} modes=${config.modes || []} rules=${config.routingRules || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
     <div style=${{ marginTop: "24px" }} />
     <${PresetEditor} presets=${config.presets || []} modes=${config.modes || []} names=${names} onSave=${refresh} readOnly=${readOnly} />
+    <div style=${{ marginTop: "24px" }} />
+    <${SimulatePanel} config=${config} />
   </div>`;
 }
 
