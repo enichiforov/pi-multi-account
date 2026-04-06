@@ -1290,15 +1290,24 @@ function TraceView({ trace }) {
 function AiEditPanel({ config, onApplied }) {
   const [open, setOpen] = useState(false);
   const [instruction, setInstruction] = useState("");
-  const [model, setModel] = useState("coding-premium");
+  const [model, setModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
+  const [routing, setRouting] = useState({ groups: [] });
 
-  const targets = [
-    ...(config.presets || []).map((p) => p.id || p.name),
-    ...(config.modes || []).map((m) => m.id),
-  ];
+  // Load /v1/routing -- same source as chat UI dropdown
+  useEffect(() => {
+    if (!open) return;
+    api("/v1/routing").then((d) => {
+      setRouting(d || { groups: [] });
+      // Auto-pick first usable model if none chosen
+      if (!model) {
+        const first = (d?.groups || []).flatMap((g) => g.items || [])[0]?.id;
+        if (first) setModel(first);
+      }
+    }).catch(() => {});
+  }, [open]);
 
   async function generate() {
     if (!instruction.trim()) return;
@@ -1347,10 +1356,15 @@ function AiEditPanel({ config, onApplied }) {
           <label>Your request</label>
           <textarea value=${instruction} onInput=${(e) => setInstruction(e.target.value)} placeholder="e.g. Add a routing rule that prefers Anthropic on Friday evenings, and add it to coding-premium mode" rows="4" />
         </div>
-        <div>
-          <label>Use this preset/model to think</label>
+        <div className="full">
+          <label>Use this model/preset to think</label>
           <select value=${model} onChange=${(e) => setModel(e.target.value)}>
-            ${targets.map((t) => html`<option key=${t} value=${t}>${t}</option>`)}
+            <option value="">-- pick a model --</option>
+            ${(routing.groups || []).map((g) => html`
+              <optgroup key=${g.label} label=${g.label}>
+                ${(g.items || []).map((it) => html`<option key=${it.id} value=${it.id}>${it.name || it.id}</option>`)}
+              </optgroup>
+            `)}
           </select>
         </div>
       </div>
