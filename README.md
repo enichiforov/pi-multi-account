@@ -602,7 +602,7 @@ All routing, failover, DLP rules, and budget enforcement happen transparently --
 
 ### pi coding agent
 
-pi can use Leeloo as its provider backend. Create a custom provider config:
+[pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) can use Leeloo as its provider backend. Create a custom provider config:
 
 `~/.pi/agent/providers.json`:
 ```json
