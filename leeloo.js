@@ -31,7 +31,7 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, createReadStream } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, createReadStream, unlinkSync } from "node:fs";
 import { join, extname, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -1539,6 +1539,128 @@ function handleApiKeyDelete(req, res, name) {
 	const config = loadConfig();
 	config.apiKeys = config.apiKeys.filter((k) => k.name !== name);
 	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: name }));
+}
+
+// ─── Account CRUD (v2 unified primitive) ──────────────────────────────────────
+
+async function handleAccountCreate(req, res) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const entry = {
+		id: body.id || `account-${Date.now()}`,
+		provider: body.provider || "openai",
+		kind: body.kind || "subscription",
+		key: body.key,
+		baseUrl: body.baseUrl,
+		label: body.label || "",
+		enabled: body.enabled !== false,
+	};
+	if (config.accounts.some((a) => a.id === entry.id)) {
+		res.writeHead(409, json());
+		res.end(JSON.stringify({ error: { message: `Account "${entry.id}" already exists` } }));
+		return;
+	}
+	config.accounts.push(entry);
+	saveConfig(config);
+	res.writeHead(201, json());
+	res.end(JSON.stringify({ account: entry }));
+}
+
+async function handleAccountUpdate(req, res, id) {
+	const body = JSON.parse(await readBody(req));
+	const config = loadConfig();
+	const idx = config.accounts.findIndex((a) => a.id === id);
+	if (idx < 0) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Account not found" } })); return; }
+	config.accounts[idx] = { ...config.accounts[idx], ...body };
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ account: config.accounts[idx] }));
+}
+
+function handleAccountDelete(req, res, id) {
+	const config = loadConfig();
+	config.accounts = config.accounts.filter((a) => a.id !== id);
+	saveConfig(config);
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ deleted: id }));
+}
+
+// ─── Files API (raw config file editor) ───────────────────────────────────────
+
+const FILE_REGISTRY = {
+	"multi-pass.json": { path: () => CONFIG_PATH, language: "json", create: () => JSON.stringify({ subscriptions: [], pools: [], chains: [], presets: [], apiKeys: [], accounts: [], modes: [], routingRules: [] }, null, 2) },
+	"multi-pass.config.js": { path: () => join(AGENT_DIR, "multi-pass.config.js"), language: "javascript", create: () => `// Power-user JS config -- when present, JSON config is ignored.\nimport { defineConfig, account, pool, mode, preset, rule } from "${join(ROOT_DIR, "config.js")}";\n\nexport default defineConfig({\n  accounts: [],\n  pools: [],\n  rules: [],\n  modes: [],\n  presets: [],\n});\n` },
+	"multi-pass-rules.json": { path: () => RULES_PATH, language: "json", create: () => JSON.stringify({ rules: [] }, null, 2) },
+	"multi-pass-users.json": { path: () => USERS_PATH, language: "json", create: () => JSON.stringify({ users: [] }, null, 2) },
+};
+
+function handleFilesList(req, res) {
+	const out = Object.entries(FILE_REGISTRY).map(([name, info]) => {
+		const p = info.path();
+		return { name, path: p, language: info.language, exists: existsSync(p) };
+	});
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ files: out }));
+}
+
+function handleFileGet(req, res, name) {
+	const info = FILE_REGISTRY[name];
+	if (!info) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Unknown file" } })); return; }
+	const p = info.path();
+	let content = "";
+	if (existsSync(p)) {
+		try { content = readFileSync(p, "utf-8"); } catch (e) { res.writeHead(500, json()); res.end(JSON.stringify({ error: { message: e.message } })); return; }
+	} else {
+		content = info.create();
+	}
+	res.writeHead(200, json());
+	res.end(JSON.stringify({ name, path: p, language: info.language, exists: existsSync(p), content }));
+}
+
+async function handleFilePut(req, res, name) {
+	const info = FILE_REGISTRY[name];
+	if (!info) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Unknown file" } })); return; }
+	const body = JSON.parse(await readBody(req));
+	const content = body.content || "";
+
+	// Validate JSON files before writing
+	if (info.language === "json") {
+		try { JSON.parse(content); }
+		catch (e) {
+			res.writeHead(400, json());
+			res.end(JSON.stringify({ error: { message: `Invalid JSON: ${e.message}` } }));
+			return;
+		}
+	}
+
+	try {
+		ensureDir();
+		writeFileSync(info.path(), content, "utf-8");
+		// Force reload of in-memory caches
+		_jsConfigCache = null;
+		_jsConfigMtime = 0;
+		// If JS config file was just written, reload it now
+		const jsP = getJsConfigPath();
+		if (jsP) await loadJsConfig(jsP);
+		res.writeHead(200, json());
+		res.end(JSON.stringify({ saved: name, bytes: content.length }));
+	} catch (e) {
+		res.writeHead(500, json());
+		res.end(JSON.stringify({ error: { message: e.message } }));
+	}
+}
+
+function handleFileDelete(req, res, name) {
+	const info = FILE_REGISTRY[name];
+	if (!info) { res.writeHead(404, json()); res.end(JSON.stringify({ error: { message: "Unknown file" } })); return; }
+	const p = info.path();
+	if (existsSync(p)) {
+		try { unlinkSync(p); } catch {}
+	}
+	_jsConfigCache = null;
+	_jsConfigMtime = 0;
 	res.writeHead(200, json());
 	res.end(JSON.stringify({ deleted: name }));
 }
@@ -3053,6 +3175,15 @@ const server = createServer(async (req, res) => {
 		else if (path === "/v1/config/apikeys" && req.method === "POST") { if (!adminOnly()) await handleApiKeyCreate(req, res); }
 		else if (path.startsWith("/v1/config/apikeys/") && req.method === "PUT") { if (!adminOnly()) await handleApiKeyUpdate(req, res, decodeURIComponent(path.split("/v1/config/apikeys/")[1])); }
 		else if (path.startsWith("/v1/config/apikeys/") && req.method === "DELETE") { if (!adminOnly()) handleApiKeyDelete(req, res, decodeURIComponent(path.split("/v1/config/apikeys/")[1])); }
+		// Accounts (v2)
+		else if (path === "/v1/config/accounts" && req.method === "POST") { if (!adminOnly()) await handleAccountCreate(req, res); }
+		else if (path.startsWith("/v1/config/accounts/") && req.method === "PUT") { if (!adminOnly()) await handleAccountUpdate(req, res, decodeURIComponent(path.split("/v1/config/accounts/")[1])); }
+		else if (path.startsWith("/v1/config/accounts/") && req.method === "DELETE") { if (!adminOnly()) handleAccountDelete(req, res, decodeURIComponent(path.split("/v1/config/accounts/")[1])); }
+		// Files (raw editor) -- never read-only blocked, file ops always allowed for admin
+		else if (path === "/v1/files" && req.method === "GET") { if (!adminOnly()) handleFilesList(req, res); }
+		else if (path.startsWith("/v1/files/") && req.method === "GET") { if (!adminOnly()) handleFileGet(req, res, decodeURIComponent(path.split("/v1/files/")[1])); }
+		else if (path.startsWith("/v1/files/") && req.method === "PUT") { if (!adminOnly()) await handleFilePut(req, res, decodeURIComponent(path.split("/v1/files/")[1])); }
+		else if (path.startsWith("/v1/files/") && req.method === "DELETE") { if (!adminOnly()) handleFileDelete(req, res, decodeURIComponent(path.split("/v1/files/")[1])); }
 		// User management (admin only)
 		else if (path === "/v1/users" && req.method === "GET") { if (!adminOnly()) handleUsersList(req, res); }
 		else if (path === "/v1/users" && req.method === "POST") { if (!adminOnly()) await handleUserCreate(req, res); }

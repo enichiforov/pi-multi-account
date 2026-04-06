@@ -462,6 +462,65 @@ function ApiKeyEditor({ apiKeys, onSave }) {
   </div>`;
 }
 
+// ── Accounts (v2 unified primitive) ──
+
+function AccountEditor({ accounts, onSave, readOnly }) {
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState({});
+
+  function startNew() { setEditing("__new__"); setDraft({ id: "", provider: "openai-codex", kind: "subscription", key: "", baseUrl: "", label: "", enabled: true }); }
+  function startEdit(a) { setEditing(a.id); setDraft({ ...a }); }
+  function cancel() { setEditing(null); }
+
+  async function save() {
+    if (editing === "__new__") { await api("/v1/config/accounts", jpost(draft)); }
+    else { await api(`/v1/config/accounts/${encodeURIComponent(editing)}`, jput(draft)); }
+    setEditing(null); onSave();
+  }
+  async function del(id) { if (confirm(`Delete account "${id}"?`)) { await api(`/v1/config/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }); onSave(); } }
+
+  function renderForm(isNew) {
+    return html`
+      <div className="card">
+        <div className="form-grid">
+          <div><label>ID</label><input value=${draft.id} onInput=${(e) => setDraft({ ...draft, id: e.target.value })} placeholder="e.g. openai-team" disabled=${!isNew} /></div>
+          <div><label>Label</label><input value=${draft.label || ""} onInput=${(e) => setDraft({ ...draft, label: e.target.value })} placeholder="e.g. Team account" /></div>
+          <div><label>Provider</label><select value=${draft.provider} onChange=${(e) => setDraft({ ...draft, provider: e.target.value })}>${BASE_PROVIDERS.concat(["openai", "openrouter", "azure", "custom"]).map((p) => html`<option key=${p} value=${p}>${p}</option>`)}</select></div>
+          <div><label>Kind</label><select value=${draft.kind} onChange=${(e) => setDraft({ ...draft, kind: e.target.value })}><option value="subscription">subscription (OAuth)</option><option value="apiKey">apiKey (raw key)</option></select></div>
+          ${draft.kind === "apiKey" ? html`
+            <div className="full"><label>API Key</label><input type="password" value=${draft.key || ""} onInput=${(e) => setDraft({ ...draft, key: e.target.value })} placeholder="sk-..." /></div>
+            <div className="full"><label>Base URL (optional)</label><input value=${draft.baseUrl || ""} onInput=${(e) => setDraft({ ...draft, baseUrl: e.target.value })} placeholder="auto-inferred from key prefix" /></div>
+          ` : null}
+          <div><label>Enabled</label><select value=${String(draft.enabled !== false)} onChange=${(e) => setDraft({ ...draft, enabled: e.target.value === "true" })}><option value="true">Yes</option><option value="false">No</option></select></div>
+        </div>
+        <div className="actions" style=${{ marginTop: "10px" }}><button className="btn primary" onClick=${save}>${isNew ? "Create" : "Save"}</button><button className="btn" onClick=${cancel}>Cancel</button></div>
+      </div>
+    `;
+  }
+
+  return html`<div>
+    <div className="card-row" style=${{ marginBottom: "10px" }}><h2 style=${{ margin: 0 }}>Accounts (v2)</h2>${!readOnly ? html`<button className="btn primary" onClick=${startNew}>+ Add account</button>` : null}</div>
+    <div style=${{ marginBottom: "10px", fontSize: "11px", color: "#52525b" }}>v2 unified primitive: any access point (subscription or raw API key). Used by modes for cross-provider routing. OAuth accounts above and API keys below are auto-included if not listed here.</div>
+    ${editing === "__new__" ? renderForm(true) : null}
+    ${(accounts || []).length === 0 && editing !== "__new__" ? html`<div className="empty">No v2 accounts. Add one to use it as a candidate in modes.</div>` : null}
+    ${(accounts || []).map((a) => editing === a.id ? renderForm(false) : html`
+      <div className="card" key=${a.id}>
+        <div className="card-row">
+          <div>
+            <span className="name">${a.label || a.id}</span>
+            <span className="badge neutral" style=${{ fontFamily: "monospace" }}>${a.id}</span>
+            <span className="badge neutral">${a.kind}</span>
+            <span className="badge neutral">${a.provider}</span>
+            <span className=${`badge ${a.enabled !== false ? "on" : "off"}`}>${a.enabled !== false ? "active" : "disabled"}</span>
+          </div>
+          ${!readOnly ? html`<div className="actions"><button className="btn" onClick=${() => startEdit(a)}>Edit</button><button className="btn danger" onClick=${() => del(a.id)}>Del</button></div>` : null}
+        </div>
+        ${a.baseUrl ? html`<div className="meta">${a.baseUrl}</div>` : null}
+      </div>
+    `)}
+  </div>`;
+}
+
 // ── Pools ──
 
 function PoolEditor({ pools, names, onSave }) {
@@ -971,6 +1030,8 @@ function ConfigPanel({ onRefresh }) {
     <div style=${{ marginTop: "24px" }} />
     <${ApiKeyEditor} apiKeys=${config.apiKeys || []} onSave=${refresh} />
     <div style=${{ marginTop: "24px" }} />
+    <${AccountEditor} accounts=${config.accounts || []} onSave=${refresh} readOnly=${readOnly} />
+    <div style=${{ marginTop: "24px" }} />
     <div style=${{ marginBottom: "6px", fontSize: "11px", color: "#52525b" }}>Editing: ${config._source || "~/.pi/agent/multi-pass.json"}</div>
     <${PoolEditor} pools=${config.pools || []} names=${names} onSave=${refresh} />
     <div style=${{ marginTop: "20px" }} />
@@ -1321,6 +1382,196 @@ function UsersPanel() {
 // APP + LOGIN
 // ════════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════════
+// FILES (raw editor with Monaco)
+// ════════════════════════════════════════════════════════════════════════════════
+
+let _monacoLoaderPromise = null;
+function loadMonaco() {
+  if (_monacoLoaderPromise) return _monacoLoaderPromise;
+  _monacoLoaderPromise = new Promise((resolve, reject) => {
+    if (window.monaco) return resolve(window.monaco);
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/monaco-editor@0.46.0/min/vs/loader.js";
+    script.onload = () => {
+      window.require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.46.0/min/vs" } });
+      window.require(["vs/editor/editor.main"], () => resolve(window.monaco));
+    };
+    script.onerror = () => reject(new Error("Failed to load Monaco from CDN"));
+    document.head.appendChild(script);
+  });
+  return _monacoLoaderPromise;
+}
+
+function MonacoEditor({ value, language, onChange, height }) {
+  const containerRef = useRef(null);
+  const editorRef = useRef(null);
+  const valueRef = useRef(value);
+
+  useEffect(() => {
+    let disposed = false;
+    loadMonaco().then((monaco) => {
+      if (disposed || !containerRef.current) return;
+      // Apply dark theme matching admin
+      monaco.editor.defineTheme("leeloo-dark", {
+        base: "vs-dark",
+        inherit: true,
+        rules: [],
+        colors: {
+          "editor.background": "#0d0d0f",
+          "editor.foreground": "#e4e4e7",
+          "editorLineNumber.foreground": "#3f3f46",
+          "editorLineNumber.activeForeground": "#a1a1aa",
+          "editor.selectionBackground": "#27272a",
+          "editor.lineHighlightBackground": "#14141a",
+        },
+      });
+      editorRef.current = monaco.editor.create(containerRef.current, {
+        value: valueRef.current,
+        language,
+        theme: "leeloo-dark",
+        automaticLayout: true,
+        fontSize: 13,
+        lineNumbers: "on",
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        wordWrap: "on",
+        tabSize: 2,
+        fontFamily: "JetBrains Mono, Menlo, monospace",
+      });
+      editorRef.current.onDidChangeModelContent(() => {
+        const v = editorRef.current.getValue();
+        valueRef.current = v;
+        onChange?.(v);
+      });
+    }).catch((err) => {
+      if (containerRef.current) containerRef.current.innerHTML = `<div class="empty">Monaco failed to load: ${err.message}</div>`;
+    });
+    return () => {
+      disposed = true;
+      if (editorRef.current) { editorRef.current.dispose(); editorRef.current = null; }
+    };
+  }, [language]);
+
+  // Update editor content when external value changes (e.g. switching files)
+  useEffect(() => {
+    if (editorRef.current && value !== valueRef.current) {
+      valueRef.current = value;
+      editorRef.current.setValue(value || "");
+    }
+  }, [value]);
+
+  return html`<div ref=${containerRef} style=${{ height: height || "560px", border: "1px solid #27272a", borderRadius: "10px", overflow: "hidden" }} />`;
+}
+
+function FilesPanel() {
+  const [files, setFiles] = useState([]);
+  const [activeFile, setActiveFile] = useState(null);
+  const [content, setContent] = useState("");
+  const [original, setOriginal] = useState("");
+  const [language, setLanguage] = useState("json");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState("");
+
+  async function loadFileList() {
+    try { const d = await api("/v1/files"); setFiles(d.files || []); } catch (e) { setError(e.message); }
+  }
+  useEffect(() => { loadFileList(); }, []);
+
+  async function selectFile(name) {
+    setError(""); setStatus(null);
+    try {
+      const d = await api(`/v1/files/${encodeURIComponent(name)}`);
+      setActiveFile(d);
+      setContent(d.content);
+      setOriginal(d.content);
+      setLanguage(d.language || "json");
+    } catch (e) { setError(e.message); }
+  }
+
+  async function save() {
+    if (!activeFile) return;
+    setBusy(true); setError(""); setStatus(null);
+    try {
+      const d = await api(`/v1/files/${encodeURIComponent(activeFile.name)}`, jput({ content }));
+      setOriginal(content);
+      setStatus(`Saved ${d.bytes} bytes`);
+      await loadFileList();
+      setTimeout(() => setStatus(null), 3000);
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  }
+
+  function revert() {
+    setContent(original);
+  }
+
+  async function deleteFile() {
+    if (!activeFile) return;
+    if (!confirm(`Delete ${activeFile.name}?`)) return;
+    setBusy(true);
+    try {
+      await api(`/v1/files/${encodeURIComponent(activeFile.name)}`, { method: "DELETE" });
+      setActiveFile(null);
+      setContent("");
+      setOriginal("");
+      await loadFileList();
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  }
+
+  const dirty = content !== original;
+
+  return html`
+    <div>
+      <div className="card-row" style=${{ marginBottom: "12px" }}>
+        <h2 style=${{ margin: 0 }}>Files</h2>
+        <div className="actions">
+          <button className="btn" onClick=${loadFileList}>Refresh list</button>
+        </div>
+      </div>
+      <div style=${{ marginBottom: "12px", fontSize: "11px", color: "#52525b" }}>Raw config file editor with Monaco. Edit any config file directly. Changes hot-reload.</div>
+
+      ${error ? html`<div className="card" style=${{ color: "#ef4444", borderColor: "#7f1d1d" }}>Error: ${error}</div>` : null}
+
+      <div style=${{ display: "flex", gap: "12px", marginBottom: "12px", flexWrap: "wrap" }}>
+        ${files.map((f) => html`
+          <button
+            key=${f.name}
+            className=${`btn ${activeFile?.name === f.name ? "primary" : ""}`}
+            onClick=${() => selectFile(f.name)}
+            style=${{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            ${f.name}
+            ${!f.exists ? html`<span style=${{ color: "#52525b", fontSize: "10px" }}>(missing)</span>` : null}
+          </button>
+        `)}
+      </div>
+
+      ${activeFile ? html`
+        <div className="card" style=${{ marginBottom: "10px" }}>
+          <div className="card-row" style=${{ marginBottom: "10px" }}>
+            <div>
+              <span className="name">${activeFile.name}</span>
+              <span className="badge neutral">${activeFile.language}</span>
+              ${dirty ? html`<span className="badge warn">unsaved</span>` : html`<span className="badge on">saved</span>`}
+              ${status ? html`<span style=${{ color: "#22c55e", marginLeft: "10px", fontSize: "12px" }}>${status}</span>` : null}
+            </div>
+            <div className="actions">
+              <button className="btn" onClick=${revert} disabled=${!dirty || busy}>Revert</button>
+              <button className="btn primary" onClick=${save} disabled=${!dirty || busy}>${busy ? "Saving..." : "Save"}</button>
+              <button className="btn danger" onClick=${deleteFile} disabled=${busy}>Delete file</button>
+            </div>
+          </div>
+          <div style=${{ fontSize: "11px", color: "#52525b", marginBottom: "8px" }}>${activeFile.path}</div>
+          <${MonacoEditor} value=${content} language=${language} onChange=${setContent} height="600px" />
+        </div>
+      ` : html`<div className="empty">Select a file above to edit it.</div>`}
+    </div>
+  `;
+}
+
 function App() {
   const [tab, setTab] = useState("dashboard");
   const [error, setError] = useState("");
@@ -1349,7 +1600,7 @@ function App() {
 
   function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
 
-  const tabs = ["dashboard", "config", "routing", "users", "rules", "audit"];
+  const tabs = ["dashboard", "config", "routing", "users", "rules", "audit", "files"];
 
   return html`
     <div className="app">
@@ -1369,6 +1620,7 @@ function App() {
         ${tab === "users" ? html`<${UsersPanel} />` : null}
         ${tab === "rules" ? html`<${RulesPanel} rules=${rules} onRefresh=${() => load("rules")} />` : null}
         ${tab === "audit" ? html`<${AuditPanel} entries=${audit} onRefresh=${() => load("audit")} />` : null}
+        ${tab === "files" ? html`<${FilesPanel} />` : null}
       </div></div>
     </div>
   `;
