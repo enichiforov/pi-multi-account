@@ -1,12 +1,12 @@
 {
-  "name": "pi-multi-pass",
+  "name": "pi-multi-account",
   "version": "1.3.1-fork.0",
-  "description": "Multi-subscription extension for pi and GSD with OAuth account switching, pool failover, and friendly subscription labels.",
+  "description": "Multi-account subscription extension for pi and GSD with OAuth account switching, pool failover, and friendly subscription labels.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "gsd-extension",
-    "multi-subscription",
+    "multi-account",
     "oauth",
     "provider-failover",
     "codex",
@@ -20,12 +20,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/enichiforov/pi-multi-pass.git"
+    "url": "git+https://github.com/enichiforov/pi-multi-account.git"
   },
   "bugs": {
-    "url": "https://github.com/enichiforov/pi-multi-pass/issues"
+    "url": "https://github.com/enichiforov/pi-multi-account/issues"
   },
-  "homepage": "https://github.com/enichiforov/pi-multi-pass#readme",
+  "homepage": "https://github.com/enichiforov/pi-multi-account#readme",
   "type": "module",
   "files": [
     "extensions",

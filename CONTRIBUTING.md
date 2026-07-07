@@ -1,6 +1,6 @@
 # Contributing
 
-This repository is a maintained fork of `hjanuschka/pi-multi-pass` for multi-subscription pi/GSD workflows.
+This repository started as a maintained fork of `hjanuschka/pi-multi-pass` and is evolving as a separate multi-account pi/GSD extension.
 
 ## Development setup
 

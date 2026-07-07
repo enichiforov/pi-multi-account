@@ -1,15 +1,15 @@
-# pi-multi-pass
+# pi-multi-account
 
-Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) and GSD. Use multiple OAuth accounts per provider with friendly labels, manual switching, automatic rate-limit failover, pool strategies, project-level affinity, and model presets.
+Multi-account subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) and GSD. Use multiple OAuth accounts per provider with friendly labels, manual switching, automatic rate-limit failover, pool strategies, project-level affinity, and model presets.
 
-> Maintained fork: this fork tracks the original `hjanuschka/pi-multi-pass` idea while keeping compatibility fixes for current pi/GSD runtimes.
+> Maintained fork: this project started from `hjanuschka/pi-multi-pass` and is evolving as a separately maintained multi-account extension for current pi/GSD runtimes.
 
 ## Install
 
 Install this maintained fork directly from GitHub:
 
 ```bash
-pi install git:github.com/enichiforov/pi-multi-pass
+pi install git:github.com/enichiforov/pi-multi-account
 ```
 
 If you already installed the upstream package, reinstall from this fork so pi reloads the patched extension code.
