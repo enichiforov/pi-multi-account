@@ -1,26 +1,35 @@
 # pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) and GSD. Use multiple OAuth accounts per provider with friendly labels, manual switching, automatic rate-limit failover, pool strategies, project-level affinity, and model presets.
+
+> Maintained fork: this fork tracks the original `hjanuschka/pi-multi-pass` idea while keeping compatibility fixes for current pi/GSD runtimes.
 
 ## Install
 
-```bash
-pi install npm:pi-multi-pass
-```
-
-Or via git:
+Install this maintained fork directly from GitHub:
 
 ```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+pi install git:github.com/enichiforov/pi-multi-pass
 ```
+
+If you already installed the upstream package, reinstall from this fork so pi reloads the patched extension code.
+
+## Verify the repository
+
+```bash
+npm test
+```
+
+The regression suite covers pool editing, project restrictions, runtime failover planning, subscription switching, and subscription limits.
 
 ## Features
 
-- **Multiple subscriptions**: Add extra OAuth accounts for any provider
-- **Rotation pools**: Group subscriptions and auto-rotate on rate limits
-- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
-- **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
-- **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
+- **Multiple subscriptions**: Add extra OAuth accounts for any provider.
+- **Friendly subscription labels**: Display accounts as `Anthropic work` or `Codex personal` while preserving stable provider ids such as `anthropic-2`.
+- **Rotation pools**: Group subscriptions and auto-rotate on rate limits.
+- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook).
+- **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`.
+- **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`).
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
