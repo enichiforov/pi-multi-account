@@ -41,10 +41,7 @@ import type {
 	AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
-	BorderedLoader,
-	DynamicBorder,
 	getAgentDir,
-	keyHint,
 } from "@earendil-works/pi-coding-agent";
 import {
 	anthropicOAuthProvider,
@@ -647,6 +644,11 @@ function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): 
 	return index >= 0 ? index : 0;
 }
 
+function keyHint(keybinding: string, description: string): string {
+	const keyLabel = keybinding === "tui.select.confirm" ? "Enter" : keybinding === "tui.select.cancel" ? "Esc" : keybinding;
+	return `${keyLabel} ${description}`;
+}
+
 async function showWrappedSelect(
 	ctx: ExtensionCommandContext,
 	options: {
@@ -680,7 +682,6 @@ async function showWrappedSelect(
 			keyHint("tui.select.cancel", cancelHint),
 		].join(" • ");
 
-		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 		container.addChild(new Text(theme.fg("accent", theme.bold(options.title))));
 		if (options.subtitle) {
 			container.addChild(new Text(theme.fg("dim", options.subtitle)));
@@ -698,7 +699,6 @@ async function showWrappedSelect(
 		selectList.onCancel = () => done(null);
 		container.addChild(selectList);
 		container.addChild(new Text(theme.fg("dim", footer)));
-		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
 		return {
 			render(width: number) {
@@ -763,26 +763,18 @@ async function loadQuotaResults(
 		return runQuotaChecks(accounts);
 	}
 
-	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
-		const loader = new BorderedLoader(
-			tui,
-			theme,
-			`Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`,
-		);
-		loader.onAbort = () => done(null);
+	return ctx.ui.custom<QuotaCheckResult[] | null>((_tui, theme, _kb, done) => {
+		const container = new Container();
+		container.addChild(new Text(theme.fg("accent", `Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`)));
 
-		runQuotaChecks(accounts, loader.signal)
+		runQuotaChecks(accounts)
 			.then(done)
 			.catch((error) => {
-				if (loader.signal.aborted) {
-					done(null);
-					return;
-				}
 				console.error("Failed to load quota checks", error);
 				done(null);
 			});
 
-		return loader;
+		return container;
 	});
 }
 
@@ -1853,11 +1845,27 @@ function subProviderName(entry: SubEntry): string {
 	return `${entry.provider}-${entry.index}`;
 }
 
+function providerShortName(provider: string): string {
+	switch (provider) {
+		case "anthropic":
+			return "Anthropic";
+		case "openai-codex":
+			return "Codex";
+		case "github-copilot":
+			return "Copilot";
+		case "gemini-cli":
+			return "Gemini";
+		case "antigravity":
+			return "Antigravity";
+		default:
+			return PROVIDER_TEMPLATES[provider]?.displayName || provider;
+	}
+}
+
 function subDisplayName(entry: SubEntry): string {
-	const template = PROVIDER_TEMPLATES[entry.provider];
-	const providerName = `${template?.displayName || entry.provider} #${entry.index}`;
-	if (!entry.label) return providerName;
-	return `${entry.label} — ${providerName}`;
+	const providerName = providerShortName(entry.provider);
+	if (entry.label) return `${providerName} ${entry.label}`;
+	return `${providerName} ${entry.index}`;
 }
 
 /** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
@@ -1874,11 +1882,12 @@ function getBaseProvider(providerName: string): string | undefined {
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
+function cloneModels(entry: SubEntry) {
+	const models = getModels(entry.provider as any) as Model<Api>[];
+	const displayName = subDisplayName(entry);
 	return models.map((m) => ({
 		id: m.id,
-		name: `${m.name} (#${index})`,
+		name: `${m.name} (${displayName})`,
 		api: m.api,
 		reasoning: m.reasoning,
 		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
@@ -1900,11 +1909,11 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
+	const oauth = { ...template.buildOAuth(entry.index), name: subDisplayName(entry) };
 	const modifyModels = template.buildModifyModels?.(name);
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const models = cloneModels(entry);
 
 	pi.registerProvider(name, {
 		baseUrl,
@@ -3006,7 +3015,7 @@ async function showSubscriptionActions(
 	}
 	if (action === "login") {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 			"info",
 		);
 		return;
@@ -3063,7 +3072,7 @@ async function handleSubsList(
 async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const providerItems: SelectItem[] = SUPPORTED_PROVIDERS.map((provider) => ({
 		value: provider,
-		label: provider,
+		label: providerShortName(provider),
 		description: PROVIDER_TEMPLATES[provider]?.displayName,
 	}));
 
@@ -3110,7 +3119,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 
 	if (loginNow) {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 			"info",
 		);
 	} else {
@@ -3190,7 +3199,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	if (!entry) return;
 
 	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+		`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 		"info",
 	);
 }
