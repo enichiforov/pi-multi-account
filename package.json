@@ -1,14 +1,16 @@
 {
   "name": "pi-multi-account",
   "version": "0.1.0",
-  "description": "Multi-account subscription extension for pi and GSD with OAuth account switching, pool failover, and friendly subscription labels.",
+  "description": "pi/GSD extension for multi-account subscription switching, account pools, and quota-aware failover.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "gsd-extension",
     "multi-account",
+    "subscription-switching",
+    "account-pool",
     "oauth",
-    "provider-failover",
+    "failover",
     "codex",
     "anthropic",
     "copilot"

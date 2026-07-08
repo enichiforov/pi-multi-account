@@ -1,241 +1,210 @@
 # pi-multi-account
 
-Multi-account subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) and GSD. Use multiple OAuth accounts per provider with friendly labels, manual switching, automatic rate-limit failover, pool strategies, project-level affinity, and model presets.
+Multi-account subscription switching for [pi](https://github.com/earendil-works/pi-coding-agent) and GSD.
 
-> Maintained fork: this project started from `hjanuschka/pi-multi-pass` and is evolving as a separately maintained multi-account extension for current pi/GSD runtimes.
+`pi-multi-account` lets one pi/GSD installation use multiple OAuth accounts for the same provider, switch between them, and fail over across account pools when a provider hits quota or rate limits.
+
+This project started as a maintained fork of [`hjanuschka/pi-multi-pass`](https://github.com/hjanuschka/pi-multi-pass) and is now maintained separately for current pi/GSD runtimes.
+
+## Extension contract
+
+| Field | Value |
+|---|---|
+| Extension id | `pi-multi-account` |
+| Package type | pi extension package |
+| Runtime | pi / GSD |
+| Install path | `git:github.com/enichiforov/pi-multi-account` |
+| Commands | `/subs`, `/pool`, `/pool chain`, `/mp-preset` |
+| Auth model | pi OAuth/auth storage; no raw token logging |
+| Provider ids | Stable internal ids such as `anthropic-2`, `openai-codex-2` |
+| Labels | Display-only labels such as `Anthropic work`, `Codex personal` |
+
+## Status
+
+Production baseline is working:
+
+- GitHub Actions CI passes on Node 20 and Node 22.
+- `npm test` runs the regression suite.
+- `/subs` runtime compatibility fixes are shipped in `v0.1.0`.
+- Friendly account labels are supported without changing existing provider ids.
+- Existing upstream-style config ids, pools, chains, presets, and project restrictions remain compatible.
+
+Still being improved:
+
+- The inherited extension implementation is currently a monolith in `extensions/multi-sub.ts`.
+- A module rewrite plan is documented in [`docs/REWRITE-PLAN.md`](docs/REWRITE-PLAN.md).
+- Full interactive runtime verification is tracked in [`docs/RUNTIME-VERIFICATION.md`](docs/RUNTIME-VERIFICATION.md).
 
 ## Install
 
-Install this maintained fork directly from GitHub:
+Install directly from the maintained fork:
 
 ```bash
 pi install git:github.com/enichiforov/pi-multi-account
 ```
 
-If you already installed the upstream package, reinstall from this fork so pi reloads the patched extension code.
+Restart pi/GSD after installing or reinstalling so provider registration and command handlers reload.
 
-## Verify the repository
-
-```bash
-npm test
-```
-
-The regression suite covers pool editing, project restrictions, runtime failover planning, subscription switching, and subscription limits.
-
-## Project docs
-
-- [Migration guide](docs/MIGRATION.md)
-- [Architecture notes](docs/ARCHITECTURE.md)
-- [Rewrite plan](docs/REWRITE-PLAN.md)
-- [Release process](RELEASE.md)
-- [Security policy](SECURITY.md)
-
-## Features
-
-- **Multiple subscriptions**: Add extra OAuth accounts for any provider.
-- **Friendly subscription labels**: Display accounts as `Anthropic work` or `Codex personal` while preserving stable provider ids such as `anthropic-2`.
-- **Rotation pools**: Group subscriptions and auto-rotate on rate limits.
-- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook).
-- **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`.
-- **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`).
-- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
-- **Smarter retries**: Preserve failover progress across internal replay retries
-- **Project affinity**: Restrict which subs/pools/chains are used per project
-- **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
-- **Labels**: Tag subscriptions (e.g. "work", "personal")
+If you previously installed upstream `pi-multi-pass`, reinstall from this fork and keep your existing config. Internal provider ids remain compatible.
 
 ## Quick start
 
-```
-/subs add              Pick a provider, add a subscription
-/login                 Authenticate the new subscription
-/subs switch           Manually switch to another subscription/provider
-/subs limits           Check built-in quota support (Codex + Google)
-/pool create           Group subs into a rotation pool (with strategy selection)
-/pool chain create     Build an ordered fallback chain across pools
-/mp-preset create         Create a named routing preset across providers
-/mp-preset coding-premium Activate a preset by name
+```bash
+# Add another account for a provider
+/subs add
+
+# Authenticate the new account through pi's login flow
+/login
+
+# Switch manually between authenticated accounts
+/subs switch
+
+# Create or manage failover pools
+/pool
+
+# Inspect pool state
+/pool status
 ```
 
-When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
+Typical result:
+
+```text
+Anthropic work       authenticated
+Anthropic personal   authenticated
+Codex team           authenticated
+```
+
+Internally those accounts still use stable ids such as:
+
+```text
+anthropic-2
+anthropic-3
+openai-codex-2
+```
+
+Use stable ids in config. Friendly labels are only for menus, model names, and notifications.
+
+## Features
+
+- **Multiple accounts per provider**: Register extra OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and other supported built-in provider templates.
+- **Friendly labels**: Show `Anthropic work` instead of raw ids or `#2` names.
+- **Manual switching**: Use `/subs switch` to move between authenticated accounts.
+- **Failover pools**: Group accounts and fail over when the active account hits quota/rate-limit/provider errors.
+- **Pool strategies**: `round-robin`, `quota-first`, `scheduled`, and `custom`.
+- **Project restrictions**: Restrict which account ids a project can use.
+- **Fallback chains**: Define ordered cross-pool fallback paths.
+- **Model presets**: Create named routing shortcuts with `/mp-preset`.
 
 ## Commands
 
-### `/subs` -- Subscription management
+### `/subs`
 
-```
-/subs              Open menu
-/subs add          Add a new subscription
-/subs remove       Remove a subscription
-/subs login        Login to a subscription
-/subs logout       Logout from a subscription
-/subs switch       Manually switch to a subscription/provider now
-/subs list         List subscriptions with auth status; select one for quick actions
-/subs status       Detailed status (token expiry, pool membership)
-/subs limits       Check built-in quota/usage support (Codex + Google)
-```
+Subscription/account management.
 
-### `/pool` -- Rotation pool and chain management
-
-```
-/pool              Open menu
-/pool create       Create a pool (pick provider, select members)
-/pool list         Show pools; select one for quick actions
-/pool chain        Open chain manager
-/pool toggle       Enable/disable a pool
-/pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
-/pool status       Member health (logged in, rate limited, cooling down)
-/pool project      Project-level config (restrict subs, override pools/chains)
+```bash
+/subs                 # open interactive menu
+/subs add             # add an extra account
+/subs list            # list configured accounts
+/subs switch          # switch to an authenticated account
+/subs login           # show login guidance for an unauthenticated account
+/subs logout          # log out an account
+/subs remove          # remove an account
+/subs limits          # inspect quota/usage where supported
 ```
 
-### `/pool chain` -- Ordered fallback chain management
+### `/pool`
 
-```
-/pool chain             Open chain manager
-/pool chain create      Create a chain
-/pool chain list        Show all chains
-/pool chain toggle      Enable/disable a chain
-/pool chain remove      Delete a chain
-/pool chain status      Inspect chain entries and validity
-```
+Pool and failover management.
 
-### `/mp-preset` -- Model presets (named routing)
-
-```
-/mp-preset                 Open menu
-/mp-preset activate        Switch to a preset's best available entry
-/mp-preset <name>          Activate a preset by name directly
-/mp-preset create          Create a new preset
-/mp-preset list            Show all presets
-/mp-preset toggle          Enable/disable a preset
-/mp-preset remove          Delete a preset
+```bash
+/pool                 # open pool menu
+/pool create          # create a pool
+/pool list            # list pools
+/pool status          # inspect active pool state
+/pool toggle          # enable or disable a pool
+/pool remove          # remove a pool
+/pool project         # manage project-level restrictions
 ```
 
-## Project-level configuration
+### `/pool chain`
 
-Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
+Ordered fallback chains across pools.
 
-When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
-
-### Use case: separate work and personal accounts
-
-```
-# Global: you have 3 Codex accounts
-/subs add   -> openai-codex-2 (label: work)
-/subs add   -> openai-codex-3 (label: personal)
-
-# Corp project: restrict to team accounts only
-cd ~/work/corp-project
-/pool project -> restrict -> select openai-codex-2 only
-
-# Side project: allow everything (no restriction)
-cd ~/side-project
-# No .pi/multi-pass.json needed -- uses all global subs
+```bash
+/pool chain           # open chain menu
+/pool chain create    # create a fallback chain
+/pool chain list      # list chains
+/pool chain status    # inspect chain state
+/pool chain toggle    # enable or disable a chain
+/pool chain remove    # remove a chain
 ```
 
-### What project config can do
+### `/mp-preset`
 
-| Feature | Description |
-|---|---|
-| **Restrict subs** | Only allow specific provider names in this project (for example `openai-codex-2` or `openai-codex`) |
-| **Override pools** | Use different pools than global (or disable some) |
-| **Override chains** | Use different fallback chains than global |
-| **Clear** | Remove project config, fall back to global |
-| **Info** | Show effective config (which pools/chains/subs are active) |
+Named routing shortcuts.
 
-### Project config file
+```bash
+/mp-preset            # open preset menu
+/mp-preset create     # create a preset
+/mp-preset list       # list presets
+/mp-preset activate   # activate a preset
+/mp-preset remove     # remove a preset
+```
 
-`.pi/multi-pass.json`:
+## How failover works
+
+Pool failover is not a per-request load balancer. It is a retry/failover mechanism.
+
+A pool can fail over only when:
+
+1. the active model provider is a member of an enabled pool;
+2. the request fails with a quota/rate-limit/provider error recognized by the extension;
+3. another pool member is authenticated and not temporarily exhausted;
+4. the same model id can be resolved for the next provider.
+
+Example pool:
 
 ```json
 {
-  "allowedSubs": ["openai-codex-2", "anthropic-2"],
-  "pools": [
-    {
-      "name": "work-codex",
-      "baseProvider": "openai-codex",
-      "members": ["openai-codex-2"],
-      "enabled": true
-    }
-  ],
-  "chains": [
-    {
-      "name": "work-fallback",
-      "enabled": true,
-      "entries": [
-        { "pool": "work-codex", "model": "gpt-5-mini", "enabled": true }
-      ]
-    }
-  ]
-}
-```
-
-- `allowedSubs`: whitelist of exact provider names. If set, only those exact providers are available in this project. Omit to allow all.
-- `pools`: if set, replaces global pools for this project. Omit to inherit global pools.
-- `chains`: if set, replaces global chains for this project. Omit to inherit global chains.
-
-## How pools work
-
-1. You're using `openai-codex` and hit a rate limit
-2. Multi-pass detects the error, marks `openai-codex` as exhausted
-3. Switches to `openai-codex-2` (same model ID, different account)
-4. Retries your last prompt automatically
-5. After a 5-minute cooldown, `openai-codex` becomes available again
-
-### Pool selection strategy
-
-Each pool has a `strategy` that controls how the next member is chosen on failover:
-
-| Strategy | Behavior |
-|---|---|
-| `round-robin` | Rotate sequentially through members (default) |
-| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
-| `scheduled` | Use per-member time windows and priority roles |
-| `custom` | Delegate to a user-provided JS selector script |
-
-Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
-
-All strategies fall back to round-robin when their specific data is unavailable.
-
-#### `quota-first`
-
-You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
-
-Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
-
-```json
-{
-  "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "name": "claude",
   "enabled": true,
-  "strategy": "quota-first"
+  "strategy": "round-robin",
+  "members": ["anthropic-2", "anthropic-3"]
 }
 ```
 
-#### `scheduled`
+If the active model is on `anthropic-2` and it hits a rate limit, the extension tries `anthropic-3` next.
 
-Assign each member a role and optional time windows:
+## Pool strategies
 
-- **preferred**: only used during its active windows. When multiple preferred members are active, the one whose window ends soonest goes first (burn that quota before the window closes).
-- **default** (no role): always available, used after preferred members.
-- **overflow**: last resort, used when preferred and default members are exhausted.
+### `round-robin`
+
+Try the next available member after the current provider.
+
+Best for deterministic testing and simple account rotation.
+
+### `quota-first`
+
+Check provider-specific quota/usage where supported and prefer the account with the most available quota. Falls back to round-robin if quota data is unavailable.
+
+Best for high-usage workflows where quota probes work reliably.
+
+### `scheduled`
+
+Prefer members during configured time windows.
+
+Example:
 
 ```json
 {
   "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
   "enabled": true,
   "strategy": "scheduled",
+  "members": ["openai-codex-2", "openai-codex-3"],
   "memberSchedule": {
-    "openai-codex": {
-      "role": "preferred",
-      "windows": [{ "hours": [9, 17], "days": ["mon", "tue", "wed", "thu", "fri"] }]
-    },
     "openai-codex-2": {
       "role": "preferred",
-      "windows": [{ "hours": [17, 9] }]
+      "windows": [{ "hours": [9, 17], "days": ["mon", "tue", "wed", "thu", "fri"] }]
     },
     "openai-codex-3": {
       "role": "overflow"
@@ -244,169 +213,110 @@ Assign each member a role and optional time windows:
 }
 ```
 
-Window format:
-- `hours`: `[start, end)` in 24h local time. Wraps midnight when start > end (e.g. `[22, 6]` = 22:00-05:59).
-- `days`: array of `"mon"`, `"tue"`, ..., `"sun"`. Omit for every day.
-- `dateRange`: `{ "from": "2025-06-01", "to": "2025-06-30" }` for temporary windows.
+### `custom`
 
-During pool creation or via the `strategy` quick action, you can configure schedules interactively with human-friendly input like `9-17 mon-fri`.
+Delegate selection to a local JavaScript selector script. Use this only when built-in strategies are not enough.
 
-#### `custom`
+## Configuration
 
-Point to a JS script that decides which member to try first. The script receives full context and returns the preferred provider name (or an ordered array).
+Global config is stored in the pi/GSD agent config directory as `multi-pass.json` for compatibility with upstream installs.
 
-```json
-{
-  "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
-  "enabled": true,
-  "strategy": "custom",
-  "selectorScript": "selectors/my-codex-selector.js"
-}
-```
-
-Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` paths also work.
-
-**Selector script interface:**
-
-```js
-// ~/.pi/agent/selectors/my-codex-selector.js
-module.exports = async function select(ctx) {
-  // ctx.members:         string[]  -- available (non-exhausted, authenticated) members
-  // ctx.currentProvider: string    -- the provider that just hit a rate limit
-  // ctx.modelId:         string    -- the model ID being used
-  // ctx.pool:            object    -- { name, baseProvider, members }
-  // ctx.timestamp:       number    -- current Unix timestamp (ms)
-  // ctx.hour:            number    -- current hour (0-23, local time)
-  // ctx.day:             string    -- current day of week ("mon".."sun")
-  // ctx.prompt:          string?   -- last user prompt, if available
-  //
-  // Return: string (provider name), string[] (ordered preference), or undefined (fall back)
-
-  // Example: prefer a specific account during business hours
-  if (ctx.hour >= 9 && ctx.hour < 17) {
-    return ctx.members.find(m => m === "openai-codex-2");
-  }
-  return ctx.members[0];
-};
-```
-
-If the script throws, returns an invalid provider name, or the file is missing, the pool falls back to round-robin.
-
-## How chains work
-
-1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
-2. If the current pool has no eligible members, multi-pass continues forward in the chain
-3. It skips disabled or invalid entries and reports why in warnings
-4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
-5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
-
-## Model presets
-
-Presets are named routing shortcuts that map to an ordered list of provider+model entries across different providers. Think of them as intent-based routing: `coding-premium`, `coding-budget`, `fastest`, etc.
-
-### Commands
-
-```
-/mp-preset              Open menu
-/mp-preset activate     Switch to a preset's best available entry
-/mp-preset <name>       Activate a preset by name directly
-/mp-preset create       Create a new preset
-/mp-preset list         Show all presets
-/mp-preset toggle       Enable/disable a preset
-/mp-preset remove       Delete a preset
-```
-
-### Example
-
-```
-/mp-preset create
-  Name: coding-premium
-  Entries:
-    1. anthropic / claude-sonnet-4-20250514
-    2. openai-codex / o3
-    3. google-gemini-cli / gemini-2.5-pro
-
-/mp-preset coding-premium
-  -> Tries anthropic first. If not logged in, tries openai-codex. Then gemini.
-```
-
-### Config
-
-Presets are stored in `~/.pi/agent/multi-pass.json`:
+Subscription entries look like this:
 
 ```json
 {
-  "presets": [
-    {
-      "name": "coding-premium",
-      "enabled": true,
-      "entries": [
-        { "provider": "anthropic", "model": "claude-sonnet-4-20250514", "enabled": true },
-        { "provider": "openai-codex", "model": "o3", "enabled": true },
-        { "provider": "google-gemini-cli", "model": "gemini-2.5-pro", "enabled": true }
-      ]
-    },
-    {
-      "name": "coding-budget",
-      "enabled": true,
-      "entries": [
-        { "provider": "openai-codex", "model": "gpt-4.1-mini", "enabled": true },
-        { "provider": "google-gemini-cli", "model": "gemini-2.5-flash", "enabled": true }
-      ]
-    }
+  "subscriptions": [
+    { "provider": "anthropic", "index": 2, "label": "work" },
+    { "provider": "anthropic", "index": 3, "label": "personal" },
+    { "provider": "openai-codex", "index": 2, "label": "team" }
   ]
 }
 ```
 
-Presets work with pools: if an entry's provider belongs to a pool, rate-limit failover still rotates within that pool before trying the next preset entry.
+The extension turns those into stable provider ids:
 
-## Supported providers
-
-| Provider key | Service |
-|---|---|
-| `anthropic` | Claude Pro/Max |
-| `openai-codex` | ChatGPT Plus/Pro (Codex) |
-| `github-copilot` | GitHub Copilot |
-| `google-gemini-cli` | Google Cloud Code Assist |
-| `google-antigravity` | Antigravity |
-
-## Built-in limits support
-
-`/subs limits` uses a provider-specific checker registry.
-
-Currently implemented:
-
-- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
-- `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
-- `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
-
-Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
-
-`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
-
-When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
-
-When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
-
-Future providers can add another checker without changing the `/subs` command surface.
-
-## Environment variable (optional)
-
-```bash
-export MULTI_SUB="openai-codex:2,anthropic:1"
+```text
+anthropic-2
+anthropic-3
+openai-codex-2
 ```
 
-Env entries merge with saved config.
+Do not replace provider ids with friendly labels in pools, chains, presets, or project restrictions.
 
-## Config files
+## Project-level restrictions
 
-| File | Scope | Contains |
-|---|---|---|
-| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
-| `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+Projects can restrict which account ids are available. This is useful when work and personal accounts must not mix.
 
-## License
+Example project config:
 
-MIT
+```json
+{
+  "allowedSubs": ["anthropic-2", "openai-codex-2"]
+}
+```
+
+When restrictions are active, switch menus, pool candidates, and fallback chains are filtered before use.
+
+## Verification
+
+Run the regression suite:
+
+```bash
+npm test
+```
+
+CI runs the same suite on Node 20 and Node 22.
+
+Manual runtime smoke-test checklist:
+
+```bash
+/subs list
+/subs switch
+/subs login
+/pool status
+/mp-preset list
+```
+
+For failover tests, start from a model whose provider is a member of the target pool, then trigger a retryable provider/rate-limit error. See [`docs/RUNTIME-VERIFICATION.md`](docs/RUNTIME-VERIFICATION.md).
+
+## Repository docs
+
+- [Extension contract](docs/EXTENSION-CONTRACT.md)
+- [Migration guide](docs/MIGRATION.md)
+- [Runtime verification matrix](docs/RUNTIME-VERIFICATION.md)
+- [Architecture notes](docs/ARCHITECTURE.md)
+- [Production readiness plan](docs/PRODUCTION-READINESS.md)
+- [Rewrite plan](docs/REWRITE-PLAN.md)
+- [Release process](RELEASE.md)
+- [Security policy](SECURITY.md)
+- [Maintainers](MAINTAINERS.md)
+
+## Development
+
+```bash
+npm ci
+npm test
+```
+
+Current implementation entrypoint:
+
+```text
+extensions/multi-sub.ts
+```
+
+Target architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). New work should move behavior toward smaller tested modules rather than growing the monolith.
+
+## Security
+
+- Never log OAuth tokens, API keys, raw auth storage, or credential payloads.
+- Friendly labels are not auth boundaries.
+- Stable provider ids are not secrets.
+- Keep real account labels and private project names out of committed examples.
+
+See [`SECURITY.md`](SECURITY.md).
+
+## License and attribution
+
+MIT. See [`LICENSE`](LICENSE).
+
+This project began as a fork of [`hjanuschka/pi-multi-pass`](https://github.com/hjanuschka/pi-multi-pass). Attribution is preserved in [`NOTICE.md`](NOTICE.md). Future releases are maintained independently as `pi-multi-account`.

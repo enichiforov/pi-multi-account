@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+### Documentation
+
+- Rewrote README around the pi/GSD extension contract, command surface, config contract, verification, and maintainer workflow.
+- Added `docs/EXTENSION-CONTRACT.md`.
+- Clarified the public extension contract and current supported command/config surface.
+
 ## 0.1.0 - 2026-07-07
 
 First maintained `pi-multi-account` release.
