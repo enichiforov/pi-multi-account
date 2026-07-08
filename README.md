@@ -22,6 +22,14 @@ npm test
 
 The regression suite covers pool editing, project restrictions, runtime failover planning, subscription switching, and subscription limits.
 
+## Project docs
+
+- [Migration guide](docs/MIGRATION.md)
+- [Architecture notes](docs/ARCHITECTURE.md)
+- [Rewrite plan](docs/REWRITE-PLAN.md)
+- [Release process](RELEASE.md)
+- [Security policy](SECURITY.md)
+
 ## Features
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider.
